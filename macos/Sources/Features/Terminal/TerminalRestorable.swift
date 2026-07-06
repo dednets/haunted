@@ -135,15 +135,11 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             return
         }
 
-        // If our configuration is "never" then we never restore the state
-        // no matter what. Note its safe to use "ghostty.config" directly here
-        // because window restoration is only ever invoked on app start so we
-        // don't have to deal with config reloads.
-        if appDelegate.ghostty.config.windowSaveState == "never" {
-            AppDelegate.logger.warning("skip restoration: window-save-state=never")
-            completionHandler(nil, nil)
-            return
-        }
+        // Haunted fork: never restore plain terminal windows. The app always
+        // starts in Haunted mode via HauntedLoginController.startup(), so a
+        // restored local terminal would violate the "never local" rule.
+        completionHandler(nil, nil)
+        return
 
         // Decode the state. If we can't decode the state, then we can't restore.
         guard let state = TerminalRestorableState(coder: state) else {

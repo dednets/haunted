@@ -223,6 +223,9 @@ class AppDelegate: NSObject,
         // Start our update checker.
         updateController.startUpdater()
 
+        // Haunted fork: add the Console login entry point to the File menu.
+        HauntedLoginController.install()
+
         // Register our service provider. This must happen after everything is initialized.
         NSApp.servicesProvider = ServiceProvider()
 
@@ -358,10 +361,10 @@ class AppDelegate: NSObject,
             // is possible to have other windows in a few scenarios:
             //   - if we're opening a URL since `application(_:openFile:)` is called before this.
             //   - if we're restoring from persisted state
-            if TerminalController.all.isEmpty && derivedConfig.initialWindow {
-                undoManager.disableUndoRegistration()
-                _ = TerminalController.newWindow(ghostty)
-                undoManager.enableUndoRegistration()
+            // Haunted fork: always start in Haunted mode (restore or login),
+            // never a plain local terminal.
+            if TerminalController.all.isEmpty {
+                HauntedLoginController.startup()
             }
         }
     }
@@ -440,8 +443,8 @@ class AppDelegate: NSObject,
         // but I haven't seen it happen in releases. I'm unsure why.
         guard applicationHasBecomeActive else { return true }
 
-        // No visible windows, open a new one.
-        _ = TerminalController.newWindow(ghostty)
+        // Haunted fork: reopen into Haunted mode, never a plain terminal.
+        HauntedLoginController.startup()
         return false
     }
 
@@ -716,9 +719,8 @@ class AppDelegate: NSObject,
     }
 
     @objc private func ghosttyNewWindow(_ notification: Notification) {
-        let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
-        let config = configAny as? Ghostty.SurfaceConfiguration
-        _ = TerminalController.newWindow(ghostty, withBaseConfig: config)
+        // Haunted fork: no plain local windows.
+        Task { @MainActor in HauntedLoginController.startup() }
     }
 
     @objc private func ghosttyNewTab(_ notification: Notification) {
@@ -727,12 +729,10 @@ class AppDelegate: NSObject,
 
         // We only want to listen to new tabs if the focused parent is
         // a regular terminal controller.
-        guard window.windowController is TerminalController else { return }
+        guard let controller = window.windowController as? TerminalController else { return }
 
-        let configAny = notification.userInfo?[Ghostty.Notification.NewSurfaceConfigKey]
-        let config = configAny as? Ghostty.SurfaceConfiguration
-
-        _ = TerminalController.newTab(ghostty, from: window, withBaseConfig: config)
+        // Haunted fork: a new tab is a new session on the focused daemon.
+        Task { await HauntedManager.shared.newTabOnCurrentDaemon(from: controller) }
     }
 
     private func setDockBadge() {
@@ -947,14 +947,17 @@ class AppDelegate: NSObject,
     }
 
     @IBAction func newWindow(_ sender: Any?) {
-        _ = TerminalController.newWindow(ghostty)
+        // Haunted fork: no plain local windows.
+        HauntedLoginController.startup()
     }
 
     @IBAction func newTab(_ sender: Any?) {
-        _ = TerminalController.newTab(
-            ghostty,
-            from: TerminalController.preferredParent?.window
-        )
+        // Haunted fork: a new tab is a new session on the focused daemon.
+        guard let parent = TerminalController.preferredParent else {
+            HauntedLoginController.startup()
+            return
+        }
+        Task { await HauntedManager.shared.newTabOnCurrentDaemon(from: parent) }
     }
 
     @IBAction func closeAllWindows(_ sender: Any?) {

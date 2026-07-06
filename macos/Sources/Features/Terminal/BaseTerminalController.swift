@@ -243,7 +243,10 @@ class BaseTerminalController: NSWindowController,
 
         // Create a new surface view
         guard let ghostty_app = ghostty.app else { return nil }
+        // Haunted fork: splits from a Haunted surface attach to the same daemon.
+        let config = HauntedManager.shared.splitConfiguration(parent: oldView, base: config)
         let newView = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
+        HauntedManager.shared.surfaceCreated(newView, splitFrom: oldView)
 
         // Do the split
         let newTree: SplitTree<Ghostty.SurfaceView>
