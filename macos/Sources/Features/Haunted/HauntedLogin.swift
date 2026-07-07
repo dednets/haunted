@@ -2,65 +2,74 @@ import AppKit
 import SwiftUI
 import GhosttyKit
 
-/// Haunted Console integration: a login window that authenticates against a
-/// Haunted Console (URL + username + password) and opens a terminal window
-/// attached to one of the user's daemons through the Console relay.
-///
-/// The password never reaches the terminal: the login exchange happens here
-/// and only the short-lived session token is handed to the spawned
-/// `haunted-console-connect` process via its environment.
-///
-/// This feature is intentionally self-contained so the fork delta against
-/// upstream Ghostty stays small.
+/// DedMesh Console integration: startup refuses to open a terminal until the
+/// app has an enrolled client identity in ~/.config/haunted.
 final class HauntedLoginController: NSWindowController {
     static let shared = HauntedLoginController()
 
-    /// Installs the "Connect to Haunted…" item in the File menu. Called once
-    /// from applicationDidFinishLaunching. The startup window itself is opened
-    /// by `startup()` from applicationDidBecomeActive.
+    /// Installs the "Log in with DedMesh Console…" item in the File menu.
+    /// Called once from applicationDidFinishLaunching. The startup window
+    /// itself is opened by `startup()` from applicationDidBecomeActive.
     static func install() {
         installMenuItem()
     }
 
     /// Entry point for launch, dock-reopen, and ⌘N. The app is always in
-    /// Haunted mode: focus an existing Haunted window, else restore a stored
-    /// session, else prompt for login. It never opens a plain local terminal.
+    /// Haunted mode: focus an existing Haunted window, else auto-connect with
+    /// the enrolled identity, else prompt for enrollment. It never opens a
+    /// plain local terminal.
     @MainActor
     static func startup() {
         if HauntedManager.shared.focusExistingWindow() { return }
-        guard HauntedKeychain.load() != nil else {
+        guard let identity = HauntedClientIdentity.load() else {
             shared.showLogin(nil)
             return
         }
-        restoreStoredSession(onFailure: { shared.showLogin(nil) })
+        connect(identity: identity)
     }
 
-    /// If the Keychain holds a valid refresh token, opens the Haunted window
-    /// without prompting for a password; otherwise runs `onFailure`.
-    private static func restoreStoredSession(onFailure: @escaping @MainActor () -> Void) {
-        guard let stored = HauntedKeychain.load() else {
-            Task { @MainActor in onFailure() }
-            return
-        }
-        NSLog("[haunted] restore: found stored session for %@", stored.consoleURL)
+    /// Auto-connect: only open a Haunted window after the enrolled identity
+    /// can authenticate and list workstations. Offline workstations still mean
+    /// the user is logged in; show the Haunted window/sidebar instead of
+    /// returning to login. A revoked/broken identity falls back to login.
+    @MainActor
+    private static func connect(identity: HauntedClientIdentity) {
         Task { @MainActor in
-            let session = HauntedSession(
-                consoleURL: stored.consoleURL,
-                refreshToken: stored.refreshToken)
+            let justStarted = await HauntedWorkstationSupervisor.ensureRunning()
             do {
-                _ = try await session.accessToken()
+                let workstations = justStarted
+                    ? try await waitForOnline(identity: identity)
+                    : try await HauntedCLI.workstations(identity: identity)
+                NSLog("[haunted] startup: %d workstation(s) via %@",
+                      workstations.count, identity.consoleHost)
+                HauntedManager.shared.openWindow(
+                    identity: identity, workstations: workstations)
             } catch {
-                NSLog("[haunted] restore: refresh failed (%@); prompting login", "\(error)")
-                HauntedKeychain.clear(consoleURL: stored.consoleURL)
-                onFailure()
-                return
+                NSLog("[haunted] startup: workstation list failed (%@)",
+                      "\(error)")
+                shared.showLoginMessage(error.localizedDescription)
             }
-            let daemons = (try? await HauntedConsoleAPI.daemons(
-                consoleURL: stored.consoleURL,
-                token: try await session.accessToken())) ?? []
-            NSLog("[haunted] restore: opening window with %d daemon(s)", daemons.count)
-            await HauntedManager.shared.openWindow(session: session, daemons: daemons)
         }
+    }
+
+    /// Right after a cold-launch spawn of the local workstation daemons,
+    /// dedmeshd still needs a moment to connect to the console and register —
+    /// give it a few quick retries before falling back to a plain shell, so
+    /// launching Haunted lands directly on the local workstation instead of
+    /// requiring the user to reopen it once it comes online.
+    @MainActor
+    private static func waitForOnline(
+        identity: HauntedClientIdentity
+    ) async throws -> [HauntedWorkstation] {
+        var workstations: [HauntedWorkstation] = []
+        for attempt in 0..<6 {
+            workstations = try await HauntedCLI.workstations(identity: identity)
+            if workstations.contains(where: { $0.online }) { break }
+            if attempt < 5 {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        return workstations
     }
 
     private static func installMenuItem() {
@@ -70,7 +79,7 @@ final class HauntedLoginController: NSWindowController {
         guard let fileMenu else { return }
 
         let item = NSMenuItem(
-            title: "Connect to Haunted…",
+            title: "Log in with DedMesh Console…",
             action: #selector(showLogin(_:)),
             keyEquivalent: "L")
         item.keyEquivalentModifierMask = [.command, .shift]
@@ -85,12 +94,12 @@ final class HauntedLoginController: NSWindowController {
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
-        window.title = "Connect to Haunted"
+        window.title = "Log in with DedMesh Console"
         window.isReleasedWhenClosed = false
         super.init(window: window)
 
-        let view = HauntedLoginView { [weak self] consoleURL, tokens in
-            self?.openTerminal(consoleURL: consoleURL, tokens: tokens)
+        let view = HauntedLoginView { [weak self] in
+            self?.openTerminal()
         }
         window.contentViewController = NSHostingController(rootView: view)
         window.center()
@@ -107,62 +116,75 @@ final class HauntedLoginController: NSWindowController {
         window?.makeKeyAndOrderFront(nil)
     }
 
-    /// Persists the refresh token and opens the Haunted terminal window
-    /// (daemon sidebar plus a tab attached to the first online daemon).
-    private func openTerminal(consoleURL: String, tokens: HauntedTokens) {
-        HauntedKeychain.save(.init(
-            consoleURL: consoleURL, refreshToken: tokens.refreshToken))
-        let session = HauntedSession(
-            consoleURL: consoleURL,
-            refreshToken: tokens.refreshToken,
-            initialAccess: tokens.accessToken,
-            initialExpiry: tokens.accessExpiresAt)
+    @MainActor
+    private func showLoginMessage(_ message: String) {
+        if let hosting = window?.contentViewController as? NSHostingController<HauntedLoginView> {
+            hosting.rootView = HauntedLoginView(initialMessage: message) { [weak self] in
+                self?.openTerminal()
+            }
+        }
+        showLogin(nil)
+    }
+
+    /// Login finished: the state dir now holds the certificate. Auto-connect
+    /// and close the login window.
+    private func openTerminal() {
+        guard let identity = HauntedClientIdentity.load() else { return }
         Task { @MainActor in
-            let daemons = (try? await HauntedConsoleAPI.daemons(
-                consoleURL: consoleURL, token: tokens.accessToken)) ?? []
-            await HauntedManager.shared.openWindow(session: session, daemons: daemons)
+            Self.connect(identity: identity)
             self.window?.close()
         }
     }
 }
 
 struct HauntedLoginView: View {
+    static let defaultConsoleURL = "https://console.staging.dednets.com"
+
     @State private var consoleURL = UserDefaults.standard.string(
-        forKey: "HauntedConsoleURL") ?? ""
-    @State private var username = ""
-    @State private var password = ""
+        forKey: "HauntedConsoleURL") ?? HauntedLoginView.defaultConsoleURL
+    @State private var requestID = ""
+    @State private var code = ""
     @State private var errorMessage: String?
     @State private var busy = false
+    @State private var waitingForCode = false
 
-    let onAuthenticated: (String, HauntedTokens) -> Void
+    let onLoggedIn: () -> Void
 
-    private var submitDisabled: Bool {
-        busy || consoleURL.isEmpty || username.isEmpty || password.isEmpty
+    init(initialMessage: String? = nil, onLoggedIn: @escaping () -> Void) {
+        self.onLoggedIn = onLoggedIn
+        _errorMessage = State(initialValue: initialMessage)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Haunted Console")
+        VStack(alignment: .leading, spacing: 14) {
+            Text("DedMesh Console")
                 .font(.headline)
-            Text("Sign in to list your daemons and attach to a session.")
+            Text("Log in once. Haunted stores the Terminal certificate in ~/.config/haunted and connects automatically after that.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-            TextField("Console URL (https://…)", text: $consoleURL)
+            TextField("Console URL", text: $consoleURL)
                 .textFieldStyle(.roundedBorder)
                 .autocorrectionDisabled()
-            TextField("Username", text: $username)
-                .textFieldStyle(.roundedBorder)
-                .autocorrectionDisabled()
-            SecureField("Password", text: $password)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit { signIn() }
+                .disabled(waitingForCode || busy)
+
+            if waitingForCode {
+                TextField("8-digit code", text: $code)
+                    .textFieldStyle(.roundedBorder)
+                    .autocorrectionDisabled()
+                    .onChange(of: code) { value in
+                        code = String(value.filter(\.isNumber).prefix(8))
+                    }
+                    .onSubmit { finishLogin() }
+            }
 
             if let errorMessage {
                 Text(errorMessage)
                     .font(.callout)
                     .foregroundStyle(.red)
                     .textSelection(.enabled)
+                    .lineLimit(4)
             }
 
             HStack {
@@ -171,255 +193,62 @@ struct HauntedLoginView: View {
                     ProgressView()
                         .controlSize(.small)
                 }
-                Button("Sign In") { signIn() }
+                Button(waitingForCode ? "Finish Login" : "Log In") {
+                    waitingForCode ? finishLogin() : beginLogin()
+                }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(submitDisabled)
+                    .disabled(busy || consoleURL.isEmpty || (waitingForCode && code.isEmpty))
             }
         }
         .padding(20)
-        .frame(width: 380)
+        .frame(width: 420)
     }
 
-    private func signIn() {
-        guard !submitDisabled else { return }
+    private func beginLogin() {
+        guard !busy, let url = URL(string: consoleURL), url.isAllowedConsoleScheme else {
+            errorMessage = "Enter an https:// Console URL."
+            return
+        }
         busy = true
         errorMessage = nil
         Task {
             defer { busy = false }
             do {
-                let tokens = try await HauntedConsoleAPI.login(
-                    consoleURL: consoleURL,
-                    username: username,
-                    password: password)
+                let request = try await HauntedClientLoginAPI.start(consoleURL: url)
+                guard let approvalURL = request.approvalURL(base: url) else {
+                    throw HauntedCLIError(message: "Console returned an invalid approval URL.")
+                }
+                requestID = request.id
+                waitingForCode = true
                 UserDefaults.standard.set(consoleURL, forKey: "HauntedConsoleURL")
-                password = ""
-                onAuthenticated(consoleURL, tokens)
+                NSWorkspace.shared.open(approvalURL)
+                errorMessage = "Approve the request in the Console, then enter the temporary code here."
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
     }
-}
 
-/// A daemon owned by the authenticated account, as reported by the Console.
-struct HauntedDaemon: Decodable, Identifiable, Equatable {
-    let id: String
-    let name: String
-    let online: Bool
-}
-
-/// A session running on a daemon, as reported by the Console.
-struct HauntedDaemonSession: Decodable, Identifiable, Equatable {
-    let name: String
-    let attachedClients: Int
-    let cols: Int
-    let rows: Int
-
-    var id: String { name }
-
-    enum CodingKeys: String, CodingKey {
-        case name
-        case attachedClients = "attached_clients"
-        case cols
-        case rows
-    }
-}
-
-/// The token pair returned by a successful login.
-struct HauntedTokens {
-    let accessToken: String
-    let accessExpiresAt: Date
-    let refreshToken: String
-}
-
-enum HauntedConsoleAPI {
-    private struct LoginResponse: Decodable {
-        let accessToken: String
-        let expiresAt: Date
-        let refreshToken: String?
-
-        enum CodingKeys: String, CodingKey {
-            case accessToken = "access_token"
-            case expiresAt = "expires_at"
-            case refreshToken = "refresh_token"
+    private func finishLogin() {
+        guard !busy, let url = URL(string: consoleURL), !requestID.isEmpty else {
+            return
         }
-    }
-
-    private struct ErrorResponse: Decodable {
-        struct Payload: Decodable {
-            let code: String
-            let message: String
-        }
-
-        let error: Payload
-    }
-
-    /// Validates the Console base URL. Credentials and tokens travel on
-    /// these requests: require TLS everywhere except explicit loopback
-    /// development consoles.
-    private static func baseURL(_ consoleURL: String) throws -> URL {
-        guard let base = URL(string: consoleURL), let scheme = base.scheme else {
-            throw loginError("enter a valid https Console URL")
-        }
-        let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
-        switch scheme {
-        case "https":
-            return base
-        case "http" where loopbackHosts.contains(base.host ?? ""):
-            return base
-        case "http":
-            throw loginError("http is only allowed for localhost consoles; use https://")
-        default:
-            throw loginError("enter a valid https Console URL")
-        }
-    }
-
-    private static var decoder: JSONDecoder {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601WithFractionalSeconds
-        return decoder
-    }
-
-    static func login(
-        consoleURL: String,
-        username: String,
-        password: String
-    ) async throws -> HauntedTokens {
-        let base = try baseURL(consoleURL)
-        var request = URLRequest(
-            url: base.appendingPathComponent("v1/sessions"),
-            timeoutInterval: 15)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(
-            ["username": username, "password": password])
-
-        let data = try await send(request)
-        let response = try decoder.decode(LoginResponse.self, from: data)
-        guard let refresh = response.refreshToken else {
-            throw loginError("Console did not issue a refresh token")
-        }
-        return HauntedTokens(
-            accessToken: response.accessToken,
-            accessExpiresAt: response.expiresAt,
-            refreshToken: refresh)
-    }
-
-    /// Exchanges a persistent refresh token for a fresh access token.
-    static func refresh(
-        consoleURL: String,
-        refreshToken: String
-    ) async throws -> (token: String, expiresAt: Date) {
-        let base = try baseURL(consoleURL)
-        var request = URLRequest(
-            url: base.appendingPathComponent("v1/tokens"),
-            timeoutInterval: 15)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(refreshToken)", forHTTPHeaderField: "Authorization")
-
-        let data = try await send(request)
-        let response = try decoder.decode(LoginResponse.self, from: data)
-        return (response.accessToken, response.expiresAt)
-    }
-
-    /// Lists the account's daemons with their online state.
-    static func daemons(
-        consoleURL: String,
-        token: String
-    ) async throws -> [HauntedDaemon] {
-        struct Response: Decodable {
-            let daemons: [HauntedDaemon]
-        }
-
-        let base = try baseURL(consoleURL)
-        var request = URLRequest(
-            url: base.appendingPathComponent("v1/daemons"),
-            timeoutInterval: 15)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
-        let data = try await send(request)
-        return try decoder.decode(Response.self, from: data).daemons
-    }
-
-    /// Lists the sessions running on a daemon.
-    static func daemonSessions(
-        consoleURL: String,
-        token: String,
-        daemonID: String
-    ) async throws -> [HauntedDaemonSession] {
-        struct Response: Decodable {
-            let sessions: [HauntedDaemonSession]
-        }
-
-        let base = try baseURL(consoleURL)
-        var request = URLRequest(
-            url: base.appendingPathComponent("v1/daemons/\(daemonID)/sessions"),
-            timeoutInterval: 15)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
-        let data = try await send(request)
-        return try decoder.decode(Response.self, from: data).sessions
-    }
-
-    /// Kills a session on a daemon.
-    static func killSession(
-        consoleURL: String,
-        token: String,
-        daemonID: String,
-        sessionName: String
-    ) async throws {
-        let base = try baseURL(consoleURL)
-        let encoded = sessionName.addingPercentEncoding(
-            withAllowedCharacters: .urlPathAllowed) ?? sessionName
-        var request = URLRequest(
-            url: base.appendingPathComponent("v1/daemons/\(daemonID)/sessions/\(encoded)"),
-            timeoutInterval: 15)
-        request.httpMethod = "DELETE"
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        _ = try await send(request)
-    }
-
-    private static func send(_ request: URLRequest) async throws -> Data {
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw loginError("unexpected response from Console")
-        }
-        guard (200..<300).contains(http.statusCode) else {
-            if let decoded = try? JSONDecoder().decode(ErrorResponse.self, from: data) {
-                throw loginError(decoded.error.message)
+        busy = true
+        errorMessage = nil
+        Task {
+            defer { busy = false }
+            do {
+                try await HauntedCLI.login(
+                    consoleURL: url,
+                    requestID: requestID,
+                    code: code)
+                code = ""
+                requestID = ""
+                waitingForCode = false
+                onLoggedIn()
+            } catch {
+                errorMessage = error.localizedDescription
             }
-            throw loginError("request failed (HTTP \(http.statusCode))")
-        }
-        return data
-    }
-
-    private static func loginError(_ message: String) -> NSError {
-        NSError(
-            domain: "com.thenets.haunted",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: message])
-    }
-}
-
-extension JSONDecoder.DateDecodingStrategy {
-    /// Decodes RFC 3339 timestamps with fractional seconds, matching the
-    /// Console's `time.RFC3339Nano` output.
-    static var iso8601WithFractionalSeconds: JSONDecoder.DateDecodingStrategy {
-        .custom { decoder in
-            let text = try decoder.singleValueContainer().decode(String.self)
-            let withFraction = ISO8601DateFormatter()
-            withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            if let date = withFraction.date(from: text) {
-                return date
-            }
-            let plain = ISO8601DateFormatter()
-            plain.formatOptions = [.withInternetDateTime]
-            if let date = plain.date(from: text) {
-                return date
-            }
-            throw DecodingError.dataCorrupted(.init(
-                codingPath: decoder.codingPath,
-                debugDescription: "invalid date: \(text)"))
         }
     }
 }

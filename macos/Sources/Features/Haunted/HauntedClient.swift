@@ -1,0 +1,499 @@
+import Foundation
+import Security
+
+/// The enrolled DedMesh client identity on disk. Enrollment (`haunted enroll`)
+/// stores an mTLS key + certificate plus the console address and a CA copy in
+/// the state dir, so holding a state dir with a certificate is the entire
+/// "logged in" state — there are no passwords or tokens in the GUI.
+struct HauntedClientIdentity: Equatable {
+    let stateDir: URL
+    /// Console control address (host:port), read from the persisted settings.
+    /// Display only; the CLI resolves it from the state dir itself.
+    let console: String?
+
+    static var defaultStateDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/haunted", isDirectory: true)
+    }
+
+    static var legacyStateDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/haunted/client", isDirectory: true)
+    }
+
+    /// Returns the identity if the default state dir holds an enrolled
+    /// certificate, else nil (enrollment needed).
+    static func load() -> HauntedClientIdentity? {
+        let dir = [defaultStateDir, legacyStateDir].first(where: hasLogin)
+            ?? defaultStateDir
+        guard hasLogin(dir) else { return nil }
+        struct Settings: Decodable { let console: String? }
+        var console: String?
+        let settings = dir.appendingPathComponent("settings.json")
+        if let data = try? Data(contentsOf: settings),
+           let decoded = try? JSONDecoder().decode(Settings.self, from: data) {
+            console = decoded.console
+        }
+        return HauntedClientIdentity(stateDir: dir, console: console)
+    }
+
+    private static func hasLogin(_ dir: URL) -> Bool {
+        let cert = dir.appendingPathComponent("cert.pem")
+        let key = dir.appendingPathComponent("key.pem")
+        let settings = dir.appendingPathComponent("settings.json")
+        let ca = dir.appendingPathComponent("ca.pem")
+        for url in [cert, key, settings, ca] {
+            guard FileManager.default.isReadableFile(atPath: url.path) else {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+struct HauntedClientLoginStart: Decodable {
+    let id: String
+    let url: String
+}
+
+struct HauntedClientLoginRedeem: Decodable {
+    let token: String
+    let username: String
+    let clientName: String
+    let controlPort: String
+    let caPEM: String
+
+    enum CodingKeys: String, CodingKey {
+        case token
+        case username
+        case clientName = "client_name"
+        case controlPort = "control_port"
+        case caPEM = "ca_pem"
+    }
+}
+
+extension URL {
+    /// The client-login flow exchanges a redeemable code for an mTLS client
+    /// certificate, so a plaintext hop is a credential-interception risk.
+    /// Loopback stays allowed over http for local console dev.
+    var isAllowedConsoleScheme: Bool {
+        guard let scheme = scheme?.lowercased() else { return false }
+        if scheme == "https" { return true }
+        guard scheme == "http" else { return false }
+        let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1"]
+        return loopbackHosts.contains(host?.lowercased() ?? "")
+    }
+}
+
+enum HauntedClientLoginAPI {
+    static func start(consoleURL: URL) async throws -> HauntedClientLoginStart {
+        let hostname = Host.current().localizedName ?? Host.current().name ?? "terminal"
+        return try await post(
+            consoleURL: consoleURL,
+            path: "/api/v0/client-login/start",
+            body: ["client_name": "term", "device_label": hostname]
+        )
+    }
+
+    static func redeem(
+        consoleURL: URL,
+        id: String,
+        code: String
+    ) async throws -> HauntedClientLoginRedeem {
+        try await post(
+            consoleURL: consoleURL,
+            path: "/api/v0/client-login/redeem",
+            body: ["id": id, "code": code]
+        )
+    }
+
+    private static func post<T: Decodable>(
+        consoleURL: URL,
+        path: String,
+        body: [String: String]
+    ) async throws -> T {
+        guard consoleURL.isAllowedConsoleScheme else {
+            throw HauntedCLIError(message: "Console URL must use https")
+        }
+        guard var components = URLComponents(url: consoleURL, resolvingAgainstBaseURL: false) else {
+            throw HauntedCLIError(message: "Invalid Console URL")
+        }
+        components.path = path
+        components.query = nil
+        guard let url = components.url else {
+            throw HauntedCLIError(message: "Invalid Console URL")
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HauntedCLIError(message: "No HTTP response from Console")
+        }
+        guard http.statusCode < 300 else {
+            let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            throw HauntedCLIError(message: text.isEmpty
+                ? "Console returned HTTP \(http.statusCode)"
+                : text)
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+}
+
+extension HauntedClientLoginStart {
+    func approvalURL(base consoleURL: URL) -> URL? {
+        if let absolute = URL(string: url), absolute.scheme != nil {
+            return absolute
+        }
+        guard var components = URLComponents(url: consoleURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        if let rel = URL(string: url), url.hasPrefix("/") {
+            components.path = rel.path
+            components.query = rel.query
+            return components.url
+        }
+        return nil
+    }
+}
+
+extension HauntedClientIdentity {
+    var consoleHost: String {
+        guard let console else { return "DedMesh" }
+        return console.split(separator: ":").first.map(String.init) ?? console
+    }
+
+    /// The enrolled identity ("username/client-name") from the client
+    /// certificate's CN — the same subject the console authenticates, so the
+    /// sidebar shows exactly who the mesh thinks we are. Nil if the cert is
+    /// unreadable (the caller should fall back to omitting the line).
+    var certIdentity: String? {
+        let certFile = stateDir.appendingPathComponent("cert.pem")
+        guard let pem = try? String(contentsOf: certFile, encoding: .utf8) else {
+            return nil
+        }
+        let base64 = pem
+            .components(separatedBy: .newlines)
+            .filter { !$0.hasPrefix("-----") && !$0.isEmpty }
+            .joined()
+        guard let der = Data(base64Encoded: base64),
+              let cert = SecCertificateCreateWithData(nil, der as CFData)
+        else { return nil }
+        var cn: CFString?
+        SecCertificateCopyCommonName(cert, &cn)
+        return cn as String?
+    }
+}
+
+/// A workstation this client may reach, as listed by
+/// `dedmeshctl workstations -json`.
+struct HauntedWorkstation: Decodable, Identifiable, Equatable {
+    let target: String // username/daemon/app — pass to attach
+    let daemon: String // display name
+    let app: String
+    let online: Bool
+    let state: String?
+    let error: String?
+
+    var id: String { target }
+    var status: String {
+        if online {
+            return "online"
+        }
+        if let state, state != "active" {
+            return state
+        }
+        return "offline"
+    }
+}
+
+/// A session running on a workstation's Haunted daemon, as listed by
+/// `haunted list --target … --json`.
+struct HauntedWorkstationSession: Decodable, Identifiable, Equatable {
+    let name: String
+    let pid: UInt32
+    let clients: Int
+    let cols: Int
+    let rows: Int
+    let created: UInt64
+    /// The session's terminal title (OSC 0/2, else its foreground process
+    /// name). Absent from daemons predating MSG_SESSION_LIST_V2.
+    let title: String?
+
+    var id: String { name }
+
+    /// What the sidebar shows: the human-facing title when the daemon knows
+    /// one, else the session name (IDs like gui-1a2b3c4d mean nothing).
+    /// Titles are attacker-influenced (any program in the session sets them),
+    /// so control and format characters — C0/C1, DEL, bidi overrides that
+    /// could visually spoof a row — are stripped before display.
+    var displayTitle: String {
+        guard let title, !title.isEmpty else { return name }
+        let cleaned = String(String.UnicodeScalarView(title.unicodeScalars.filter {
+            switch $0.properties.generalCategory {
+            case .control, .format, .privateUse, .surrogate: return false
+            default: return true
+            }
+        }))
+        return cleaned.isEmpty ? name : cleaned
+    }
+}
+
+struct HauntedCLIError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// `target` and session `name` values end up as positional/flag arguments to
+/// the `haunted` CLI (see attachCommand/killSession below), whose hand-rolled
+/// arg parser has no `--` end-of-options marker — a value starting with `-`
+/// risks being misread as one of the CLI's own flags rather than the
+/// positional it's meant to be (e.g. a compromised console returning a
+/// crafted session name). Both values come from remote-controlled JSON
+/// (`dedmeshctl workstations -json`, `haunted list --json`), so reject them
+/// at that decode boundary rather than at each call site.
+private func isSafeCLIArgument(_ value: String) -> Bool {
+    !value.isEmpty && !value.hasPrefix("-")
+}
+
+/// Shells out to the `haunted` / `dedmeshctl` CLIs, which own all mesh
+/// transport and mTLS state. Helper binaries are resolved to absolute paths:
+/// the app is often launched with no useful PATH (Finder/Dock, or a
+/// non-interactive `zsh -lc`, which never sources .zshrc), so "it's on my
+/// PATH" is true in the user's terminal and false inside the app.
+enum HauntedCLI {
+    /// Well-known install locations, most specific first. PATH remains the
+    /// last resort for setups that install elsewhere.
+    static func resolve(_ tool: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let candidates = [
+            "\(home)/.local/bin/\(tool)",
+            "/opt/homebrew/bin/\(tool)",
+            "/usr/local/bin/\(tool)",
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return path
+        }
+        return tool
+    }
+
+    static func workstations(
+        identity: HauntedClientIdentity
+    ) async throws -> [HauntedWorkstation] {
+        let data = try await run(
+            "\(quote(resolve("dedmeshctl"))) workstations -json -state-dir \(quote(identity.stateDir.path))")
+        return try JSONDecoder().decode([HauntedWorkstation].self, from: data)
+            .filter { isSafeCLIArgument($0.target) }
+    }
+
+    static func sessions(
+        identity: HauntedClientIdentity,
+        target: String
+    ) async throws -> [HauntedWorkstationSession] {
+        let data = try await run(
+            "\(quote(resolve("haunted"))) list --json --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
+        return try JSONDecoder().decode(
+            [HauntedWorkstationSession].self, from: data)
+            .filter { isSafeCLIArgument($0.name) }
+    }
+
+    static func killSession(
+        identity: HauntedClientIdentity,
+        target: String,
+        sessionName: String
+    ) async throws {
+        _ = try await run(
+            "\(quote(resolve("haunted"))) kill \(quote(sessionName)) --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
+    }
+
+    /// One-time enrollment: join token → client mTLS certificate (plus the
+    /// persisted console settings) in the default state dir.
+    static func enroll(
+        console: String,
+        caFile: String,
+        token: String,
+        name: String
+    ) async throws {
+        _ = try await run(
+            "\(quote(resolve("haunted"))) enroll --console \(quote(console)) --ca \(quote(caFile)) "
+                + "--token \(quote(token)) --name \(quote(name)) "
+                + "--state-dir \(quote(HauntedClientIdentity.defaultStateDir.path))")
+    }
+
+    static func login(
+        consoleURL: URL,
+        requestID: String,
+        code: String
+    ) async throws {
+        let redeemed = try await HauntedClientLoginAPI.redeem(
+            consoleURL: consoleURL, id: requestID, code: code)
+        let stateDir = HauntedClientIdentity.defaultStateDir
+        try FileManager.default.createDirectory(
+            at: stateDir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let caFile = stateDir.appendingPathComponent("ca.pem")
+        try redeemed.caPEM.write(to: caFile, atomically: true, encoding: .utf8)
+        guard let host = consoleURL.host else {
+            throw HauntedCLIError(message: "Invalid Console URL")
+        }
+        let controlPort = redeemed.controlPort.isEmpty ? "9443" : redeemed.controlPort
+        try await enroll(
+            console: "\(host):\(controlPort)",
+            caFile: caFile.path,
+            token: redeemed.token,
+            name: redeemed.clientName)
+    }
+
+    /// The command a terminal tab runs to attach to a workstation session.
+    /// create=true for fresh session names (the daemon does not create on
+    /// raw attach).
+    ///
+    /// The heavy lifting lives in a generated helper script (attachLoopPath):
+    /// initialInput is TYPED into the starting shell and echoed raw back at
+    /// the user, so it must stay one short ASCII line — the script's first
+    /// act is to wipe the screen, erasing that echo.
+    static func attachCommand(
+        target: String,
+        sessionName: String,
+        create: Bool
+    ) -> String {
+        var cmd = "exec \(quote(attachLoopPath())) \(quote(target)) \(quote(sessionName))"
+        if create { cmd += " --create" }
+        return cmd
+    }
+
+    /// Writes (once per launch) and returns the attach-loop helper: a bounded
+    /// reconnect loop, because a console restart or network blip drops the
+    /// transport while the session it fronts is still alive on the
+    /// workstation — quietly reattaching beats stranding the user on an exit
+    /// banner. Growing backoff capped at 10s, 20 attempts ≈ 3 minutes of
+    /// riding out mesh re-convergence (the workstation daemon reconnects on
+    /// its own backoff; attach attempts during its gap fail instantly).
+    /// A clean exit (detach / session killed) breaks the loop; ctrl-c during
+    /// the backoff cancels it; spent retries exit nonzero so
+    /// wait-after-command shows the failure.
+    private static var wroteAttachLoop = false
+    static func attachLoopPath() -> String {
+        let dir = FileManager.default.urls(
+            for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("HauntedTerminal", isDirectory: true)
+        let script = dir.appendingPathComponent("attach-loop.sh")
+        if wroteAttachLoop { return script.path }
+
+        // ASCII only: this file's output lands in a terminal whose charset
+        // is not yet negotiated when the loop starts.
+        let body = """
+        #!/bin/sh
+        # Generated by Haunted Terminal at launch; edits are overwritten.
+        # usage: attach-loop.sh TARGET SESSION [--create]
+        TARGET=$1; SESSION=$2; CREATE=${3:-}
+        # Wipe the echoed invocation and title the tab after the session
+        # (instead of this script's exec line); the remote session's own
+        # title updates pass through and override this once attached.
+        printf '\\033[2J\\033[H\\033]0;%s\\007' "$SESSION on ${TARGET#*/}"
+        trap 'echo; echo "[haunted] reconnect cancelled"; exit 130' INT
+        attempt=0; delay=2
+        while :; do
+            \(quote(resolve("haunted"))) attach-remote --target "$TARGET" ${CREATE:+--create} "$SESSION"
+            code=$?
+            [ $code -eq 0 ] && exit 0
+            attempt=$((attempt+1))
+            [ $attempt -ge 20 ] && { echo "[haunted] giving up after 20 attempts (exit $code)"; exit $code; }
+            echo "[haunted] connection lost (exit $code); reconnecting ($attempt/20) in ${delay}s, ctrl-c to stop"
+            sleep $delay
+            delay=$((delay+2)); [ $delay -gt 10 ] && delay=10
+        done
+        """
+        do {
+            try FileManager.default.createDirectory(
+                at: dir, withIntermediateDirectories: true)
+            try body.write(to: script, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o755], ofItemAtPath: script.path)
+            wroteAttachLoop = true
+        } catch {
+            NSLog("[haunted] cannot write attach-loop helper: %@", "\(error)")
+        }
+        return script.path
+    }
+
+    static func quote(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    private static func run(_ command: String) async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-lc", command]
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+            process.standardInput = FileHandle.nullDevice
+
+            // Accumulate output as it streams so a chatty child can never
+            // fill the pipe and deadlock against waiting for termination.
+            let collector = OutputCollector()
+            stdout.fileHandleForReading.readabilityHandler = { handle in
+                collector.appendOut(handle.availableData)
+            }
+            stderr.fileHandleForReading.readabilityHandler = { handle in
+                collector.appendErr(handle.availableData)
+            }
+
+            process.terminationHandler = { proc in
+                stdout.fileHandleForReading.readabilityHandler = nil
+                stderr.fileHandleForReading.readabilityHandler = nil
+                collector.appendOut(
+                    stdout.fileHandleForReading.readDataToEndOfFile())
+                collector.appendErr(
+                    stderr.fileHandleForReading.readDataToEndOfFile())
+                let (out, err) = collector.snapshot()
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: out)
+                } else {
+                    let message = String(data: err, encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    continuation.resume(throwing: HauntedCLIError(
+                        message: message.isEmpty
+                            ? "command failed (\(proc.terminationStatus))"
+                            : message))
+                }
+            }
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+}
+
+/// Thread-safe stdout/stderr accumulator for HauntedCLI.run (readability
+/// handlers and the termination handler fire on different queues).
+private final class OutputCollector: @unchecked Sendable {
+    private var out = Data()
+    private var err = Data()
+    private let lock = NSLock()
+
+    func appendOut(_ data: Data) {
+        lock.lock()
+        out.append(data)
+        lock.unlock()
+    }
+
+    func appendErr(_ data: Data) {
+        lock.lock()
+        err.append(data)
+        lock.unlock()
+    }
+
+    func snapshot() -> (Data, Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (out, err)
+    }
+}

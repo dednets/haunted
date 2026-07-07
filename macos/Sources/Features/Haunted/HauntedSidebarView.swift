@@ -1,42 +1,192 @@
 import SwiftUI
 
-/// Daemon sidebar shown in Haunted-connected terminal windows. Each daemon is
-/// a group; under it are the sessions currently running on that daemon, plus a
-/// "new session" action. Selecting a session opens a new tab attached to it;
-/// selecting "new session" creates a fresh one. The list refreshes on a short
-/// poll.
-struct HauntedSidebarView: View {
-    let session: HauntedSession
-    /// (daemon, sessionName?) — nil sessionName means "create a new session".
-    let onOpen: (HauntedDaemon, String?) -> Void
+/// Shared state behind every sidebar instance. Each tab's window hosts its
+/// own HauntedSidebarView, but they all render THIS one model: tab switches
+/// show identical, already-loaded data (no flicker, no reload), and the
+/// single poll loop lives here — owned by the app, not by any view — so
+/// SwiftUI cancelling a hidden tab's `.task` can neither kill polling nor
+/// reset the data. Expansion state is shared too: the sidebar reads as one
+/// persistent surface that every tab happens to show.
+@MainActor
+final class HauntedSidebarModel: ObservableObject {
+    static let shared = HauntedSidebarModel()
 
-    @State private var daemons: [HauntedDaemon] = []
-    @State private var sessionsByDaemon: [String: [HauntedDaemonSession]] = [:]
-    @State private var expanded: Set<String> = []
-    @State private var errorMessage: String?
-    @State private var loaded = false
+    @Published var workstations: [HauntedWorkstation] = []
+    @Published var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
+    @Published var expanded: Set<String> = []
+    @Published var errorMessage: String?
+    @Published var loaded = false
 
-    private var consoleHost: String {
-        URL(string: session.consoleURL)?.host ?? session.consoleURL
+    private var identity: HauntedClientIdentity?
+    private var pollTask: Task<Void, Never>?
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: .hauntedSessionsDidChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            // Attach/kill take a moment to land daemon-side; refresh shortly
+            // after instead of waiting out the poll interval.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                await self?.refreshSessions()
+            }
+        }
     }
 
+    /// Idempotent: the first sidebar starts the poll loop, later ones just
+    /// render. A changed identity (re-login) restarts it.
+    func start(identity: HauntedClientIdentity) {
+        if self.identity == identity, pollTask != nil { return }
+        self.identity = identity
+        pollTask?.cancel()
+        loaded = false
+        pollTask = Task { [weak self] in await self?.poll() }
+    }
+
+    func toggle(_ workstation: HauntedWorkstation) {
+        if expanded.contains(workstation.id) {
+            expanded.remove(workstation.id)
+        } else {
+            expanded.insert(workstation.id)
+        }
+    }
+
+    func kill(workstation: HauntedWorkstation, session sessionName: String) {
+        guard let identity else { return }
+        // Optimistically drop it from the list; the change notification's
+        // refresh reconciles.
+        sessionsByTarget[workstation.id]?.removeAll { $0.name == sessionName }
+        HauntedManager.shared.killSession(
+            identity: identity,
+            target: workstation.target,
+            sessionName: sessionName)
+    }
+
+    private func refreshSessions() async {
+        guard let identity else { return }
+        for workstation in workstations where workstation.online {
+            if let sessions = try? await HauntedCLI.sessions(
+                identity: identity, target: workstation.target) {
+                sessionsByTarget[workstation.id] =
+                    sessions.sorted { $0.name < $1.name }
+            }
+        }
+    }
+
+    private func poll() async {
+        while !Task.isCancelled {
+            guard let identity else { return }
+            do {
+                let fresh = try await HauntedCLI.workstations(identity: identity)
+                workstations = fresh.sorted { $0.target < $1.target }
+                errorMessage = nil
+
+                // On first load, expand online workstations so sessions are
+                // visible.
+                if !loaded {
+                    expanded = Set(fresh.filter { $0.online }.map { $0.id })
+                }
+
+                await refreshSessions()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+            loaded = true
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+        }
+    }
+}
+
+/// Workstation sidebar shown in Haunted-connected terminal windows. Each
+/// workstation the enrolled client may reach is a group; under it are the
+/// sessions currently running on that workstation's Haunted daemon, plus a
+/// "new session" action. Clicking an online workstation's name attaches to
+/// its persistent "default" session (creating it on first use); the chevron
+/// expands the session list. Rows for sessions already open in this app are
+/// highlighted. Purely a renderer over HauntedSidebarModel.shared.
+struct HauntedSidebarView: View {
+    let identity: HauntedClientIdentity
+    /// (workstation, sessionName?) — nil sessionName means "create a new session".
+    let onOpen: (HauntedWorkstation, String?) -> Void
+
+    @ObservedObject private var model = HauntedSidebarModel.shared
+    @ObservedObject private var layout = HauntedSidebarLayout.shared
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Haunted")
-                    .font(.headline)
-                Text(consoleHost)
-                    .font(.caption)
+        ZStack(alignment: .topLeading) {
+            // Full content is always laid out; only its opacity animates, so
+            // the fade never fights the width animation (which is AppKit's).
+            fullSidebar
+                .opacity(layout.contentVisible ? 1 : 0)
+                .allowsHitTesting(layout.contentVisible)
+                .animation(.easeInOut(duration: HauntedSidebarLayout.animationDuration),
+                           value: layout.contentVisible)
+
+            // The show button belongs to the collapsed strip; it's visible
+            // only once the sidebar has actually narrowed (collapsed) and the
+            // content has faded out.
+            if layout.collapsed && !layout.contentVisible {
+                collapsedStrip
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .onAppear { model.start(identity: identity) }
+    }
+
+    /// The hidden state: a thin icon-only strip whose single button brings
+    /// the sidebar back.
+    private var collapsedStrip: some View {
+        VStack {
+            Button {
+                layout.setCollapsed(false)
+            } label: {
+                Image(systemName: "sidebar.left")
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+            .help("Show workstations")
+            .padding(.top, 14)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var fullSidebar: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 4) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Haunted")
+                        .font(.headline)
+                    Text(identity.consoleHost)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let who = identity.certIdentity {
+                        Text("@" + who)
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                            .help("Enrolled client identity (certificate CN)")
+                    }
+                }
+                Spacer(minLength: 0)
+                Button {
+                    layout.setCollapsed(true)
+                } label: {
+                    Image(systemName: "sidebar.left")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Hide workstations (drag the divider to resize)")
             }
             .padding(.top, 12)
             .padding(.horizontal, 12)
 
             Divider()
 
-            if loaded && daemons.isEmpty && errorMessage == nil {
-                Text("No daemons enrolled")
+            if model.loaded && model.workstations.isEmpty && model.errorMessage == nil {
+                Text("No workstations")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
@@ -44,15 +194,21 @@ struct HauntedSidebarView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
-                    ForEach(daemons) { daemon in
-                        DaemonGroup(
-                            daemon: daemon,
-                            sessions: sessionsByDaemon[daemon.id] ?? [],
-                            isExpanded: expanded.contains(daemon.id),
-                            toggle: { toggle(daemon) },
-                            onOpenSession: { onOpen(daemon, $0) },
-                            onNewSession: { onOpen(daemon, nil) },
-                            onKillSession: { kill(daemon: daemon, session: $0) })
+                    ForEach(model.workstations) { workstation in
+                        WorkstationGroup(
+                            workstation: workstation,
+                            sessions: model.sessionsByTarget[workstation.id] ?? [],
+                            isExpanded: model.expanded.contains(workstation.id),
+                            toggle: { model.toggle(workstation) },
+                            onOpenPrimary: {
+                                model.expanded.insert(workstation.id)
+                                onOpen(workstation, "default")
+                            },
+                            onOpenSession: { onOpen(workstation, $0) },
+                            onNewSession: { onOpen(workstation, nil) },
+                            onKillSession: {
+                                model.kill(workstation: workstation, session: $0)
+                            })
                     }
                 }
                 .padding(.horizontal, 8)
@@ -60,7 +216,7 @@ struct HauntedSidebarView: View {
 
             Spacer(minLength: 0)
 
-            if let errorMessage {
+            if let errorMessage = model.errorMessage {
                 Text(errorMessage)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -68,105 +224,68 @@ struct HauntedSidebarView: View {
                     .padding(.horizontal, 12)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .task { await poll() }
-    }
-
-    private func toggle(_ daemon: HauntedDaemon) {
-        if expanded.contains(daemon.id) {
-            expanded.remove(daemon.id)
-        } else {
-            expanded.insert(daemon.id)
-        }
-    }
-
-    private func kill(daemon: HauntedDaemon, session sessionName: String) {
-        // Optimistically drop it from the list; the next poll reconciles.
-        sessionsByDaemon[daemon.id]?.removeAll { $0.name == sessionName }
-        Task {
-            do {
-                let token = try await session.accessToken()
-                try await HauntedConsoleAPI.killSession(
-                    consoleURL: session.consoleURL,
-                    token: token,
-                    daemonID: daemon.id,
-                    sessionName: sessionName)
-            } catch {
-                errorMessage = "kill failed: \(error.localizedDescription)"
-            }
-        }
-    }
-
-    private func poll() async {
-        while !Task.isCancelled {
-            do {
-                let token = try await session.accessToken()
-                let fresh = try await HauntedConsoleAPI.daemons(
-                    consoleURL: session.consoleURL, token: token)
-                daemons = fresh.sorted { $0.name < $1.name }
-                errorMessage = nil
-
-                // On first load, expand online daemons so sessions are visible.
-                if !loaded {
-                    expanded = Set(fresh.filter { $0.online }.map { $0.id })
-                }
-
-                // Refresh sessions for online daemons.
-                for daemon in daemons where daemon.online {
-                    if let sessions = try? await HauntedConsoleAPI.daemonSessions(
-                        consoleURL: session.consoleURL,
-                        token: token,
-                        daemonID: daemon.id) {
-                        sessionsByDaemon[daemon.id] =
-                            sessions.sorted { $0.name < $1.name }
-                    }
-                }
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-            loaded = true
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
-        }
     }
 }
 
-private struct DaemonGroup: View {
-    let daemon: HauntedDaemon
-    let sessions: [HauntedDaemonSession]
+private struct WorkstationGroup: View {
+    let workstation: HauntedWorkstation
+    let sessions: [HauntedWorkstationSession]
     let isExpanded: Bool
     let toggle: () -> Void
+    let onOpenPrimary: () -> Void
     let onOpenSession: (String) -> Void
     let onNewSession: () -> Void
     let onKillSession: (String) -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
-            Button(action: toggle) {
-                HStack(spacing: 6) {
+            HStack(spacing: 0) {
+                Button(action: toggle) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .frame(width: 10)
-                    Circle()
-                        .fill(daemon.online ? Color.green : Color.secondary.opacity(0.4))
-                        .frame(width: 8, height: 8)
-                    Text(daemon.name)
-                        .fontWeight(.medium)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
                 }
-                .contentShape(Rectangle())
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
-            }
-            .buttonStyle(.plain)
-            .disabled(!daemon.online)
-            .opacity(daemon.online ? 1 : 0.5)
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse sessions" : "Show sessions")
 
-            if isExpanded && daemon.online {
+                Button(action: onOpenPrimary) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 8, height: 8)
+                        Text(workstation.daemon)
+                            .fontWeight(.medium)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(hovering && workstation.online
+                                  ? Color.secondary.opacity(0.15) : Color.clear))
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
+                .help(workstation.online
+                      ? "Open a terminal on \(workstation.daemon) (its persistent default session)"
+                      : workstation.error ?? "\(workstation.target) (\(workstation.status))")
+            }
+            .disabled(!workstation.online)
+            .opacity(workstation.online ? 1 : 0.5)
+            .padding(.leading, 2)
+
+            if isExpanded && workstation.online {
                 ForEach(sessions) { session in
                     SessionRow(
                         session: session,
+                        isOpenHere: HauntedManager.shared.isSessionOpen(
+                            target: workstation.target, sessionName: session.name),
                         action: { onOpenSession(session.name) },
                         onKill: { onKillSession(session.name) })
                 }
@@ -188,10 +307,21 @@ private struct DaemonGroup: View {
             }
         }
     }
+
+    private var statusColor: Color {
+        if workstation.online {
+            return .green
+        }
+        if workstation.state == "error" {
+            return .red
+        }
+        return Color.secondary.opacity(0.4)
+    }
 }
 
 private struct SessionRow: View {
-    let session: HauntedDaemonSession
+    let session: HauntedWorkstationSession
+    let isOpenHere: Bool
     let action: () -> Void
     let onKill: () -> Void
 
@@ -202,10 +332,11 @@ private struct SessionRow: View {
             HStack(spacing: 6) {
                 Image(systemName: "terminal")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Text(session.name)
+                    .foregroundStyle(isOpenHere ? Color.accentColor : Color.secondary)
+                Text(session.displayTitle)
+                    .fontWeight(isOpenHere ? .medium : .regular)
                     .lineLimit(1)
-                if session.attachedClients > 0 {
+                if session.clients > 0 {
                     Circle()
                         .fill(Color.accentColor)
                         .frame(width: 5, height: 5)
@@ -225,9 +356,11 @@ private struct SessionRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help(session.attachedClients > 0
-              ? "Reattach \(session.name) (moves it to this tab)"
-              : "Attach \(session.name) in a new tab")
+        .help(isOpenHere
+              ? "\(session.name) — open in this window; click to focus its tab"
+              : session.clients > 0
+                  ? "Reattach \(session.name) (moves it to this tab)"
+                  : "Attach \(session.name) in a new tab")
         .contextMenu {
             Button("Attach in New Tab") { action() }
             Divider()
