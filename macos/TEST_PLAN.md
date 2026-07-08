@@ -23,14 +23,8 @@ Confirmed and fixed in Phase 1:
   `isSafeCLIArgument` (still used for `target`) additionally rejects control and
   format scalars.
 
-Confirmed, not yet fixed:
-
-- **ID-09** — `consoleHost` of `"[::1]:9443"` really does return `"["`. Phase 2.
-- **INV-11** — the "never a plain local terminal" invariant has **four live
-  holes**: dock drop (`macos-dock-drop-behavior = new_window`), AppleScript,
-  App Intents, and the Services provider each still call
-  `TerminalController.newWindow` for an unattached local shell. The pinning test
-  records them; closing them is a separate change.
+Confirmed, **not yet fixed** — see §11 for detail: `BUG-1` (four ways to open a
+plain local terminal) and `BUG-2` (`consoleHost` mangles IPv6).
 
 Corrections to this plan, found by writing the tests:
 
@@ -233,7 +227,7 @@ lone surrogate scalar. Harmless, but do not write a test that pretends to cover 
 | ID-06 | `settings.json` is malformed | identity loads, `console == nil` (no throw) |
 | ID-07 | `consoleHost` of `"console.example.com:9443"` | `"console.example.com"` |
 | ID-08 | `consoleHost` of `nil` | `"DedMesh"` |
-| ID-09 | `consoleHost` of `"[::1]:9443"` | ⚠️ returns `"["` — split on `":"` takes the first component. **Expected to fail.** |
+| ID-09 | `consoleHost` of `"[::1]:9443"` | ⚠️ returns `"["` — split on `":"` takes the first component. **Confirmed; expected to fail.** See §11, BUG-2. |
 | ID-10 | `certIdentity` from a fixture cert with `CN=alice/term` | `"alice/term"` |
 | ID-11 | `certIdentity` from a **chain** PEM (leaf + intermediate) | ⚠️ all base64 lines are joined across both certs → invalid DER → `nil`. **Expected to fail** if the console ever issues chains. |
 | ID-12 | `certIdentity`, unreadable file | `nil` |
@@ -476,7 +470,7 @@ L3 (XCUITest) unless noted:
 | INV-08 | `ghosttyNewTab` from a non-`TerminalController` window | ignored |
 | INV-09 | **L0**: `TerminalWindowRestoration.restoreWindow` | always `completionHandler(nil, nil)`, regardless of `window-save-state` |
 | INV-10 | Relaunch after quit with 3 tabs open | zero windows restored |
-| INV-11 | Every `TerminalController.newWindow` call site in `macos/Sources` | ✅ **implemented as an L0 grep test** (`newWindowCallSitesArePinned`), pulled forward into Phase 1 — it is the only guard that survives a rebase. It found that the invariant is **not** actually held: dock drop (`macos-dock-drop-behavior = new_window`), AppleScript, App Intents, and the Services provider each still open an unattached local shell. The allowlist records and classifies them; closing them is separate work. |
+| INV-11 | Every `TerminalController.newWindow` call site in `macos/Sources` | ✅ **implemented as an L0 grep test** (`newWindowCallSitesArePinned`), pulled forward into Phase 1 — it is the only guard that survives a rebase. It found that the invariant is **not** actually held: see §11, BUG-1. |
 
 ⚠️ INV-09 also documents dead code: everything after the unconditional `return`
 in `TerminalRestorable.swift:142` is unreachable. Either delete it or leave a
@@ -604,8 +598,8 @@ Expected failures: SUP-08, ID-09, ID-11.
 is the piece that catches C↔Swift drift, which is the failure mode the current
 suite structurally cannot see.
 
-**Phase 5 — L3.** `INV-01…11`. Slowest, flakiest, but INV-11 (grep-based) is
-free and should be pulled forward into Phase 1.
+**Phase 5 — L3.** `INV-01…08`, `INV-10`. Slowest, flakiest. INV-09 and INV-11 are
+L0 and already landed in Phase 1.
 
 ---
 
@@ -659,8 +653,82 @@ be rebased onto upstream Ghostty.
    `@user/client` line.
 4. ~~Does `docs/haunted.md` need a "Testing the macOS app" section once Phase 1
    lands?~~ Yes; added as "Testing the macOS Terminal".
-5. **INV-11's four holes** — dock drop, AppleScript, App Intents, and the
-   Services provider all still open a plain local terminal. Is "never a plain
-   local terminal" meant to hold for those entry points too? If yes, each needs
-   to route through `HauntedLoginController.startup()` and the allowlist shrinks
-   to the three legitimate sites.
+5. **BUG-1** — is "never a plain local terminal" meant to hold for the dock-drop,
+   AppleScript, App Intents and Services entry points too? See §11.
+
+---
+
+## 11. Confirmed defects, not yet fixed
+
+Each was reproduced while implementing Phase 1. These are **not** ⚠️ candidates —
+those live in §4 and are still unverified. Every entry below has been observed.
+
+Two defects the plan predicted (TITLE-07, APPR-05) were confirmed the same way
+and are already fixed; §4 marks them ✅.
+
+### BUG-1 — four entry points still open a plain local terminal
+
+**Severity: high.** No hostile console required; a user gesture is enough.
+**Found by:** `HauntedForkInvariantTests.newWindowCallSitesArePinned` (§4.6, INV-11).
+
+The fork's central claim is that a window is *never* an unattached local shell.
+⌘N, ⌘T, dock reopen (`applicationShouldHandleReopen`) and window restoration are
+all closed — which is exactly why the invariant reads as airtight. It is not.
+These four call `TerminalController.newWindow` for a fresh local shell:
+
+| # | Site | Trigger |
+|---|---|---|
+| 1 | `macos/Sources/App/macOS/AppDelegate.swift:520` | drop a file on the dock icon with `macos-dock-drop-behavior = new_window` |
+| 2 | `macos/Sources/Features/AppleScript/AppDelegate+AppleScript.swift:194` | AppleScript / `osascript` |
+| 3 | `macos/Sources/Features/App Intents/NewTerminalIntent.swift:110` | App Intents, Shortcuts, Spotlight |
+| 4 | `macos/Sources/Features/Services/ServiceProvider.swift:66` | the macOS Services menu ("New Ghostty Terminal Here") |
+
+Site 1 is the cheapest to reach: it needs one drag, no scripting.
+
+A fifth call site — `BaseTerminalController.swift:785`, dragging a split out of a
+window — is **not** a hole: it re-homes an already-attached surface tree and
+spawns no new shell. The three sites inside `TerminalController.swift` are its
+own internal dispatch.
+
+**Fix:** route 1–4 through `HauntedLoginController.startup()`, as
+`AppDelegate.newWindow(_:)` already does. Then shrink the allowlist in
+`newWindowCallSitesArePinned` to the five legitimate sites — the test will fail
+until the map matches, which is the point.
+
+Until then the allowlist records and classifies all nine sites, so a rebase
+cannot add a tenth silently. **Do not silence a failure by bumping a count.**
+
+### BUG-2 — `consoleHost` mangles a bracketed IPv6 console address
+
+**Severity: low.** Display only, and no user has an IPv6-literal console today.
+**Found by:** reading `HauntedClient.swift` for ID-09; reproduced standalone.
+**Test:** ID-09 in §4.1, lands with Phase 2.
+
+`macos/Sources/Features/Haunted/HauntedClient.swift:173`
+
+```swift
+return console.split(separator: ":").first.map(String.init) ?? console
+```
+
+`consoleHost` of `"[::1]:9443"` returns `"["`, which the sidebar then renders as
+the console's name. Splitting on the *first* `:` is wrong for any bracketed
+literal.
+
+**Fix:** `URLComponents(string: "//\(console)")?.host ?? console`. Verified
+against `[::1]:9443` → `[::1]`, `console.example.com:9443` → `console.example.com`,
+`console.example.com` → itself, `[fe80::1%25en0]:9443` → `[fe80::1%en0]`.
+
+Careful: `URLComponents.host` keeps the brackets (`[::1]`), while `URL.host`
+strips them (`::1` — that is what SCHEME-05 pins, and what
+`isAllowedConsoleScheme`'s loopback set matches against). The two disagree. For
+`consoleHost`, which is display-only, the bracketed form is the correct one; do
+not "unify" them without re-reading SCHEME-05.
+
+### Still unconfirmed
+
+The remaining ⚠️ marks in §4 — SUP-08 (`pgrep -f` takes an ERE, so a config path
+with `+` or `.` misses a running daemon and a second one spawns), ID-11 (cert
+chains), SPL-04 (`pendingSplitSessionName` leaks), LAY-07, LOG-04/05 — are
+candidates read off the code, not observations. SUP-08 is the one most likely to
+be real and the most damaging if it is: two `dedmeshd` instances fighting the
+console for one identity. It lands with Phase 2.
