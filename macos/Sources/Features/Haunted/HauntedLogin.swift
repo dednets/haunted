@@ -150,8 +150,17 @@ struct HauntedLoginView: View {
 
     let onLoggedIn: () -> Void
 
-    init(initialMessage: String? = nil, onLoggedIn: @escaping () -> Void) {
+    /// The whole login flow — start, then redeem inside `HauntedCLI.login` —
+    /// runs over this one session, so a test can stand the console up in-process.
+    private let session: URLSession
+
+    init(
+        initialMessage: String? = nil,
+        session: URLSession = .shared,
+        onLoggedIn: @escaping () -> Void
+    ) {
         self.onLoggedIn = onLoggedIn
+        self.session = session
         _errorMessage = State(initialValue: initialMessage)
     }
 
@@ -214,7 +223,8 @@ struct HauntedLoginView: View {
         Task {
             defer { busy = false }
             do {
-                let request = try await HauntedClientLoginAPI.start(consoleURL: url)
+                let request = try await HauntedClientLoginAPI.start(
+                    consoleURL: url, session: session)
                 guard let approvalURL = request.approvalURL(base: url) else {
                     throw HauntedCLIError(message: "Console returned an invalid approval URL.")
                 }
@@ -241,7 +251,8 @@ struct HauntedLoginView: View {
                 try await HauntedCLI.login(
                     consoleURL: url,
                     requestID: requestID,
-                    code: code)
+                    code: code,
+                    session: session)
                 code = ""
                 requestID = ""
                 waitingForCode = false

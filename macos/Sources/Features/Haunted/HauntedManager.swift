@@ -61,9 +61,15 @@ final class HauntedManager {
     }
 
     /// Must satisfy the daemon's session_name_valid() — see isValidSessionName.
+    ///
+    /// 16 hex digits, not 8: a collision means two tabs share a tabKey, so a
+    /// sidebar click focuses the wrong session (or `haunted` attaches where it
+    /// should create). At 32 bits the birthday bound makes that a ~1-in-10⁴
+    /// event across a few thousand sessions — small, but for free it can be
+    /// 64 bits and negligible. Well inside HAUNTED_SESSION_NAME_MAX (63).
     static func generateSessionName() -> String {
         "gui-" + String(UUID().uuidString.replacingOccurrences(
-            of: "-", with: "").prefix(8)).lowercased()
+            of: "-", with: "").prefix(16)).lowercased()
     }
 
     func identity(for controller: TerminalController) -> HauntedClientIdentity? {

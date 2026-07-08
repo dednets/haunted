@@ -6,25 +6,48 @@ plan was written the delta had **zero automated coverage**: `macos/Tests/` and
 `macos/GhosttyUITests/` were inherited upstream suites, and `grep -ril haunt` over
 both returned nothing. `make haunted-test` runs six ctest targets, all C.
 
-Status: **Phase 1 landed** (§7). `macos/Tests/Haunted/` holds ~97 tests, run by
-`make haunted-test-macos`. Phases 2–5 are still plan only. Findings marked ⚠️
-are defect *candidates* spotted while reading the code to write this plan; each
-is phrased as a test that should fail today. Confirm before "fixing".
+Status: **Phases 1 and 2 landed** (§7). `macos/Tests/Haunted/` holds ~90 test
+functions across 10 suites, run green by `make haunted-test-macos`. Phases 3–5 are
+still plan only. Findings marked ⚠️ are defect *candidates* spotted while reading
+the code to write this plan; each is phrased as a test that should fail today.
+Confirm before "fixing".
 
-Confirmed and fixed in Phase 1:
+Confirmed and fixed in **Phase 1**:
 
 - **APPR-05** — `approvalURL` returned `javascript:` / `file://` / any-scheme URLs
   straight to `NSWorkspace.shared.open`. Now both the absolute and the
   base-resolved branch must pass `isAllowedConsoleScheme`.
 - **TITLE-07 / SH-07** — session `name` was never validated. Now rejected at the
   decode boundary by `isValidSessionName`, mirroring the daemon's
-  `session_name_valid()` (`[A-Za-z0-9_-]{1,63}`), plus a leading-`-` ban. A name
-  can no longer reach `attach-loop.sh`'s OSC-0 `printf` nor the sidebar fallback.
-  `isSafeCLIArgument` (still used for `target`) additionally rejects control and
-  format scalars.
+  `session_name_valid()` (`[A-Za-z0-9_-]{1,63}`), plus a leading-`-` ban.
 
-Confirmed, **not yet fixed** — see §11 for detail: `BUG-1` (four ways to open a
-plain local terminal) and `BUG-2` (`consoleHost` mangles IPv6).
+Confirmed and fixed in **Phase 2** (each has a regression test named for its ID):
+
+- **SUP-08 (was BUG-3)** — `pgrep -f` takes a POSIX **ERE**, not a literal. A
+  config path holding `+` never matched the daemon actually running it, so a
+  **second `dedmeshd` spawned** and the two fought the Console for one identity;
+  the same wildcards could also falsely match a *different* daemon's path, so one
+  that should start never did. Both directions were reproduced against the real
+  `/usr/bin/pgrep`. The path is now ERE-escaped and passed after `--`.
+  The most severe defect found in Phase 2.
+- **LOG-04 (was BUG-4)** — `createDirectory(attributes:)` applies its mode only to
+  directories it *creates*. A pre-existing `0755` `~/.config/haunted` stayed
+  world-readable while `haunted enroll` wrote `key.pem` — the client's mTLS
+  **private key** — into it. Now chmod'd `0700` unconditionally.
+- **ID-11 (was BUG-5)** — `certIdentity` joined the base64 of *every* PEM block, so
+  a certificate chain decoded to garbage (or, when the leaf's DER length happened
+  to be ≡ 0 mod 3, to the leaf with a whole second cert stapled to its tail, which
+  Security.framework silently ignored). Now parses the first block only. This
+  answers §10 Q3's if-then: yes, chains were already broken.
+- **ID-09 (was BUG-2)** — `consoleHost` of `"[::1]:9443"` returned `"["`.
+- **NAME-01 (BUG-6)** — `generateSessionName` had **32 bits** of entropy, and the
+  Phase 1 test drew 10 000 names asserting no collision: by the birthday bound that
+  test failed ~1.16% of runs (≈1 in 86) forever, with a perfect RNG. Generator
+  widened to 64 bits, and the test now states the bound it depends on.
+
+Confirmed, **not yet fixed** — see §11: `BUG-1` (four ways to open a plain local
+terminal), `BUG-7` (`login()` has no rollback), and `BUG-8` (a *plausible*,
+unreproduced short read in the process runner — pre-existing).
 
 Corrections to this plan, found by writing the tests:
 
@@ -32,7 +55,14 @@ Corrections to this plan, found by writing the tests:
   is allowed. The plan's guess was right; there is now a test pinning it.
 - **INV-06** — the fork overrides `applicationShouldHandleReopen`, not
   `applicationOpenUntitledFile`.
+- **ID-11** — the plan predicted "→ nil" for chain PEMs. Only true for ~2/3 of
+  leaf certificates; for the rest it returned the right CN for the wrong reason.
 - **§2 / §8** — the separate-target advice was wrong for this project; see §8.
+
+> **Harness trap.** `-only-testing:Suite/testName` silently runs **zero**
+> swift-testing tests and exits 0. Only suite-level selectors work; that is why
+> `HAUNTED_MACOS_SUITES` in the root `Makefile` lists suites, not functions. Any
+> new suite must be added there or it never runs.
 
 > **Paths.** This file lives in the `thenets/ghostty` submodule, mounted in the
 > DedNets monorepo at `apps/haunted-terminal/`. Paths starting `macos/` are
@@ -227,9 +257,9 @@ lone surrogate scalar. Harmless, but do not write a test that pretends to cover 
 | ID-06 | `settings.json` is malformed | identity loads, `console == nil` (no throw) |
 | ID-07 | `consoleHost` of `"console.example.com:9443"` | `"console.example.com"` |
 | ID-08 | `consoleHost` of `nil` | `"DedMesh"` |
-| ID-09 | `consoleHost` of `"[::1]:9443"` | ⚠️ returns `"["` — split on `":"` takes the first component. **Confirmed; expected to fail.** See §11, BUG-2. |
+| ID-09 | `consoleHost` of `"[::1]:9443"` | ✅ **fixed** — was `"["` (split on `":"` took the first component). Now `URLComponents`-parsed → `"[::1]"`. Note `URLComponents.host` keeps brackets, `URL.host` strips them (SCHEME-05); do not unify. |
 | ID-10 | `certIdentity` from a fixture cert with `CN=alice/term` | `"alice/term"` |
-| ID-11 | `certIdentity` from a **chain** PEM (leaf + intermediate) | ⚠️ all base64 lines are joined across both certs → invalid DER → `nil`. **Expected to fail** if the console ever issues chains. |
+| ID-11 | `certIdentity` from a **chain** PEM (leaf + intermediate) | ✅ **fixed** — parses the first PEM block only. The plan's "→ nil" was right for ~1/3 of leaves (padded DER → invalid base64) but for the rest the joined blob decoded and Security.framework *silently ignored the stapled second cert*, returning the right CN for the wrong reason. Both fixtures (ID-11a padded, ID-11b unpadded) are pinned. |
 | ID-12 | `certIdentity`, unreadable file | `nil` |
 | ID-13 | `certIdentity`, garbage base64 | `nil` |
 
@@ -301,7 +331,7 @@ then `/usr/local/bin`, then bare name; skips non-executable candidates.
 | SUP-05 | Two `.toml`, one already running | exactly one `dedmeshd` spawned |
 | SUP-06 | `haunted-daemon` already up (exits 1 via its pidfile guard) | `ensureRunning()` still returns `true` iff a `dedmeshd` was spawned |
 | SUP-07 | Nothing to start | `false` — caller skips the online-wait |
-| SUP-08 | Config path `~/.config/dedmesh/a+b.toml` | ⚠️ `pgrep -f "dedmeshd -config <path>"` takes an **ERE**; `+` is a quantifier, `.` matches any char. A running daemon is missed → a second one spawns and the two fight the console for the identity. **Expected to fail.** Fix: `pgrep -f -- "$(escape)"`, or match on the pidfile instead. |
+| SUP-08 | Config path `~/.config/dedmesh/a+b.toml` | ✅ **fixed** — `pgrep -f` takes an **ERE**, so `+` was a quantifier and `.` matched any char. Confirmed against the real `/usr/bin/pgrep` in *both* directions: a running daemon was missed (→ a second spawned, the two fighting the console for one identity), **and** the pattern falsely matched a daemon at `ab.toml` (→ one that should start, didn't). Path is now ERE-escaped and passed after `--`. |
 | SUP-09 | `pgrep` binary missing | returns `false`, no crash |
 
 ---
@@ -327,7 +357,7 @@ Pure logic first — extract `HauntedSessionRouter` (§5.4) so these are L0:
 | TAB-05 | `tabKey("a/b", "c")` vs `tabKey("a", "b/c")` | distinct — the `\u{1}` separator is doing real work |
 | KILL-01 | `killSession` | window closed **before** the CLI kill (the `waitAfterCommand` exit banner would otherwise strand the tab) |
 | KILL-02 | CLI kill throws | logged, `hauntedSessionsDidChange` still posted |
-| NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{8}$`, no collisions |
+| NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{16}$`, no collisions. ⚠️ The uniqueness half is a *statistical* claim: P(collision) ≈ 1 − exp(−n(n−1)/2N). At the original 8 hex digits (N = 2³²) that is **1.16% per run** — the Phase 1 test was flaky by construction, ~1 failure in 86 runs. Widened to 16 digits (2.7e-12) in Phase 2; a companion test asserts the entropy width the assertion depends on. Do not narrow the generator without deleting the uniqueness assertion. |
 | CFG-01 | `buildConfiguration` | `waitAfterCommand == true`, `initialInput` ends with `\n` |
 | LAST-01 | `HauntedLastTarget` set, `HauntedLastSession` unset | `lastAttached == nil` |
 
@@ -444,8 +474,8 @@ prefer folding; do not add a dependency for four assertions):
 | LOG-01 | Happy path | `~/.config/haunted` created `0700`, `ca.pem` written, `enroll` invoked with `host:controlPort` |
 | LOG-02 | `control_port` empty | defaults to `9443` |
 | LOG-03 | Console URL with no host | `"Invalid Console URL"`, nothing written |
-| LOG-04 | State dir already exists as `0755` | ⚠️ `createDirectory(attributes:)` does not chmod an existing dir. Assert current behavior, then decide whether to enforce `0700`. |
-| LOG-05 | `enroll` fails | ⚠️ `ca.pem` from the failed attempt is left behind. Assert, then decide (harmless — it is a public CA cert — but it makes `hasLogin` half-true). |
+| LOG-04 | State dir already exists as `0755` | ✅ **fixed** — `createDirectory(attributes:)` applies its mode only to dirs it creates, so an existing `0755` dir survived and `haunted enroll` wrote `key.pem` (the mTLS **private key**) into it. Now `setAttributes(0o700)` unconditionally. Decided §10 Q2: yes, harden. |
+| LOG-05 | `enroll` fails | ⚠️ `ca.pem` from the failed attempt is left behind — **confirmed**, green characterization test. Harmless (a public CA cert) but it makes `hasLogin` half-true. See §11 BUG-7. |
 
 ---
 
@@ -588,8 +618,20 @@ changes were needed to reach the code: `isSafeCLIArgument` made internal,
 (this also gives Phase 4 its seam), and `HauntedManager.tabKey`/
 `generateSessionName` made static.
 
-**Phase 2 — seams §5.1–5.3.** `RUN-*`, `SUP-*`, `ID-*`, `API-*`, `LOG-*`.
-Expected failures: SUP-08, ID-09, ID-11.
+**Phase 2 — ✅ done.** Seams §5.1–5.3 (`HauntedProcessRunning` in
+`HauntedProcess.swift`, an injected `URLSession`, `HauntedFileSystem` in
+`HauntedFileSystem.swift`), plus `RUN-*`, `SUP-*`, `ID-*`, `API-*`, `LOG-*` in five
+new suites and `HauntedTestDoubles.swift`. Every seam is a defaulted parameter, so
+production behavior is unchanged.
+
+Predicted failures SUP-08 and ID-09 both materialized and are fixed. ID-11 was
+predicted to fail and did *not* — because the tests initially pinned the broken
+behavior; the underlying defect was real and is also fixed. Newly found and fixed:
+LOG-04 and NAME-01. Still open: BUG-7, BUG-8 (§11).
+
+Not covered by Phase 2, despite §5.3 unlocking them: `LOOP-04/05/06`. And RUN-07
+landed as a *behavioral* proxy — its ThreadSanitizer requirement is unmet, which
+is what leaves BUG-8 unsettled.
 
 **Phase 3 — §5.4 + §5.5 + §5.6.** `OPEN-*`, `TAB-*`, `SPL-*`, `LAY-*`, `MOD-*`,
 `SH-*`. Expected failures: SPL-04, SPL-05, LAY-07 (verify).
@@ -646,25 +688,38 @@ be rebased onto upstream Ghostty.
    wait abort to the login window, or retry? Today it aborts. That means a
    cold launch racing `dedmeshd`'s console connection can land the user on a
    login screen they do not need.
-2. **LOG-04/05** — is a pre-existing `0755` state dir worth hardening against?
-   It holds `key.pem`.
-3. **ID-11** — will the console ever issue a certificate *chain* to a client?
-   If yes, `certIdentity` is already broken and the sidebar silently drops the
-   `@user/client` line.
+2. ~~**LOG-04** — is a pre-existing `0755` state dir worth hardening against?~~
+   **Answered: yes.** It holds `key.pem`, the client's mTLS private key. Fixed in
+   Phase 2. LOG-05's `ca.pem` leftover is separate and still open — §11 BUG-7.
+3. **ID-11** — ~~If the console issues chains, `certIdentity` is already broken.~~
+   The *if-then* is now **confirmed by test**: chains were already broken, and
+   `certIdentity` is fixed. What remains is the product question no Swift test can
+   answer: **does the Console ever issue a certificate chain to a client?** If it
+   never will, the fix is merely defensive.
 4. ~~Does `docs/haunted.md` need a "Testing the macOS app" section once Phase 1
    lands?~~ Yes; added as "Testing the macOS Terminal".
 5. **BUG-1** — is "never a plain local terminal" meant to hold for the dock-drop,
    AppleScript, App Intents and Services entry points too? See §11.
+6. **BUG-8 / RUN-07** — settle the suspected short read with a ThreadSanitizer
+   run. It is the only Phase 2 finding left unproven, and §4.1's RUN-07 row asks
+   for TSan that the landed behavioral proxy does not provide.
+7. **NAME-01** — the generator is now 64-bit, so the 10 000-draw uniqueness
+   assertion is sound. Is a *statistical* assertion wanted in a unit suite at all,
+   or should it be replaced by the entropy-width check alone?
 
 ---
 
 ## 11. Confirmed defects, not yet fixed
 
-Each was reproduced while implementing Phase 1. These are **not** ⚠️ candidates —
-those live in §4 and are still unverified. Every entry below has been observed.
+Each was reproduced while implementing Phase 1 or Phase 2. These are **not** ⚠️
+candidates — those live in §4 and are still unverified. Every entry below has
+been observed.
 
-Two defects the plan predicted (TITLE-07, APPR-05) were confirmed the same way
-and are already fixed; §4 marks them ✅.
+**Fixed since:** TITLE-07 and APPR-05 (Phase 1); and in Phase 2 —
+BUG-2 (`consoleHost` IPv6), BUG-3 (`pgrep` ERE injection, was §4.2 SUP-08),
+BUG-4 (state-dir mode, was LOG-04), BUG-5 (`certIdentity` chains, was ID-11), and
+BUG-6 (`generateSessionName` entropy). Each has a regression test named for its
+ID. §4 marks them ✅.
 
 ### BUG-1 — four entry points still open a plain local terminal
 
@@ -698,37 +753,72 @@ until the map matches, which is the point.
 Until then the allowlist records and classifies all nine sites, so a rebase
 cannot add a tenth silently. **Do not silence a failure by bumping a count.**
 
-### BUG-2 — `consoleHost` mangles a bracketed IPv6 console address
+### BUG-7 — `login()` writes and calls out before it validates, with no rollback
 
-**Severity: low.** Display only, and no user has an IPv6-literal console today.
-**Found by:** reading `HauntedClient.swift` for ID-09; reproduced standalone.
-**Test:** ID-09 in §4.1, lands with Phase 2.
+**Severity: low.** Latent, not live. No secret is leaked.
+**Found by:** Phase 2, LOG-03/LOG-05. Predicted by §4.5 and §10 Q2.
+**Tests:** LOG-03 and LOG-05 in `HauntedCLILoginTests` — both **green
+characterization tests**: they pin what the code does, not what it should.
 
-`macos/Sources/Features/Haunted/HauntedClient.swift:173`
+`HauntedCLI.login` runs `redeem(…)` → `createDirectory` → write `ca.pem` → *then*
+`guard let host = consoleURL.host`. Two consequences:
+
+- A host-less console URL still burns the **one-time** login code over the
+  network, then fails, leaving `ca.pem` on disk.
+- A failed `haunted enroll` likewise leaves `ca.pem` behind.
+
+`hasLogin()` requires all four of `cert.pem`, `key.pem`, `settings.json`,
+`ca.pem`, so a failed login supplies exactly one of them and makes that predicate
+"half-true". Today `load()` still correctly reports *not enrolled*, which is why
+this is latent rather than live. `ca.pem` is a public CA certificate, so nothing
+secret is exposed.
+
+**Fix:** hoist the `host` guard above `redeem`; delete `ca.pem` when `enroll`
+fails. Then flip LOG-03/LOG-05 from characterization to regression tests.
+
+### BUG-8 — suspected short read in `HauntedProcessRunner.run` — **PLAUSIBLE, not confirmed**
+
+**Severity: unknown.** Would silently truncate CLI output.
+**Pre-existing**, not introduced by Phase 2's seams: the code is byte-identical to
+the original `HauntedCLI.run`, which the §5.1 extraction merely relocated into
+`macos/Sources/Features/Haunted/HauntedProcess.swift`.
 
 ```swift
-return console.split(separator: ":").first.map(String.init) ?? console
+process.terminationHandler = { proc in
+    stdout.fileHandleForReading.readabilityHandler = nil   // does NOT join an in-flight handler
+    collector.appendOut(stdout.fileHandleForReading.readDataToEndOfFile())
+    let (out, err) = collector.snapshot()                  // may run before that handler's append
 ```
 
-`consoleHost` of `"[::1]:9443"` returns `"["`, which the sidebar then renders as
-the console's name. Splitting on the *first* `:` is wrong for any bracketed
-literal.
+`OutputCollector` is correctly locked, so `Data` cannot be *corrupted*. The window
+is elsewhere: a `readabilityHandler` block that has already returned from
+`availableData` with N bytes but has not yet taken the lock will append **after**
+`snapshot()` has been taken and the continuation resumed. Those N bytes are
+dropped — a short read. Assigning `readabilityHandler = nil` cancels the dispatch
+source; it does not wait for a block already executing.
 
-**Fix:** `URLComponents(string: "//\(console)")?.host ?? console`. Verified
-against `[::1]:9443` → `[::1]`, `console.example.com:9443` → `console.example.com`,
-`console.example.com` → itself, `[fe80::1%25en0]:9443` → `[fe80::1%en0]`.
+**Evidence, stated honestly.** RUN-07 failed once under parallel load, and the
+triage panel separately observed RUN-02b failing once; the single mechanism above
+explains both (dropped stdout fails RUN-07's byte count; dropped stderr leaves
+`message` empty so `run` falls back to `"command failed (N)"`). But it was **never
+reproduced deterministically** — ~1 failure in 21 executions, and 4 consecutive
+clean full-suite runs afterwards. The original assertion message was lost. Two
+flakes in one runner sharing one plausible cause is suggestive, not proof.
 
-Careful: `URLComponents.host` keeps the brackets (`[::1]`), while `URL.host`
-strips them (`::1` — that is what SCHEME-05 pins, and what
-`isAllowedConsoleScheme`'s loopback set matches against). The two disagree. For
-`consoleHost`, which is display-only, the bracketed form is the correct one; do
-not "unify" them without re-reading SCHEME-05.
+**Not settled, and §4.1 RUN-07's ThreadSanitizer requirement is still unmet** —
+what landed is a behavioral proxy (32 concurrent children, distinct fill bytes).
+The TSan run is the thing that would settle this; treat BUG-8 as open until then.
+
+**Proposed fix:** stop mixing `readabilityHandler` with `readDataToEndOfFile` on
+the same handle. Read both pipes to EOF on two background queues started before
+`process.run()`, signal a `DispatchGroup`, and resume the continuation from
+`group.notify` after termination. Secondary risk with the current shape: if a
+grandchild inherits the pipe's write end, `readDataToEndOfFile` in the termination
+handler blocks forever.
 
 ### Still unconfirmed
 
-The remaining ⚠️ marks in §4 — SUP-08 (`pgrep -f` takes an ERE, so a config path
-with `+` or `.` misses a running daemon and a second one spawns), ID-11 (cert
-chains), SPL-04 (`pendingSplitSessionName` leaks), LAY-07, LOG-04/05 — are
-candidates read off the code, not observations. SUP-08 is the one most likely to
-be real and the most damaging if it is: two `dedmeshd` instances fighting the
-console for one identity. It lands with Phase 2.
+The remaining ⚠️ marks in §4 — SPL-04 (`pendingSplitSessionName` leaks into the
+next split), SPL-05 (strict-concurrency isolation gap), LAY-07, WAIT-03 — are
+candidates read off the code, not observations. They are all gated on the §5.4
+extraction and land with Phase 3.
