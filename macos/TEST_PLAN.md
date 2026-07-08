@@ -1,19 +1,49 @@
 # Haunted macOS Terminal — Test Plan
 
 Test plan for the **Haunted feature delta** carried on top of upstream Ghostty in
-the `thenets/ghostty` fork (`vendor/ghostty`, branch `haunted`). Today this code
-has **zero automated coverage**: `macos/Tests/` and `macos/GhosttyUITests/` are
-inherited upstream suites, and `grep -ril haunt` over both returns nothing.
-`make haunted-test` runs six ctest targets, all C.
+the `thenets/ghostty` fork (`apps/haunted-terminal`, branch `haunted`). When this
+plan was written the delta had **zero automated coverage**: `macos/Tests/` and
+`macos/GhosttyUITests/` were inherited upstream suites, and `grep -ril haunt` over
+both returned nothing. `make haunted-test` runs six ctest targets, all C.
 
-Status: **plan only — none of the tests below exist yet.** Findings marked
-⚠️ are defect *candidates* spotted while reading the code to write this plan;
-each is phrased as a test that should fail today. Confirm before "fixing".
+Status: **Phase 1 landed** (§7). `macos/Tests/Haunted/` holds ~97 tests, run by
+`make haunted-test-macos`. Phases 2–5 are still plan only. Findings marked ⚠️
+are defect *candidates* spotted while reading the code to write this plan; each
+is phrased as a test that should fail today. Confirm before "fixing".
 
-> **Paths.** This file lives in the `thenets/ghostty` submodule, but paths below
-> are relative to the **DedNets monorepo root** — so `macos/Sources/…` here is
-> `vendor/ghostty/macos/Sources/…`, and `tests/haunted/`, `apps/`, `docs/` refer
-> to the outer repo. The two repos both matter to this plan (§6 spans them).
+Confirmed and fixed in Phase 1:
+
+- **APPR-05** — `approvalURL` returned `javascript:` / `file://` / any-scheme URLs
+  straight to `NSWorkspace.shared.open`. Now both the absolute and the
+  base-resolved branch must pass `isAllowedConsoleScheme`.
+- **TITLE-07 / SH-07** — session `name` was never validated. Now rejected at the
+  decode boundary by `isValidSessionName`, mirroring the daemon's
+  `session_name_valid()` (`[A-Za-z0-9_-]{1,63}`), plus a leading-`-` ban. A name
+  can no longer reach `attach-loop.sh`'s OSC-0 `printf` nor the sidebar fallback.
+  `isSafeCLIArgument` (still used for `target`) additionally rejects control and
+  format scalars.
+
+Confirmed, not yet fixed:
+
+- **ID-09** — `consoleHost` of `"[::1]:9443"` really does return `"["`. Phase 2.
+- **INV-11** — the "never a plain local terminal" invariant has **four live
+  holes**: dock drop (`macos-dock-drop-behavior = new_window`), AppleScript,
+  App Intents, and the Services provider each still call
+  `TerminalController.newWindow` for an unattached local shell. The pinning test
+  records them; closing them is a separate change.
+
+Corrections to this plan, found by writing the tests:
+
+- **SCHEME-05** — `URL.host` does yield `::1` unbracketed, so `http://[::1]:8080`
+  is allowed. The plan's guess was right; there is now a test pinning it.
+- **INV-06** — the fork overrides `applicationShouldHandleReopen`, not
+  `applicationOpenUntitledFile`.
+- **§2 / §8** — the separate-target advice was wrong for this project; see §8.
+
+> **Paths.** This file lives in the `thenets/ghostty` submodule, mounted in the
+> DedNets monorepo at `apps/haunted-terminal/`. Paths starting `macos/` are
+> relative to the submodule root; `tests/haunted/`, `apps/`, `docs/` refer to the
+> outer repo. The two repos both matter to this plan (§6 spans them).
 
 ---
 
@@ -46,24 +76,31 @@ DedMesh transport (Go tests).
 
 Three homes, because the code under test spans two languages and a submodule:
 
-1. **`vendor/ghostty/macos/HauntedTests/`** — a new Xcode unit-test target.
-   Separate from the upstream `GhosttyTests` target so the fork delta stays a
-   clean, rebase-friendly patch (see §8).
-2. **`vendor/ghostty/macos/HauntedUITests/`** — a new XCUITest target for the
-   handful of invariants only the real app can prove.
+1. **`apps/haunted-terminal/macos/Tests/Haunted/`** — the Haunted unit tests,
+   inside upstream's existing `GhosttyTests` target. **Landed.** `Tests/` is a
+   `PBXFileSystemSynchronizedRootGroup`, so files added under it need no
+   `project.pbxproj` edit at all — strictly less rebase surface than a separate
+   target would cost (see §8).
+2. **`apps/haunted-terminal/macos/GhosttyUITests/`** — the L3 invariants, when
+   Phase 5 arrives. Same reasoning: it is already a synchronized root group.
 3. **`tests/haunted/fixtures/`** — golden JSON contract files, written by a C
    test and read by the Swift tests (see §6.1). This is the only piece that
    lives in the DedNets monorepo proper.
 
-New make target, kept out of the default `make test` like the rest of Haunted:
+Make target, kept out of the default `make test` and out of `make haunted-test`
+(which is ctest/C only):
 
 ```make
 haunted-test-macos:   ## Swift/macOS tests for the Haunted fork delta
 	xcodebuild test \
-	  -project vendor/ghostty/macos/Ghostty.xcodeproj \
-	  -scheme Ghostty -testPlan Haunted \
-	  -destination 'platform=macOS,arch=arm64'
+	  -project apps/haunted-terminal/macos/Ghostty.xcodeproj \
+	  -scheme Ghostty \
+	  -destination 'platform=macOS,arch=arm64' \
+	  -only-testing:GhosttyTests/Haunted…   # one flag per Haunted suite
 ```
+
+The `-only-testing` filter, not a custom `.xctestplan`, is what keeps the run
+fast and independent of upstream's own suites.
 
 ### Tier placement
 
@@ -109,7 +146,7 @@ end-of-options marker.
 | SCHEME-02 | `HTTPS://console.example.com` | allow | scheme lowercased |
 | SCHEME-03 | `http://localhost:8080` | allow | local console dev |
 | SCHEME-04 | `http://127.0.0.1:8080` | allow | — |
-| SCHEME-05 | `http://[::1]:8080` | allow | ⚠️ `URL.host` yields `::1` unbracketed on macOS — assert, don't assume |
+| SCHEME-05 | `http://[::1]:8080` | allow | ✅ `URL.host` does yield `::1` unbracketed on macOS; pinned by a test |
 | SCHEME-06 | `http://console.example.com` | **deny** | plaintext credential interception |
 | SCHEME-07 | `http://localhost.evil.com` | **deny** | suffix-match trap; host is not in the set |
 | SCHEME-08 | `http://127.0.0.1.evil.com` | **deny** | same |
@@ -128,7 +165,7 @@ end-of-options marker.
 | ARG-04 | `"user/box/haunted"` | safe |
 | ARG-05 | `workstations` JSON with a `-`-prefixed `target` | that element is **dropped**, others survive |
 | ARG-06 | `sessions` JSON with a `-`-prefixed `name` | dropped |
-| ARG-07 | Session name `"gui-\u{07}x"` | ⚠️ **currently safe** → the raw name reaches `attach-loop.sh`'s OSC-0 `printf`. See TITLE-07. |
+| ARG-07 | Session name `"gui-\u{07}x"` | ✅ **fixed** — `isValidSessionName` rejects it at decode, so it never reaches `attach-loop.sh`'s OSC-0 `printf`. See TITLE-07. |
 
 `kill`'s parser (`apps/haunted-terminal/src/cli/main.c:1380`) treats
 `argv[i][0] != '-'` as the positional — ARG-02/03 confirm the Swift-side filter
@@ -179,7 +216,7 @@ OSC 0/2.
 | TITLE-04 | `"a\u{07}b"` (BEL, `.control`) | `"ab"` |
 | TITLE-05 | `"a\u{202E}b"` (RTL override, `.format`) | `"ab"` — no visual row spoofing |
 | TITLE-06 | `"\u{07}\u{07}"` (all stripped) | falls back to `name` |
-| TITLE-07 | Session **`name`** = `"gui-\u{07}x"`, `title` = `nil` | ⚠️ `displayTitle` returns the raw name. `name` is never sanitized — and it is also what `attach-loop.sh` interpolates into an OSC-0 title sequence. **Expected to fail.** Fix: sanitize at the decode boundary, not at display. |
+| TITLE-07 | Session **`name`** = `"gui-\u{07}x"`, `title` = `nil` | ✅ **fixed** — rejected at the decode boundary (`isValidSessionName`), not at display, so `displayTitle`'s `name` fallback is safe by construction. Confirmed failing before the fix. |
 
 Note: `.surrogate` in the filter is unreachable — a Swift `String` cannot hold a
 lone surrogate scalar. Harmless, but do not write a test that pretends to cover it.
@@ -210,7 +247,7 @@ lone surrogate scalar. Harmless, but do not write a test that pretends to cover 
 | APPR-02 | `/approve?id=1` | resolved against base, **query preserved** |
 | APPR-03 | `approve` (no leading `/`) | `nil` |
 | APPR-04 | `""` | `nil` |
-| APPR-05 | `javascript:alert(1)` | ⚠️ returned as-is → handed to `NSWorkspace.shared.open`. Same for `file:///…` and custom app schemes. A compromised or MITM'd console picks the target. **Expected to fail.** Fix: require `isAllowedConsoleScheme` on the resolved URL too. |
+| APPR-05 | `javascript:alert(1)` | ✅ **fixed** — `isAllowedConsoleScheme` is now required on both the absolute and the base-resolved branch, so `javascript:`, `file:///…` and custom app schemes return `nil` instead of reaching `NSWorkspace.shared.open`. Confirmed failing before the fix. |
 
 #### `attachCommand` / `attachLoopPath` — L1
 
@@ -434,12 +471,12 @@ L3 (XCUITest) unless noted:
 | INV-03 | ⌘N | `HauntedLoginController.startup()` — focuses the existing Haunted window; never a plain terminal |
 | INV-04 | ⌘T with a Haunted parent | new tab on the focused daemon |
 | INV-05 | ⌘T with no window | `startup()` |
-| INV-06 | Dock reopen (`applicationOpenUntitledFile`) | `startup()`, returns `false` |
+| INV-06 | Dock reopen (`applicationShouldHandleReopen`, *not* `applicationOpenUntitledFile`) | `startup()`, returns `false` |
 | INV-07 | `ghosttyNewWindow` notification | `startup()` |
 | INV-08 | `ghosttyNewTab` from a non-`TerminalController` window | ignored |
 | INV-09 | **L0**: `TerminalWindowRestoration.restoreWindow` | always `completionHandler(nil, nil)`, regardless of `window-save-state` |
 | INV-10 | Relaunch after quit with 3 tabs open | zero windows restored |
-| INV-11 | Every `TerminalController.newWindow` call site in the delta | reachable only from `HauntedManager`/`HauntedLoginController`. **Enforce with a build-time grep test**, not a runtime one — it is the only thing that survives a rebase. |
+| INV-11 | Every `TerminalController.newWindow` call site in `macos/Sources` | ✅ **implemented as an L0 grep test** (`newWindowCallSitesArePinned`), pulled forward into Phase 1 — it is the only guard that survives a rebase. It found that the invariant is **not** actually held: dock drop (`macos-dock-drop-behavior = new_window`), AppleScript, App Intents, and the Services provider each still open an unattached local shell. The allowlist records and classifies them; closing them is separate work. |
 
 ⚠️ INV-09 also documents dead code: everything after the unconditional `return`
 in `TerminalRestorable.swift:142` is unreachable. Either delete it or leave a
@@ -547,10 +584,15 @@ contract.
 
 Ordered by (security × likelihood of silent regression) ÷ cost.
 
-**Phase 1 — no refactor, no dependencies.** Pure L0. Ships in a day.
+**Phase 1 — ✅ done.** Pure L0 (plus QUOTE-01's real `zsh` round trip).
 `SCHEME-*`, `ARG-*`, `QUOTE-*`, `TITLE-*`, `STAT-*`, `DEC-*`, `APPR-*`,
-`NAME-01`, `TAB-05`, `INV-09`. Creates the `HauntedTests` target.
-Expected failures on day one: TITLE-07, APPR-05.
+`NAME-01`, `TAB-05`, `INV-09`, and `INV-11` pulled forward from Phase 5.
+Lives in `macos/Tests/Haunted/`; run with `make haunted-test-macos`.
+TITLE-07 and APPR-05 failed as predicted and are fixed. Three small production
+changes were needed to reach the code: `isSafeCLIArgument` made internal,
+`HauntedCLI.decodeWorkstations`/`decodeSessions` split out of the process call
+(this also gives Phase 4 its seam), and `HauntedManager.tabKey`/
+`generateSessionName` made static.
 
 **Phase 2 — seams §5.1–5.3.** `RUN-*`, `SUP-*`, `ID-*`, `API-*`, `LOG-*`.
 Expected failures: SUP-08, ID-09, ID-11.
@@ -569,17 +611,27 @@ free and should be pulled forward into Phase 1.
 
 ## 8. Fork-maintenance constraints
 
-Every file added under `vendor/ghostty/macos/` widens the delta that must be
-rebased onto upstream Ghostty.
+Every file added under `apps/haunted-terminal/macos/` widens the delta that must
+be rebased onto upstream Ghostty.
 
-- Put Haunted tests in their **own target** (`HauntedTests`) and their **own
-  test plan** (`Haunted.xctestplan`). Touching upstream's `Ghostty.xctestplan`
-  or `GhosttyTests` guarantees a rebase conflict on every upstream test change.
-- The `project.pbxproj` edit to register the target is unavoidable and *will*
-  conflict. Keep it to one file-group and one target — a single conflict hunk.
+- **Superseded advice.** This section used to say: put Haunted tests in their own
+  `HauntedTests` target and `Haunted.xctestplan`, and accept the
+  `project.pbxproj` hunk as "unavoidable". It is avoidable. The project is
+  `objectVersion = 70`, and `Tests/` is a `PBXFileSystemSynchronizedRootGroup` —
+  Xcode compiles whatever `.swift` files it finds on disk. Adding
+  `Tests/Haunted/*.swift` changes **zero** lines of `project.pbxproj`; a new
+  target changes many, in the one file every upstream target change also touches.
+  The subdirectory serves this section's own goal better than its own advice did.
+- We therefore do **not** touch `Ghostty.xctestplan` either. Suite selection is a
+  `-only-testing:` flag in the Makefile, which lives in the outer monorepo and
+  cannot conflict with upstream at all.
+- The residual risk is a name collision — upstream adding its own
+  `Tests/Haunted/`, or a type named `HauntedModelTests`. Both are implausible.
 - The seams in §5 all live in Haunted-owned files, except §5.6's build setting.
   Scope that flag to the Haunted sources, not the whole target.
-- INV-11's grep test is the cheapest possible rebase guard. Write it first.
+- INV-11's grep test is the cheapest possible rebase guard. It was written first,
+  and it immediately found four unguarded `TerminalController.newWindow` call
+  sites (see the status block at the top).
 
 ---
 
@@ -605,5 +657,10 @@ rebased onto upstream Ghostty.
 3. **ID-11** — will the console ever issue a certificate *chain* to a client?
    If yes, `certIdentity` is already broken and the sidebar silently drops the
    `@user/client` line.
-4. Does `docs/haunted.md` need a "Testing the macOS app" section once Phase 1
-   lands? The documentation policy in `CLAUDE.md` says yes.
+4. ~~Does `docs/haunted.md` need a "Testing the macOS app" section once Phase 1
+   lands?~~ Yes; added as "Testing the macOS Terminal".
+5. **INV-11's four holes** — dock drop, AppleScript, App Intents, and the
+   Services provider all still open a plain local terminal. Is "never a plain
+   local terminal" meant to hold for those entry points too? If yes, each needs
+   to route through `HauntedLoginController.startup()` and the allowlist shrinks
+   to the three legitimate sites.

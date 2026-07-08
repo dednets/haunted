@@ -53,11 +53,15 @@ final class HauntedManager {
 
     private init() {}
 
-    private func tabKey(_ target: String, _ sessionName: String) -> NSString {
+    /// U+0001 separates the two halves so no (target, session) pair can collide
+    /// with another: it cannot appear in a target, and isValidSessionName bars
+    /// it from a session name.
+    static func tabKey(_ target: String, _ sessionName: String) -> NSString {
         "\(target)\u{1}\(sessionName)" as NSString
     }
 
-    private func generateSessionName() -> String {
+    /// Must satisfy the daemon's session_name_valid() — see isValidSessionName.
+    static func generateSessionName() -> String {
         "gui-" + String(UUID().uuidString.replacingOccurrences(
             of: "-", with: "").prefix(8)).lowercased()
     }
@@ -72,7 +76,7 @@ final class HauntedManager {
     @MainActor
     func isSessionOpen(target: String, sessionName: String) -> Bool {
         guard let controller = sessionTabs.object(
-            forKey: tabKey(target, sessionName)) else { return false }
+            forKey: Self.tabKey(target, sessionName)) else { return false }
         return controller.window != nil
     }
 
@@ -86,7 +90,7 @@ final class HauntedManager {
         target: String,
         sessionName: String
     ) {
-        if let controller = sessionTabs.object(forKey: tabKey(target, sessionName)) {
+        if let controller = sessionTabs.object(forKey: Self.tabKey(target, sessionName)) {
             controller.window?.close()
         }
         Task {
@@ -151,7 +155,7 @@ final class HauntedManager {
         }
         guard let target else { return }
         openTab(from: parent, target: target,
-                sessionName: generateSessionName(), create: true)
+                sessionName: Self.generateSessionName(), create: true)
     }
 
     // MARK: Session entry points
@@ -220,8 +224,8 @@ final class HauntedManager {
         workstation: HauntedWorkstation,
         sessionName: String?
     ) {
-        let name = sessionName ?? generateSessionName()
-        if let existing = sessionTabs.object(forKey: tabKey(workstation.target, name)),
+        let name = sessionName ?? Self.generateSessionName()
+        if let existing = sessionTabs.object(forKey: Self.tabKey(workstation.target, name)),
            let window = existing.window {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -265,7 +269,7 @@ final class HauntedManager {
               let target = info.target else { return base }
         // A split opens a fresh session on the parent's workstation. Generate
         // its name here and hand it to the surfaceCreated call that follows.
-        let name = generateSessionName()
+        let name = Self.generateSessionName()
         pendingSplitSessionName = name
         return buildConfiguration(target: target, sessionName: name, create: true)
     }
@@ -290,7 +294,7 @@ final class HauntedManager {
         if let target = info.target, let name,
            let controller = TerminalController.all.first(
             where: { $0.surfaceTree.contains(surface) }) {
-            sessionTabs.setObject(controller, forKey: tabKey(target, name))
+            sessionTabs.setObject(controller, forKey: Self.tabKey(target, name))
         }
     }
 
@@ -311,7 +315,7 @@ final class HauntedManager {
                 forKey: view)
         }
         if let target, let sessionName {
-            sessionTabs.setObject(controller, forKey: tabKey(target, sessionName))
+            sessionTabs.setObject(controller, forKey: Self.tabKey(target, sessionName))
             Self.lastAttached = (target, sessionName)
             NotificationCenter.default.post(
                 name: .hauntedSessionsDidChange, object: nil)

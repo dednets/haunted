@@ -143,9 +143,14 @@ enum HauntedClientLoginAPI {
 }
 
 extension HauntedClientLoginStart {
+    /// The browser URL that approves this login request. The console chooses
+    /// this string, so a compromised or MITM'd console would otherwise pick
+    /// what `NSWorkspace.shared.open` launches — `javascript:`, `file://` or
+    /// any registered app scheme. Only http(s) console origins may escape into
+    /// the browser; everything else is rejected rather than opened.
     func approvalURL(base consoleURL: URL) -> URL? {
         if let absolute = URL(string: url), absolute.scheme != nil {
-            return absolute
+            return absolute.isAllowedConsoleScheme ? absolute : nil
         }
         guard var components = URLComponents(url: consoleURL, resolvingAgainstBaseURL: false) else {
             return nil
@@ -153,7 +158,10 @@ extension HauntedClientLoginStart {
         if let rel = URL(string: url), url.hasPrefix("/") {
             components.path = rel.path
             components.query = rel.query
-            return components.url
+            guard let resolved = components.url, resolved.isAllowedConsoleScheme else {
+                return nil
+            }
+            return resolved
         }
         return nil
     }
@@ -228,7 +236,9 @@ struct HauntedWorkstationSession: Decodable, Identifiable, Equatable {
     /// one, else the session name (IDs like gui-1a2b3c4d mean nothing).
     /// Titles are attacker-influenced (any program in the session sets them),
     /// so control and format characters — C0/C1, DEL, bidi overrides that
-    /// could visually spoof a row — are stripped before display.
+    /// could visually spoof a row — are stripped before display. The `name`
+    /// fallback needs no stripping: isValidSessionName rejected anything
+    /// outside [A-Za-z0-9_-] at the decode boundary.
     var displayTitle: String {
         guard let title, !title.isEmpty else { return name }
         let cleaned = String(String.UnicodeScalarView(title.unicodeScalars.filter {
@@ -254,8 +264,39 @@ struct HauntedCLIError: LocalizedError {
 /// crafted session name). Both values come from remote-controlled JSON
 /// (`dedmeshctl workstations -json`, `haunted list --json`), so reject them
 /// at that decode boundary rather than at each call site.
-private func isSafeCLIArgument(_ value: String) -> Bool {
-    !value.isEmpty && !value.hasPrefix("-")
+///
+/// Control and format scalars are rejected too: `name` is interpolated into
+/// attach-loop.sh's OSC-0 title sequence, where a BEL would terminate the
+/// sequence early and inject the remainder into the *local* terminal, and it
+/// is the sidebar's fallback display string when a session has no title.
+func isSafeCLIArgument(_ value: String) -> Bool {
+    guard !value.isEmpty, !value.hasPrefix("-") else { return false }
+    return !value.unicodeScalars.contains { scalar in
+        switch scalar.properties.generalCategory {
+        case .control, .format, .privateUse, .lineSeparator, .paragraphSeparator:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Session names as the daemon defines them: `session_name_valid()` in
+/// `apps/haunted-daemon/src/session.c` accepts exactly `[A-Za-z0-9_-]{1,63}`,
+/// so the daemon can never legitimately report a name outside that set — one
+/// that arrives anyway came from a tampered-with list response. We additionally
+/// reject a leading `-`, which the daemon permits but which the CLI's arg
+/// parser would read as a flag (see isSafeCLIArgument).
+func isValidSessionName(_ value: String) -> Bool {
+    guard !value.isEmpty, value.utf8.count <= 63, !value.hasPrefix("-") else {
+        return false
+    }
+    return value.utf8.allSatisfy { byte in
+        (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+            || (byte >= UInt8(ascii: "A") && byte <= UInt8(ascii: "Z"))
+            || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+            || byte == UInt8(ascii: "-") || byte == UInt8(ascii: "_")
+    }
 }
 
 /// Shells out to the `haunted` / `dedmeshctl` CLIs, which own all mesh
@@ -279,13 +320,25 @@ enum HauntedCLI {
         return tool
     }
 
+    /// The decode boundary for `dedmeshctl workstations -json`. Split out from
+    /// the process call so the JSON contract is testable without a subprocess.
+    static func decodeWorkstations(_ data: Data) throws -> [HauntedWorkstation] {
+        try JSONDecoder().decode([HauntedWorkstation].self, from: data)
+            .filter { isSafeCLIArgument($0.target) }
+    }
+
+    /// The decode boundary for `haunted list --json`.
+    static func decodeSessions(_ data: Data) throws -> [HauntedWorkstationSession] {
+        try JSONDecoder().decode([HauntedWorkstationSession].self, from: data)
+            .filter { isValidSessionName($0.name) }
+    }
+
     static func workstations(
         identity: HauntedClientIdentity
     ) async throws -> [HauntedWorkstation] {
         let data = try await run(
             "\(quote(resolve("dedmeshctl"))) workstations -json -state-dir \(quote(identity.stateDir.path))")
-        return try JSONDecoder().decode([HauntedWorkstation].self, from: data)
-            .filter { isSafeCLIArgument($0.target) }
+        return try decodeWorkstations(data)
     }
 
     static func sessions(
@@ -294,9 +347,7 @@ enum HauntedCLI {
     ) async throws -> [HauntedWorkstationSession] {
         let data = try await run(
             "\(quote(resolve("haunted"))) list --json --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
-        return try JSONDecoder().decode(
-            [HauntedWorkstationSession].self, from: data)
-            .filter { isSafeCLIArgument($0.name) }
+        return try decodeSessions(data)
     }
 
     static func killSession(
