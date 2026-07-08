@@ -1675,6 +1675,12 @@ extension Ghostty {
                 guard surfaceView.window != nil, v.timetime_ms > 0 else { return false }
                 guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return false }
                 surfaceView.setChildExitedMessage(.init(v, threshold: config.abnormalCommandExitRuntime))
+                // Haunted fork: a surface's process exiting means its attach
+                // loop ended — the workstation session it fronted is over and
+                // the daemon has reaped it. Refresh the sidebar now so the dead
+                // session's row disappears instead of lingering until the next
+                // poll (harmless for non-Haunted surfaces: no session to drop).
+                NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
                 return true
             default:
                 return false
