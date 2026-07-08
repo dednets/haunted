@@ -12,10 +12,10 @@ struct HauntedModelTests {
 
     @Test("DEC-01: login redeem decodes snake_case")
     func decodeLoginRedeem() throws {
-        let json = """
+        let json = Data("""
         {"token":"t","username":"alice","client_name":"term",
          "control_port":"9443","ca_pem":"-----BEGIN CERTIFICATE-----"}
-        """.data(using: .utf8)!
+        """.utf8)
         let redeemed = try JSONDecoder().decode(HauntedClientLoginRedeem.self, from: json)
         #expect(redeemed.token == "t")
         #expect(redeemed.username == "alice")
@@ -27,9 +27,9 @@ struct HauntedModelTests {
     /// DEC-02. Daemons predating MSG_SESSION_LIST_V2 omit `title` entirely.
     @Test("DEC-02: session without a title decodes, title == nil")
     func decodeSessionWithoutTitle() throws {
-        let json = """
+        let json = Data("""
         [{"name":"default","pid":42,"clients":1,"cols":80,"rows":24,"created":1700000000}]
-        """.data(using: .utf8)!
+        """.utf8)
         let sessions = try HauntedCLI.decodeSessions(json)
         #expect(sessions.count == 1)
         #expect(sessions[0].title == nil)
@@ -40,10 +40,10 @@ struct HauntedModelTests {
     /// blank the sidebar on an older Terminal.
     @Test("DEC-03: unknown keys are ignored")
     func decodeSessionForwardCompatible() throws {
-        let json = """
+        let json = Data("""
         [{"name":"default","pid":42,"clients":1,"cols":80,"rows":24,
           "created":1700000000,"title":"vim","future_field":{"nested":true}}]
-        """.data(using: .utf8)!
+        """.utf8)
         let sessions = try HauntedCLI.decodeSessions(json)
         #expect(sessions.count == 1)
         #expect(sessions[0].title == "vim")
@@ -51,9 +51,9 @@ struct HauntedModelTests {
 
     @Test("DEC-04: workstation without error/state decodes")
     func decodeWorkstationSparse() throws {
-        let json = """
+        let json = Data("""
         [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true}]
-        """.data(using: .utf8)!
+        """.utf8)
         let workstations = try HauntedCLI.decodeWorkstations(json)
         #expect(workstations.count == 1)
         #expect(workstations[0].state == nil)
@@ -62,9 +62,9 @@ struct HauntedModelTests {
 
     @Test("DEC-05: pid at UInt32.max decodes")
     func decodeMaxPID() throws {
-        let json = """
+        let json = Data("""
         [{"name":"a","pid":4294967295,"clients":0,"cols":80,"rows":24,"created":0}]
-        """.data(using: .utf8)!
+        """.utf8)
         let sessions = try HauntedCLI.decodeSessions(json)
         #expect(sessions[0].pid == UInt32.max)
     }

@@ -388,8 +388,7 @@ final class HauntedManager {
               let terminalView = window.contentView,
               !(terminalView is HauntedContainerView) else { return }
 
-        let sidebar = HauntedSidebarView(identity: identity) {
-            [weak self, weak controller] workstation, sessionName in
+        let sidebar = HauntedSidebarView(identity: identity) { [weak self, weak controller] workstation, sessionName in
             guard let self, let controller else { return }
             Task { @MainActor in
                 self.focusOrOpen(from: controller,

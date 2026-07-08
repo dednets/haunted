@@ -54,13 +54,13 @@ struct HauntedCLIArgumentTests {
     /// ARG-05: a crafted `target` is dropped; its siblings survive.
     @Test("ARG-05: decodeWorkstations drops flag-like targets")
     func decodeDropsUnsafeTarget() throws {
-        let json = """
+        let json = Data("""
         [
           {"target":"-rf","daemon":"evil","app":"haunted","online":true},
           {"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true},
           {"target":"","daemon":"empty","app":"haunted","online":false}
         ]
-        """.data(using: .utf8)!
+        """.utf8)
         let result = try HauntedCLI.decodeWorkstations(json)
         #expect(result.map(\.target) == ["alice/box/haunted"])
     }
@@ -69,13 +69,13 @@ struct HauntedCLIArgumentTests {
     /// reach attach-loop.sh's OSC-0 `printf` nor the sidebar's name fallback.
     @Test("ARG-06: decodeSessions drops invalid session names")
     func decodeDropsUnsafeSessionName() throws {
-        let json = """
+        let json = Data("""
         [
           {"name":"-create","pid":1,"clients":0,"cols":80,"rows":24,"created":0},
           {"name":"gui-\\u0007x","pid":2,"clients":0,"cols":80,"rows":24,"created":0},
           {"name":"gui-1a2b3c4d","pid":3,"clients":1,"cols":80,"rows":24,"created":0}
         ]
-        """.data(using: .utf8)!
+        """.utf8)
         let result = try HauntedCLI.decodeSessions(json)
         #expect(result.map(\.name) == ["gui-1a2b3c4d"])
     }
