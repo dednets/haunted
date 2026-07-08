@@ -37,6 +37,25 @@ protocol HauntedProcessRunning: Sendable {
 struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
     static let shared = HauntedProcessRunner()
 
+    /// One reader per pipe, each draining to EOF on its own queue, joined by a
+    /// group before the result is assembled.
+    ///
+    /// The obvious shape — `readabilityHandler` to drain, then
+    /// `readDataToEndOfFile` in `terminationHandler` — silently drops bytes.
+    /// Setting `readabilityHandler = nil` cancels the dispatch source but does
+    /// **not** wait for a block already running: a handler that has returned from
+    /// `availableData` with N bytes and not yet taken the collector's lock
+    /// appends *after* the snapshot is taken and the continuation resumed. Those
+    /// N bytes vanish. Truncated stdout means an empty sidebar; truncated stderr
+    /// means a CLI error the user never sees, replaced by "command failed (1)".
+    ///
+    /// Both readers start before `run()`, so a chatty child can never fill a
+    /// ~64 KiB pipe buffer and deadlock against `waitUntilExit`.
+    ///
+    /// Known limitation: if the child spawns a grandchild that inherits the pipe
+    /// write end, EOF waits for the grandchild too. Every command here is a short
+    /// CLI invocation, and `spawnDetached` is the path for anything that outlives
+    /// us.
     func run(_ command: String) async throws -> Data {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
@@ -48,39 +67,50 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
             process.standardError = stderr
             process.standardInput = FileHandle.nullDevice
 
-            // Accumulate output as it streams so a chatty child can never
-            // fill the pipe and deadlock against waiting for termination.
             let collector = OutputCollector()
-            stdout.fileHandleForReading.readabilityHandler = { handle in
-                collector.appendOut(handle.availableData)
+            let readers = DispatchGroup()
+            let queue = DispatchQueue(
+                label: "org.thenets.haunted.process-read", attributes: .concurrent)
+
+            readers.enter()
+            queue.async {
+                collector.appendOut(stdout.fileHandleForReading.readDataToEndOfFile())
+                readers.leave()
             }
-            stderr.fileHandleForReading.readabilityHandler = { handle in
-                collector.appendErr(handle.availableData)
+            readers.enter()
+            queue.async {
+                collector.appendErr(stderr.fileHandleForReading.readDataToEndOfFile())
+                readers.leave()
             }
 
-            process.terminationHandler = { proc in
-                stdout.fileHandleForReading.readabilityHandler = nil
-                stderr.fileHandleForReading.readabilityHandler = nil
-                collector.appendOut(
-                    stdout.fileHandleForReading.readDataToEndOfFile())
-                collector.appendErr(
-                    stderr.fileHandleForReading.readDataToEndOfFile())
+            do {
+                try process.run()
+            } catch {
+                // The readers are blocked on pipes nobody will ever write to.
+                // Closing the write ends gives them their EOF so they can exit.
+                try? stdout.fileHandleForWriting.close()
+                try? stderr.fileHandleForWriting.close()
+                readers.wait()
+                continuation.resume(throwing: error)
+                return
+            }
+
+            // Both pipes are at EOF, so the child's every byte is in hand before
+            // its status is read. `waitUntilExit` cannot block: EOF already
+            // implies the write ends are closed.
+            readers.notify(queue: queue) {
+                process.waitUntilExit()
                 let (out, err) = collector.snapshot()
-                if proc.terminationStatus == 0 {
+                if process.terminationStatus == 0 {
                     continuation.resume(returning: out)
                 } else {
                     let message = String(data: err, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     continuation.resume(throwing: HauntedCLIError(
                         message: message.isEmpty
-                            ? "command failed (\(proc.terminationStatus))"
+                            ? "command failed (\(process.terminationStatus))"
                             : message))
                 }
-            }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(throwing: error)
             }
         }
     }
@@ -110,8 +140,8 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
     }
 }
 
-/// Thread-safe stdout/stderr accumulator for HauntedProcessRunner.run
-/// (readability handlers and the termination handler fire on different queues).
+/// Thread-safe stdout/stderr accumulator for HauntedProcessRunner.run: the two
+/// pipe readers drain on separate queues, and `snapshot()` runs on a third.
 private final class OutputCollector: @unchecked Sendable {
     private var out = Data()
     private var err = Data()

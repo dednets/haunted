@@ -127,6 +127,45 @@ struct HauntedForkInvariantTests {
             """)
     }
 
+    // MARK: EXIT-01 — the session dies with its process
+
+    /// TEST_PLAN §4.7. When the remote shell exits — `exit`, or ctrl-D — the
+    /// daemon reaps the session, and the sidebar row must vanish with it rather
+    /// than linger up to ten seconds until the next poll and invite a click that
+    /// reattaches to a corpse.
+    ///
+    /// The hook that makes that immediate is **six lines inside an upstream
+    /// file** (`Ghostty/Ghostty.App.swift`, the `childExited` action). It is the
+    /// most rebase-fragile part of the whole feature: upstream owns that switch,
+    /// a conflict resolution that takes "theirs" drops the post silently, and
+    /// nothing else in the app would notice. Hence a grep, not a runtime test.
+    @Test("EXIT-01: the childExited action still refreshes the sidebar")
+    func childExitedRefreshesSidebar() throws {
+        let app = Self.sourcesDirectory
+            .appendingPathComponent("Ghostty/Ghostty.App.swift")
+        let contents = try String(contentsOf: app, encoding: .utf8)
+
+        try #require(contents.contains("showChildExited"),
+                     "upstream renamed the child-exited action; the Haunted hook needs re-siting")
+        #expect(contents.contains("hauntedSessionsDidChange"), """
+            Ghostty.App.swift no longer posts .hauntedSessionsDidChange when a \
+            surface's process exits. A remote session that ended by `exit`/ctrl-D \
+            will linger in the sidebar until the next 10s poll, and clicking it \
+            reattaches to a session the daemon has already reaped.
+            """)
+    }
+
+    /// The exit path's other half: `waitAfterCommand` keeps the tab open showing
+    /// the exit banner. Removing it would close the surface, and an empty surface
+    /// tree closes the window — which reads to the user as the app crashing.
+    @Test("EXIT-02: the attached surface keeps its exit banner")
+    func attachedSurfaceWaitsAfterCommand() throws {
+        let manager = Self.sourcesDirectory
+            .appendingPathComponent("Features/Haunted/HauntedManager.swift")
+        let contents = try String(contentsOf: manager, encoding: .utf8)
+        #expect(contents.contains("config.waitAfterCommand = true"))
+    }
+
     /// The invariant's other half: the `newWindow:`/`newTab:` menu actions and
     /// the dock-reopen handler must all funnel into `HauntedLoginController`.
     @Test("INV-11: AppDelegate window entry points route through Haunted")

@@ -181,11 +181,14 @@ final class HauntedManager {
 
         var target: String?
         var sessionName = "default"
-        if let last = Self.lastAttached,
-           workstations.contains(where: { $0.target == last.target && $0.online }) {
-            (target, sessionName) = (last.target, last.session)
-        } else {
-            target = workstations.first { $0.online }?.target
+        switch HauntedSessionRouter.route(
+            lastAttached: Self.lastAttached, workstations: workstations) {
+        case .resume(let resumeTarget, let resumeSession):
+            (target, sessionName) = (resumeTarget, resumeSession)
+        case .fresh(let freshTarget):
+            target = freshTarget
+        case .plainShell:
+            target = nil
         }
 
         let config: Ghostty.SurfaceConfiguration
@@ -264,20 +267,55 @@ final class HauntedManager {
 
     // MARK: Split inheritance (hooks called from BaseTerminalController)
 
+    /// What a split inherits from the surface it was created from. Pure: the
+    /// interesting decision, extracted from `splitConfiguration`, which cannot
+    /// run without a live `Ghostty.SurfaceView`.
+    enum SplitPlan: Equatable {
+        /// The parent is attached to a workstation; the child opens a fresh
+        /// session on that same workstation.
+        case inherit(target: String, sessionName: String)
+        /// The parent is a plain local shell (or not ours). Whatever config the
+        /// caller had is used unchanged, and no session name is pending.
+        case passthrough
+    }
+
+    static func splitPlan(
+        parentTarget: String?,
+        generateName: () -> String = generateSessionName
+    ) -> SplitPlan {
+        guard let parentTarget else { return .passthrough }
+        return .inherit(target: parentTarget, sessionName: generateName())
+    }
+
     /// If a split's parent surface belongs to a workstation, the child
     /// attaches to a fresh session on the same workstation. Synchronous: the
     /// attach command authenticates from the state dir, no token to mint.
+    ///
+    /// `@MainActor` because it writes `pendingSplitSessionName`, which the
+    /// `@MainActor` `surfaceCreated` reads immediately afterwards — both run on
+    /// the main thread inside `BaseTerminalController.newSplit`, and saying so
+    /// is what keeps that hand-off from being a data race.
+    @MainActor
     func splitConfiguration(
         parent: Ghostty.SurfaceView,
         base: Ghostty.SurfaceConfiguration?
     ) -> Ghostty.SurfaceConfiguration? {
-        guard let info = surfaces.object(forKey: parent),
-              let target = info.target else { return base }
-        // A split opens a fresh session on the parent's workstation. Generate
-        // its name here and hand it to the surfaceCreated call that follows.
-        let name = Self.generateSessionName()
-        pendingSplitSessionName = name
-        return buildConfiguration(target: target, sessionName: name, create: true)
+        // Clear first. A previous split whose surface creation failed never
+        // reached surfaceCreated, so its name is still sitting here; leaving it
+        // would let the *next* split — including one from a plain-shell parent,
+        // which returns early below — adopt a session name that was minted for
+        // a different surface.
+        pendingSplitSessionName = nil
+
+        guard let info = surfaces.object(forKey: parent) else { return base }
+        switch Self.splitPlan(parentTarget: info.target) {
+        case .passthrough:
+            return base
+        case .inherit(let target, let sessionName):
+            pendingSplitSessionName = sessionName
+            return buildConfiguration(
+                target: target, sessionName: sessionName, create: true)
+        }
     }
 
     /// Propagates the parent surface's association to a new split surface, and
@@ -431,13 +469,17 @@ final class HauntedSidebarLayout: ObservableObject {
     /// Duration of the width animation; content fade is sequenced around it.
     static let animationDuration: TimeInterval = 0.2
 
+    /// Where `width`/`collapsed` persist. Injectable so tests get a scratch
+    /// suite instead of poisoning the user's real sidebar geometry.
+    private let defaults: UserDefaults
+
     @Published var width: CGFloat {
-        didSet { UserDefaults.standard.set(Double(width), forKey: "HauntedSidebarWidth") }
+        didSet { defaults.set(Double(width), forKey: "HauntedSidebarWidth") }
     }
     /// The persisted collapsed state — drives the sidebar WIDTH. Restored on
     /// launch, so quitting collapsed reopens collapsed.
     @Published var collapsed: Bool {
-        didSet { UserDefaults.standard.set(collapsed, forKey: "HauntedSidebarCollapsed") }
+        didSet { defaults.set(collapsed, forKey: "HauntedSidebarCollapsed") }
     }
     /// Transient: whether the full sidebar CONTENT is shown (opacity 1) vs.
     /// faded out. Sequenced separately from `collapsed` so the content fades
@@ -445,31 +487,48 @@ final class HauntedSidebarLayout: ObservableObject {
     /// narrows — never scaling/clipping mid-transition.
     @Published var contentVisible: Bool
 
+    /// Where the *user* last asked to be, as opposed to where the animation has
+    /// got to. `collapsed` and `contentVisible` each lag it by one animation
+    /// step, so neither can answer "did the user change their mind?" — see
+    /// setCollapsed.
+    private var desiredCollapsed: Bool
+
     var effectiveWidth: CGFloat { collapsed ? Self.collapsedWidth : width }
 
-    private init() {
-        let saved = UserDefaults.standard.double(forKey: "HauntedSidebarWidth")
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let saved = defaults.double(forKey: "HauntedSidebarWidth")
         width = saved >= Self.minWidth ? min(CGFloat(saved), Self.maxWidth) : 220
-        let startCollapsed = UserDefaults.standard.bool(forKey: "HauntedSidebarCollapsed")
+        let startCollapsed = defaults.bool(forKey: "HauntedSidebarCollapsed")
         collapsed = startCollapsed
         contentVisible = !startCollapsed
+        desiredCollapsed = startCollapsed
     }
 
     /// Toggle/collapse with the fade sequencing:
     ///  - expand:  widen first (content hidden), then fade content in;
     ///  - collapse: fade content out first, then narrow.
+    ///
+    /// Both deferred closures re-check `desiredCollapsed`, not the property they
+    /// are about to write. Guarding on `contentVisible`/`collapsed` instead would
+    /// strand a reversal made inside the animation window: collapsing sets
+    /// `contentVisible = false` but leaves `collapsed == false` until the closure
+    /// runs, so an immediate `setCollapsed(false)` saw "already expanded", took
+    /// the early return, and the pending closure then collapsed the sidebar the
+    /// user had just asked to reopen.
     func setCollapsed(_ value: Bool) {
-        guard value != collapsed else { return }
+        guard value != desiredCollapsed else { return }
+        desiredCollapsed = value
         if value {
             contentVisible = false // view fades out over animationDuration
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.animationDuration) {
-                if !self.contentVisible { self.collapsed = true }
+                if self.desiredCollapsed { self.collapsed = true }
             }
         } else {
             collapsed = false // width animates open
             DispatchQueue.main.asyncAfter(
                 deadline: .now() + Self.animationDuration + 0.02) {
-                if !self.collapsed { self.contentVisible = true }
+                if !self.desiredCollapsed { self.contentVisible = true }
             }
         }
     }

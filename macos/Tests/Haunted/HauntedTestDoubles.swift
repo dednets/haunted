@@ -125,7 +125,9 @@ struct HauntedTempFileSystem: HauntedFileSystem {
     /// the `/opt/homebrew` and `/usr/local` tool candidates live outside any
     /// root: probing them for real would make `HauntedCLI.resolve` — and every
     /// command string built on it — depend on what the developer has installed.
-    let executables: Set<String>
+    ///
+    /// `var`, because a stub binary's path is only known once `root` exists.
+    var executables: Set<String>
 
     init(executables: Set<String> = []) {
         root = FileManager.default.temporaryDirectory

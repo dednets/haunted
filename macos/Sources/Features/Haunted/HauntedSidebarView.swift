@@ -1,5 +1,27 @@
 import SwiftUI
 
+/// What the sidebar model reads from the mesh. A seam, so the poll loop can be
+/// driven without spawning `dedmeshctl`/`haunted` (§5.4).
+protocol HauntedSessionListing: Sendable {
+    func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation]
+    func sessions(
+        identity: HauntedClientIdentity, target: String
+    ) async throws -> [HauntedWorkstationSession]
+}
+
+/// The real one: the CLIs own all mesh transport and mTLS state.
+struct HauntedCLISessionListing: HauntedSessionListing {
+    func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
+        try await HauntedCLI.workstations(identity: identity)
+    }
+
+    func sessions(
+        identity: HauntedClientIdentity, target: String
+    ) async throws -> [HauntedWorkstationSession] {
+        try await HauntedCLI.sessions(identity: identity, target: target)
+    }
+}
+
 /// Shared state behind every sidebar instance. Each tab's window hosts its
 /// own HauntedSidebarView, but they all render THIS one model: tab switches
 /// show identical, already-loaded data (no flicker, no reload), and the
@@ -17,30 +39,67 @@ final class HauntedSidebarModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var loaded = false
 
+    private let client: HauntedSessionListing
+    /// Killing a session closes its tab, which only `HauntedManager` can do.
+    /// Injected so a test can observe the request without a window.
+    private let killSession: @MainActor (HauntedClientIdentity, String, String) -> Void
+    private let pollInterval: TimeInterval
+    /// Attach/kill take a moment to land daemon-side, so the change
+    /// notification refreshes after a beat rather than racing the daemon.
+    private let refreshDelay: TimeInterval
+
     private var identity: HauntedClientIdentity?
     private var pollTask: Task<Void, Never>?
+    private var observer: (any NSObjectProtocol)?
 
-    private init() {
-        NotificationCenter.default.addObserver(
+    init(
+        client: HauntedSessionListing = HauntedCLISessionListing(),
+        killSession: @escaping @MainActor (HauntedClientIdentity, String, String) -> Void = {
+            HauntedManager.shared.killSession(
+                identity: $0, target: $1, sessionName: $2)
+        },
+        pollInterval: TimeInterval = 10,
+        refreshDelay: TimeInterval = 1.2
+    ) {
+        self.client = client
+        self.killSession = killSession
+        self.pollInterval = pollInterval
+        self.refreshDelay = refreshDelay
+        observer = NotificationCenter.default.addObserver(
             forName: .hauntedSessionsDidChange, object: nil, queue: .main
         ) { [weak self] _ in
-            // Attach/kill take a moment to land daemon-side; refresh shortly
-            // after instead of waiting out the poll interval.
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
-                await self?.refreshSessions()
+                guard let self else { return }
+                try? await Task.sleep(nanoseconds: UInt64(self.refreshDelay * 1_000_000_000))
+                await self.refreshSessions()
             }
         }
     }
 
+    deinit {
+        // Block-based observers outlive their target; without this a test's
+        // model keeps answering notifications meant for the next one.
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        pollTask?.cancel()
+    }
+
     /// Idempotent: the first sidebar starts the poll loop, later ones just
     /// render. A changed identity (re-login) restarts it.
+    ///
+    /// A *cancelled* poll task counts as no poll task — `pollTask` stays
+    /// non-nil after cancellation, so testing it alone would refuse to ever
+    /// resume polling.
     func start(identity: HauntedClientIdentity) {
-        if self.identity == identity, pollTask != nil { return }
+        if self.identity == identity, let pollTask, !pollTask.isCancelled { return }
         self.identity = identity
         pollTask?.cancel()
         loaded = false
         pollTask = Task { [weak self] in await self?.poll() }
+    }
+
+    /// Stops the poll loop without discarding what it last saw.
+    func stop() {
+        pollTask?.cancel()
     }
 
     func toggle(_ workstation: HauntedWorkstation) {
@@ -56,16 +115,15 @@ final class HauntedSidebarModel: ObservableObject {
         // Optimistically drop it from the list; the change notification's
         // refresh reconciles.
         sessionsByTarget[workstation.id]?.removeAll { $0.name == sessionName }
-        HauntedManager.shared.killSession(
-            identity: identity,
-            target: workstation.target,
-            sessionName: sessionName)
+        killSession(identity, workstation.target, sessionName)
     }
 
-    private func refreshSessions() async {
+    /// One workstation's failure must not blank the others: a mesh blip on one
+    /// daemon should not empty the whole sidebar.
+    func refreshSessions() async {
         guard let identity else { return }
         for workstation in workstations where workstation.online {
-            if let sessions = try? await HauntedCLI.sessions(
+            if let sessions = try? await client.sessions(
                 identity: identity, target: workstation.target) {
                 sessionsByTarget[workstation.id] =
                     sessions.sorted { $0.name < $1.name }
@@ -77,22 +135,25 @@ final class HauntedSidebarModel: ObservableObject {
         while !Task.isCancelled {
             guard let identity else { return }
             do {
-                let fresh = try await HauntedCLI.workstations(identity: identity)
+                let fresh = try await client.workstations(identity: identity)
                 workstations = fresh.sorted { $0.target < $1.target }
                 errorMessage = nil
 
                 // On first load, expand online workstations so sessions are
-                // visible.
+                // visible. Only on first load: re-deriving it every poll would
+                // undo the user's collapses every ten seconds.
                 if !loaded {
                     expanded = Set(fresh.filter { $0.online }.map { $0.id })
                 }
 
                 await refreshSessions()
             } catch {
+                // Keep the last-known workstations: a transient CLI failure must
+                // not flash the sidebar to empty.
                 errorMessage = error.localizedDescription
             }
             loaded = true
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
         }
     }
 }

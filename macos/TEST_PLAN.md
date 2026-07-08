@@ -6,8 +6,8 @@ plan was written the delta had **zero automated coverage**: `macos/Tests/` and
 `macos/GhosttyUITests/` were inherited upstream suites, and `grep -ril haunt` over
 both returned nothing. `make haunted-test` runs six ctest targets, all C.
 
-Status: **Phases 1 and 2 landed** (§7). `macos/Tests/Haunted/` holds ~90 test
-functions across 10 suites, run green by `make haunted-test-macos`. Phases 3–5 are
+Status: **Phases 1, 2 and 3 landed** (§7). `macos/Tests/Haunted/` holds ~120 test
+functions across 14 suites, run green by `make haunted-test-macos`. Phases 4–5 are
 still plan only. Findings marked ⚠️ are defect *candidates* spotted while reading
 the code to write this plan; each is phrased as a test that should fail today.
 Confirm before "fixing".
@@ -82,9 +82,13 @@ The delta versus `origin/main` (`git diff --stat origin/main...HEAD`):
 | `macos/Sources/Features/Haunted/HauntedSidebarView.swift` | 370 | New. Sidebar model + SwiftUI views |
 | `macos/Sources/Features/Haunted/HauntedLogin.swift` | 254 | New. Startup gate, login window, menu item |
 | `macos/Sources/Features/Haunted/HauntedWorkstationSupervisor.swift` | 87 | New. Local `dedmeshd` / `haunted-daemon` supervision |
+| `macos/Sources/Features/Haunted/HauntedProcess.swift` | 137 | New (Phase 2, §5.1). Process-runner seam |
+| `macos/Sources/Features/Haunted/HauntedFileSystem.swift` | 53 | New (Phase 2, §5.3). Filesystem-root seam |
+| `macos/Sources/Features/Haunted/HauntedSessionRouter.swift` | 37 | New (Phase 3, §5.4). Where a new window lands |
 | `macos/Sources/App/macOS/AppDelegate.swift` | +22/−19 | Modified. "Never a plain local terminal" |
 | `macos/Sources/Features/Terminal/TerminalRestorable.swift` | +5/−9 | Modified. Restoration disabled |
 | `macos/Sources/Features/Terminal/BaseTerminalController.swift` | +3 | Modified. Split inheritance hooks |
+| `macos/Sources/Ghostty/Ghostty.App.swift` | +6 | Modified. **Child-exited → sidebar refresh (§4.7).** Inside an upstream-owned file; guarded by EXIT-01 |
 | `macos/Ghostty.xcodeproj/project.pbxproj` | +2/−2 | Modified. Bundle ID / display name |
 
 **In scope:** all nine files, plus the JSON and exit-code contracts the Swift
@@ -508,6 +512,59 @@ comment saying it is kept for rebase context — right now it reads as live logi
 
 ---
 
+### 4.7 Session lifetime — a process exit must reap the session everywhere
+
+When the remote shell ends — the user typed `exit`, or pressed ctrl-D — three
+things must happen, in three different codebases. The chain is what makes this
+worth its own section: any one link failing leaves a *corpse* in the sidebar, and
+clicking a corpse reattaches to a session the daemon has already destroyed.
+
+The chain, as implemented:
+
+1. **Daemon (C).** `session_reap_children()` sees the pane's child exit. If a
+   client is attached it delivers `MSG_EXIT_STATUS` and marks the session
+   `exited`; `session_detach_client()` then destroys it once that client
+   detaches. If nobody is attached it destroys the session immediately — "a dead
+   session must not linger — it would show in the sidebar and let a click
+   reattach to a corpse" (`apps/haunted-daemon/src/session.c`).
+2. **CLI.** `haunted attach-remote` receives the exit status and exits **0**.
+   `attach-loop.sh` treats 0 as "clean detach or session killed" and stops
+   looping rather than reconnecting to a session that no longer exists.
+3. **Terminal (Swift).** The surface's process has now exited. The fork's hook in
+   `Ghostty/Ghostty.App.swift`'s `showChildExited` posts
+   `.hauntedSessionsDidChange`, so the sidebar refreshes at once instead of
+   showing the dead row for up to the 10 s poll interval. The **tab stays open**
+   with its exit banner, deliberately: `waitAfterCommand = true`, because an
+   empty surface tree closes the window and that reads to the user as a crash.
+
+| ID | Case | Expect | Status |
+|---|---|---|---|
+| EXIT-01 | `Ghostty.App.swift` still posts `.hauntedSessionsDidChange` on child exit | grep guard passes | ✅ `HauntedForkInvariantTests` |
+| EXIT-02 | An attached surface sets `waitAfterCommand` | exit banner, tab survives | ✅ `HauntedForkInvariantTests` |
+| EXIT-03 | Daemon stops listing a session → refresh | its sidebar row disappears; the last one leaves an empty list | ✅ `HauntedSidebarModelTests` |
+| EXIT-04 | `attach-remote` exits 0 | the loop stops, exactly one invocation | ✅ SH-01 |
+| EXIT-05 | **C:** pane's child exits with **no** client attached | session destroyed immediately; absent from `haunted list` | ⬜ `tests/haunted/` |
+| EXIT-06 | **C:** pane's child exits **while** a client is attached | `MSG_EXIT_STATUS` delivered, then reaped on detach; a reattach in between must fail, not resurrect | ⬜ `tests/haunted/` |
+| EXIT-07 | **L4 manual:** type `exit` in a Haunted tab | banner appears, sidebar row vanishes within ~1.2 s, `haunted list` no longer shows it | ⬜ checklist |
+
+EXIT-01 is a **grep** rather than a runtime check on purpose. The hook is six
+lines inside a file upstream owns; a rebase that resolves that switch statement
+in upstream's favour drops the post silently, and nothing else in the app
+notices. This is the same reasoning as INV-11.
+
+EXIT-05/06 belong in `tests/haunted/test_daemon.c` — the reap-on-detach ordering
+is a C-side invariant and a Swift test can only observe it through two
+subprocesses. Not yet written.
+
+**Open question.** Should a *clean* exit (status 0) close the tab, rather than
+leave a banner? Today every exit leaves one, which is right for a crashed attach
+(§4.1 SH-04 propagates the code so the user sees it) and arguably wrong for
+`exit`, where the user has already said they are done and now has to close the
+tab a second time. Changing it means distinguishing exit 0 from the rest, and
+`waitAfterCommand` is a libghostty surface setting with no such distinction.
+
+---
+
 ## 5. Refactors required (the actual blocker)
 
 Almost nothing above L0 is reachable today. `HauntedCLI`,
@@ -537,29 +594,53 @@ Unlocks: API-*, LGN-*.
 `configDir` resolve from an injectable home, defaulting to
 `homeDirectoryForCurrentUser`. Unlocks: ID-*, SUP-*, LOG-*.
 
-### 5.4 Pull pure logic out of the singletons
-- `HauntedSessionRouter` — a pure function
-  `(lastAttached, [HauntedWorkstation]) -> Action` where
-  `Action = .resume(target,session) | .fresh(target) | .plainShell`.
-  Unlocks OPEN-01…05 with no `NSApp`.
-- Make `HauntedSidebarModel` and `HauntedSidebarLayout` instantiable
-  (`init` non-private, keep `.shared`). Unlocks MOD-*, LAY-* without cross-test
-  contamination.
+### 5.4 Pull pure logic out of the singletons — ✅ **landed**
+- `HauntedSessionRouter.route(lastAttached:workstations:) -> Route` where
+  `Route = .resume(target,session) | .fresh(target) | .plainShell`. Unlocks
+  OPEN-01…05 with no `NSApp`. `openWindow` calls it, so the tests exercise the
+  real path rather than a copy of the decision.
+- `HauntedSidebarLayout(defaults:)` and `HauntedSidebarModel(client:killSession:
+  pollInterval:refreshDelay:)` are instantiable; `.shared` keeps the production
+  defaults. Unlocks LAY-*, MOD-* with no cross-test contamination, no real
+  `dedmeshctl`, and no ten-second waits.
+- `HauntedManager.splitPlan(parentTarget:generateName:)` — the split decision.
 
-### 5.5 Extract `attach-loop.sh` to a bundle resource
-The script is a Swift multiline string with `\(quote(resolve("haunted")))`
-interpolated at generation time. Move the body to
-`Sources/Features/Haunted/attach-loop.sh`, ship it as a resource, and have
-`attachLoopPath()` copy it out and pass the resolved `haunted` path as `$0`'s
-environment or a fourth argument.
+**What is still out of reach, and why.** `TAB-01…04` and `SPL-03/04` are listed as
+L1, but they are not: every one of them needs a live `Ghostty.SurfaceView`, whose
+initializer takes a `ghostty_app_t`. Standing one up in a unit test means booting
+libghostty. `NSMapTable` weak-value semantics (TAB-04) and the pending-name
+hand-off (SPL-03) are only observable through it. They belong in §4.6's L3 tier
+with the rest of the app-level invariants, not here.
 
-Two wins: the script becomes directly executable under `/bin/sh` in a test
-(SH-01…07), and the escaping concern disappears from the generation path.
+### 5.5 ~~Extract `attach-loop.sh` to a bundle resource~~ — **not needed**
+The original argument: the script is a Swift multiline string, so move it to
+`Sources/Features/Haunted/attach-loop.sh`, ship it as a resource, and pass the
+resolved `haunted` path in at run time. Two wins: directly executable under
+`/bin/sh` in a test, and the escaping concern leaves the generation path.
 
-### 5.6 Enable strict concurrency on the Haunted sources
-`-strict-concurrency=complete` for the five Haunted files. SPL-05 is not really
-a test — it is a compiler flag that would have caught the
-`pendingSplitSessionName` isolation gap for free.
+Both wins are already available. §5.3's `HauntedFileSystem` seam lets a test point
+`attachLoopPath(fs:)` at a temp Application Support root, and `resolve("haunted",
+fs:)` at a stub binary under a temp `~/.local/bin` — so the test executes the
+*real generated script*, escaping and all. A bundle resource would cost a
+resource-build-phase hunk in `project.pbxproj`, which is the rebase surface §8
+exists to avoid. `HauntedAttachLoopTests` covers SH-01…06 and LOOP-01…05 with no
+project-file change.
+
+One thing a test cannot reach: `HauntedCLI.attachLoopPath` memoizes written paths
+in a plain `static var Set<String>`. Production only ever calls it from the main
+thread, so `HauntedAttachLoopTests` is `@Suite(.serialized)` rather than the Set
+being made thread-safe for the tests' benefit.
+
+### 5.6 ~~Enable strict concurrency on the Haunted sources~~ — **not needed**
+The gap SPL-05 was meant to catch — `splitConfiguration` non-isolated while
+mutating `pendingSplitSessionName`, which the `@MainActor` `surfaceCreated` reads
+— is closed by marking `splitConfiguration` `@MainActor`. Both calls already
+happen back-to-back inside `BaseTerminalController.newSplit`, which is main-actor
+context; the annotation states what was already true.
+
+A per-file `-strict-concurrency=complete` flag would have to be scoped in
+`project.pbxproj` (§8 again), and a whole-target flag drowns in upstream's own
+diagnostics. Not worth it for one gap that a keyword closes.
 
 ---
 
@@ -633,8 +714,37 @@ Not covered by Phase 2, despite §5.3 unlocking them: `LOOP-04/05/06`. And RUN-0
 landed as a *behavioral* proxy — its ThreadSanitizer requirement is unmet, which
 is what leaves BUG-8 unsettled.
 
-**Phase 3 — §5.4 + §5.5 + §5.6.** `OPEN-*`, `TAB-*`, `SPL-*`, `LAY-*`, `MOD-*`,
-`SH-*`. Expected failures: SPL-04, SPL-05, LAY-07 (verify).
+**Phase 3 — ✅ done.** `HauntedSessionRouter` (new file), `HauntedSidebarLayout` and
+`HauntedSidebarModel` made instantiable with injected `UserDefaults` / client /
+poll interval, and the split decision extracted as `HauntedManager.splitPlan`.
+Four new suites: `HauntedSessionRouterTests`, `HauntedSidebarLayoutTests`,
+`HauntedSidebarModelTests`, `HauntedAttachLoopTests`. Plus §4.7's EXIT-*.
+
+Landed: `OPEN-01…05`, `SPL-01/02`, `LAY-01…08`, `MOD-01…11`, `SH-01…06`,
+`LOOP-01…05`, `EXIT-01…04`.
+
+Predicted failures, resolved:
+- **LAY-07 was real** — see §11 BUG-9. Fixed; both directions now covered.
+- **SPL-04 was real but narrower than described.** `splitConfiguration` overwrites
+  `pendingSplitSessionName` on every Haunted-parent split, so the "next split
+  adopts the wrong name" case needs a *plain-shell* parent in between: that path
+  returns early without clearing, and `surfaceCreated` then adopts the stale name
+  for a surface with no target. `splitConfiguration` now clears first.
+- **SPL-05 needed no build flag.** `surfaceCreated` is already `@MainActor` and
+  both calls happen in `BaseTerminalController.newSplit`, so marking
+  `splitConfiguration` `@MainActor` closes the isolation gap outright — see §5.6.
+
+Two deviations from the plan, both to avoid a `project.pbxproj` edit (§8):
+- **§5.5 was not needed.** Extracting `attach-loop.sh` to a bundle resource costs a
+  resource-build-phase hunk. The §5.3 filesystem seam already lets a test generate
+  the *real* script into a temp Application Support root and run it under
+  `/bin/sh` with a stub `haunted` at the path `resolve()` embeds. Same two wins,
+  zero project-file change. `HauntedAttachLoopTests` does exactly that.
+- **§5.6 was not needed** — see SPL-05 above.
+
+Not landed: `TAB-01…04` and `SPL-03/04` as *runtime* tests. They need a live
+`Ghostty.SurfaceView`, which needs a `ghostty_app_t`; the plan calls them L1, and
+they are not. See §5.4's note.
 
 **Phase 4 — contracts (§6).** Golden fixtures + `attach-remote` exit codes. This
 is the piece that catches C↔Swift drift, which is the failure mode the current
@@ -700,9 +810,12 @@ be rebased onto upstream Ghostty.
    lands?~~ Yes; added as "Testing the macOS Terminal".
 5. **BUG-1** — is "never a plain local terminal" meant to hold for the dock-drop,
    AppleScript, App Intents and Services entry points too? See §11.
-6. **BUG-8 / RUN-07** — settle the suspected short read with a ThreadSanitizer
-   run. It is the only Phase 2 finding left unproven, and §4.1's RUN-07 row asks
-   for TSan that the landed behavioral proxy does not provide.
+6. **RUN-07** — BUG-8 is now confirmed and fixed, but §4.1's ThreadSanitizer
+   requirement is still unmet; what runs is a behavioral proxy. A TSan pass over
+   the process runner would turn "8 clean runs" into a guarantee.
+8. **EXIT** (§4.7) — should a *clean* exit (status 0) close the tab instead of
+   leaving an exit banner? And EXIT-05/06 want C-side tests in
+   `tests/haunted/test_daemon.c` for the reap-on-detach ordering.
 7. **NAME-01** — the generator is now 64-bit, so the 10 000-draw uniqueness
    assertion is sound. Is a *statistical* assertion wanted in a unit suite at all,
    or should it be replaced by the entropy-width check alone?
@@ -715,11 +828,65 @@ Each was reproduced while implementing Phase 1 or Phase 2. These are **not** ⚠
 candidates — those live in §4 and are still unverified. Every entry below has
 been observed.
 
-**Fixed since:** TITLE-07 and APPR-05 (Phase 1); and in Phase 2 —
-BUG-2 (`consoleHost` IPv6), BUG-3 (`pgrep` ERE injection, was §4.2 SUP-08),
-BUG-4 (state-dir mode, was LOG-04), BUG-5 (`certIdentity` chains, was ID-11), and
-BUG-6 (`generateSessionName` entropy). Each has a regression test named for its
-ID. §4 marks them ✅.
+**Fixed since:** TITLE-07 and APPR-05 (Phase 1); in Phase 2 — BUG-2 (`consoleHost`
+IPv6), BUG-3 (`pgrep` ERE injection, was §4.2 SUP-08), BUG-4 (state-dir mode, was
+LOG-04), BUG-5 (`certIdentity` chains, was ID-11), BUG-6 (`generateSessionName`
+entropy); and in Phase 3 — BUG-8 (the short read below) and BUG-9 (LAY-07's
+stranded reversal). Each has a regression test named for its ID. §4 marks them ✅.
+
+### BUG-8 — short read in `HauntedProcessRunner.run` — ✅ **confirmed, then fixed**
+
+Recorded in Phase 2 as *plausible but unreproduced*. Phase 3 added four suites,
+the extra parallel load pushed the flake rate up, and **RUN-07 failed on the third
+consecutive full-suite run** — the reproduction Phase 2 could not get.
+
+The mechanism was exactly the one predicted:
+
+```swift
+process.terminationHandler = { proc in
+    stdout.fileHandleForReading.readabilityHandler = nil   // does NOT join an in-flight handler
+    collector.appendOut(stdout.fileHandleForReading.readDataToEndOfFile())
+    let (out, err) = collector.snapshot()                  // may run before that handler's append
+```
+
+`OutputCollector` is correctly locked, so `Data` was never *corrupted*. The window
+was elsewhere: a `readabilityHandler` block that had already returned from
+`availableData` with N bytes but had not yet taken the lock appended **after**
+`snapshot()` was taken and the continuation resumed. Those N bytes vanished.
+Assigning `readabilityHandler = nil` cancels the dispatch source; it does not wait
+for a block already executing. Truncated stdout means an empty sidebar; truncated
+stderr means a CLI error the user never sees, replaced by `"command failed (1)"`.
+
+**Pre-existing**, not introduced by Phase 2's seams — the code was byte-identical
+to the original `HauntedCLI.run`, which §5.1 merely relocated.
+
+**Fix (landed).** Both pipes are drained to EOF on their own queue, started before
+`process.run()`, joined by a `DispatchGroup`; the continuation resumes from
+`notify` after `waitUntilExit`. No `readabilityHandler` anywhere, so nothing can
+append after the snapshot, and a chatty child still cannot fill a ~64 KiB pipe
+buffer and deadlock. The failed-`run()` path closes the write ends so the readers
+get their EOF instead of hanging.
+
+Post-fix: **8 consecutive clean full-suite runs**. Against a ~1-in-3 flake rate
+that is ~2.6% likely by luck, so: strong, not proof. §4.1 RUN-07's ThreadSanitizer
+requirement remains unmet — what runs is a behavioral proxy (32 concurrent
+children, distinct fill bytes). A TSan run would settle it; §10 Q6.
+
+Known limitation, documented at the call site: if a child spawns a grandchild that
+inherits the pipe write end, EOF waits for the grandchild too. Every command here
+is a short CLI invocation, and `spawnDetached` is the path for anything meant to
+outlive us.
+
+### BUG-9 — a sidebar collapse/expand reversal stranded the sidebar — ✅ **fixed**
+
+`HauntedSidebarLayout.setCollapsed` guarded on `collapsed`, which lags the user's
+intent by one animation step. `setCollapsed(true)` set `contentVisible = false` but
+left `collapsed == false` until its deferred closure ran, so an immediate
+`setCollapsed(false)` — a double-click on the divider — saw "already expanded",
+took the early return, and the pending closure then collapsed the sidebar the user
+had just asked to reopen. Only that direction was broken, which is why it survived
+casual use. Now both closures re-check a `desiredCollapsed` field that records
+intent rather than animation state. LAY-07 covers both directions.
 
 ### BUG-1 — four entry points still open a plain local terminal
 
@@ -775,46 +942,6 @@ secret is exposed.
 
 **Fix:** hoist the `host` guard above `redeem`; delete `ca.pem` when `enroll`
 fails. Then flip LOG-03/LOG-05 from characterization to regression tests.
-
-### BUG-8 — suspected short read in `HauntedProcessRunner.run` — **PLAUSIBLE, not confirmed**
-
-**Severity: unknown.** Would silently truncate CLI output.
-**Pre-existing**, not introduced by Phase 2's seams: the code is byte-identical to
-the original `HauntedCLI.run`, which the §5.1 extraction merely relocated into
-`macos/Sources/Features/Haunted/HauntedProcess.swift`.
-
-```swift
-process.terminationHandler = { proc in
-    stdout.fileHandleForReading.readabilityHandler = nil   // does NOT join an in-flight handler
-    collector.appendOut(stdout.fileHandleForReading.readDataToEndOfFile())
-    let (out, err) = collector.snapshot()                  // may run before that handler's append
-```
-
-`OutputCollector` is correctly locked, so `Data` cannot be *corrupted*. The window
-is elsewhere: a `readabilityHandler` block that has already returned from
-`availableData` with N bytes but has not yet taken the lock will append **after**
-`snapshot()` has been taken and the continuation resumed. Those N bytes are
-dropped — a short read. Assigning `readabilityHandler = nil` cancels the dispatch
-source; it does not wait for a block already executing.
-
-**Evidence, stated honestly.** RUN-07 failed once under parallel load, and the
-triage panel separately observed RUN-02b failing once; the single mechanism above
-explains both (dropped stdout fails RUN-07's byte count; dropped stderr leaves
-`message` empty so `run` falls back to `"command failed (N)"`). But it was **never
-reproduced deterministically** — ~1 failure in 21 executions, and 4 consecutive
-clean full-suite runs afterwards. The original assertion message was lost. Two
-flakes in one runner sharing one plausible cause is suggestive, not proof.
-
-**Not settled, and §4.1 RUN-07's ThreadSanitizer requirement is still unmet** —
-what landed is a behavioral proxy (32 concurrent children, distinct fill bytes).
-The TSan run is the thing that would settle this; treat BUG-8 as open until then.
-
-**Proposed fix:** stop mixing `readabilityHandler` with `readDataToEndOfFile` on
-the same handle. Read both pipes to EOF on two background queues started before
-`process.run()`, signal a `DispatchGroup`, and resume the continuation from
-`group.notify` after termination. Secondary risk with the current shape: if a
-grandchild inherits the pipe's write end, `readDataToEndOfFile` in the termination
-handler blocks forever.
 
 ### Still unconfirmed
 
