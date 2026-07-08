@@ -504,8 +504,9 @@ enum HauntedCLI {
         # usage: attach-loop.sh TARGET SESSION [--create]
         TARGET=$1; SESSION=$2; CREATE=${3:-}
         # Wipe the echoed invocation and title the tab after the session
-        # (instead of this script's exec line); the remote session's own
-        # title updates pass through and override this once attached.
+        # (instead of this script's exec line). This title only has to survive
+        # until attach: the daemon then pushes the session's real title and
+        # `haunted` retitles the tab, keeping it current from there on.
         printf '\\033[2J\\033[H\\033]0;%s\\007' "$SESSION on ${TARGET#*/}"
         trap 'echo; echo "[haunted] reconnect cancelled"; exit 130' INT
         attempt=0; delay=2
