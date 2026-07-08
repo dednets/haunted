@@ -543,9 +543,15 @@ The chain, as implemented:
 | EXIT-02 | An attached surface sets `waitAfterCommand` | exit banner, tab survives | ✅ `HauntedForkInvariantTests` |
 | EXIT-03 | Daemon stops listing a session → refresh | its sidebar row disappears; the last one leaves an empty list | ✅ `HauntedSidebarModelTests` |
 | EXIT-04 | `attach-remote` exits 0 | the loop stops, exactly one invocation | ✅ SH-01 |
-| EXIT-05 | **C:** pane's child exits with **no** client attached | session destroyed immediately; absent from `haunted list` | ⬜ `tests/haunted/` |
-| EXIT-06 | **C:** pane's child exits **while** a client is attached | `MSG_EXIT_STATUS` delivered, then reaped on detach; a reattach in between must fail, not resurrect | ⬜ `tests/haunted/` |
+| EXIT-05 | **C:** pane's child exits with **no** client attached | session destroyed immediately; absent from `haunted list` | ✅ `tests/haunted/test_daemon.c` |
+| EXIT-06 | **C:** pane's child exits **while** a client is attached | `MSG_EXIT_STATUS` delivered, then reaped on detach | ✅ `tests/haunted/test_daemon.c` |
 | EXIT-07 | **L4 manual:** type `exit` in a Haunted tab | banner appears, sidebar row vanishes within ~1.2 s, `haunted list` no longer shows it | ⬜ checklist |
+| EXIT-08 | The **deployed** workstation daemon is as new as the source | see §11 BUG-10 | ⬜ nothing checks this |
+
+EXIT-05/06 landed with `4fa71c2` ("session reaping when process exits"). Note what
+that leaves uncovered: every one of these tests exercises the daemon **built from
+this source tree**. Nothing anywhere checks the daemon *actually running on a
+workstation*, which is how BUG-10 shipped a green suite and a broken product.
 
 EXIT-01 is a **grep** rather than a runtime check on purpose. The hook is six
 lines inside a file upstream owns; a rebase that resolves that switch statement
@@ -942,6 +948,57 @@ secret is exposed.
 
 **Fix:** hoist the `host` guard above `redeem`; delete `ca.pem` when `enroll`
 fails. Then flip LOG-03/LOG-05 from characterization to regression tests.
+
+### BUG-10 — a CMake-built `haunted-daemon` is not installable, and stale deployed daemons are invisible
+
+**Severity: high in practice.** Two failure modes, one root: *what runs is not what
+the tests test.* Found by reproducing a user-reported "the process closes but it
+doesn't exit". No source defect; both C and Swift suites were green throughout.
+
+**(a) Stale deployed daemon.** The reaping in `4fa71c2` makes a session die with its
+process. Every deployed `haunted-daemon` predated it, so:
+
+- the shell exits, `MSG_EXIT_STATUS` is delivered, `attach-remote` exits 0, the tab
+  gets its banner — all correct;
+- but `session_destroy` never runs, so the **session outlives its process**. It
+  stays in `haunted list` and in the sidebar, and clicking that row reattaches to a
+  corpse.
+
+Confirmed by reverting exactly the 17 lines of `4fa71c2` and rebuilding:
+*with* them the session is reaped and `attach` returns 0; *without* them
+`attach` still returns 0 but the row remains. The C tests (EXIT-05/06) cover the
+source; nothing covers the binary on the workstation.
+
+**(b) The daemon `make haunted-build` produces cannot be installed.** Its
+`LC_RPATH` is an **absolute path into the build tree**:
+
+```
+$ otool -l build/apps/haunted-daemon/haunted-daemon | grep -A2 LC_RPATH
+    path /Users/luiz/projects/dednets-mono/apps/haunted-terminal/zig-out/lib
+```
+
+Copy it to `~/.local/bin` and it works until the repo moves. The monorepo
+restructure (`vendor/ghostty` → `apps/haunted-terminal`, `1b5cd6e`) moved it, so an
+installed daemon died at launch with `dyld: Library not loaded:
+@rpath/libghostty-vt.dylib`. `HauntedWorkstationSupervisor.ensureHauntedDaemon()`
+spawns it, sees a nonzero exit, and returns false — **silently**. The Mac then never
+appears as a workstation and nobody is told why.
+
+Only `scripts/build-dist.sh` output is installable: it links one target per prefix
+and emits a self-contained binary with **no** `LC_RPATH`.
+
+**Fixes.**
+- Immediate (done): install `build/dist/<os>-<arch>/haunted-daemon`, and restart the
+  workstation daemon (`systemctl --user restart haunted-daemon.service` in the Lima
+  VM). Verified end-to-end against the live daemon.
+- Code, not yet done: give the CMake build a relocatable rpath
+  (`@loader_path`/`@executable_path`) or link `libghostty-vt` statically, so the
+  `make haunted-build` artifact is installable. Until then, `docs/haunted.md` says
+  not to copy it.
+- Missing guard: nothing detects a workstation running an out-of-date daemon.
+  EXIT-08. A version handshake — the daemon reporting its build in
+  `MSG_SESSION_LIST_V2`, the console or sidebar warning on mismatch — would have
+  turned three hours of debugging into a banner.
 
 ### Still unconfirmed
 
