@@ -344,13 +344,19 @@ then `/usr/local/bin`, then bare name; skips non-executable candidates.
 
 Pure logic first — extract `HauntedSessionRouter` (§5.4) so these are L0:
 
-| ID | `lastAttached` | Workstations | Expect |
+Startup **never creates** a session — a session only appears from an explicit
+click. `route` takes the last target's session list and resumes (with
+`create: false`) only when the remembered session is still there; everything
+else lands on the `.empty` "Nothing here" state (sidebar shown, no shell).
+
+| ID | `lastAttached` | Workstations / sessions | Expect |
 |---|---|---|---|
-| OPEN-01 | `(box, work)` and `box` online | resume `box`/`work` |
-| OPEN-02 | `(box, work)`, `box` **offline**, `other` online | `other`/`default` |
-| OPEN-03 | `nil`, one online | that one, `default` |
-| OPEN-04 | `nil`, none online | plain shell — `initialInput` empty, sidebar still shown |
-| OPEN-05 | `(box, work)`, list empty | plain shell |
+| OPEN-01 | `(box, work)`, `box` online, `work` listed | resume `box`/`work` (`create: false`) |
+| OPEN-02 | `(box, gui-…)`, `box` online, session **gone** | `.empty` — never re-create the remembered session |
+| OPEN-03 | `(box, work)`, `box` **offline**, `other` online | `.empty` — no auto-attach to another workstation |
+| OPEN-04 | `nil`, a workstation online | `.empty` — no auto-open on a fresh launch |
+| OPEN-05 | `nil`, none online | `.empty` |
+| OPEN-06 | `(box, work)`, `box` offline but `work` in a stale list | `.empty` — offline beats the stale list |
 
 | ID | Case | Expect |
 |---|---|---|
@@ -359,7 +365,7 @@ Pure logic first — extract `HauntedSessionRouter` (§5.4) so these are L0:
 | TAB-03 | Session already open in a live window | focuses it, opens **no** new tab |
 | TAB-04 | Session in `sessionTabs` but its window is gone | opens a new tab (weak value → `nil`) |
 | TAB-05 | `tabKey("a/b", "c")` vs `tabKey("a", "b/c")` | distinct — the `\u{1}` separator is doing real work |
-| KILL-01 | `killSession` | window closed **before** the CLI kill (the `waitAfterCommand` exit banner would otherwise strand the tab) |
+| KILL-01 | `sessionTabClosePlan(siblingTabCount:)` | last tab → `.emptyState`; with siblings → `.closeTab`. Killing the *last* session must NOT close the window — `window.close()` frees the attached `SurfaceView` while libghostty is still delivering a scrollbar action into it (use-after-free, `SIGABRT` in `Ghostty.App.scrollbar`). The last tab drops to the "Nothing here" empty state instead. |
 | KILL-02 | CLI kill throws | logged, `hauntedSessionsDidChange` still posted |
 | NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{16}$`, no collisions. ⚠️ The uniqueness half is a *statistical* claim: P(collision) ≈ 1 − exp(−n(n−1)/2N). At the original 8 hex digits (N = 2³²) that is **1.16% per run** — the Phase 1 test was flaky by construction, ~1 failure in 86 runs. Widened to 16 digits (2.7e-12) in Phase 2; a companion test asserts the entropy width the assertion depends on. Do not narrow the generator without deleting the uniqueness assertion. |
 | CFG-01 | `buildConfiguration` | `waitAfterCommand == true`, `initialInput` ends with `\n` |
@@ -838,7 +844,48 @@ been observed.
 IPv6), BUG-3 (`pgrep` ERE injection, was §4.2 SUP-08), BUG-4 (state-dir mode, was
 LOG-04), BUG-5 (`certIdentity` chains, was ID-11), BUG-6 (`generateSessionName`
 entropy); and in Phase 3 — BUG-8 (the short read below) and BUG-9 (LAY-07's
-stranded reversal). Each has a regression test named for its ID. §4 marks them ✅.
+stranded reversal); and in Phase 4 — BUG-11 (startup auto-creates a session) and
+BUG-12 (killing the last session crashes the app). Each has a regression test
+named for its ID. §4 marks them ✅.
+
+### BUG-11 — startup silently creates a session on every launch — ✅ **confirmed, then fixed**
+
+**Symptom (user):** "It starts a new session on each workstation automatically."
+The startup log showed `openWindow: target=luiz/test4/haunted session=gui-a487f63d13f14a75`
+— a *generated* name, re-attached on every launch.
+
+**Mechanism:** `openWindow` called `buildConfiguration(create: true)` for the
+`.resume` route, and the router resumed whenever the workstation was online —
+without checking the session still existed. So a remembered `gui-…` session that
+had been killed (or whose daemon restarted) was re-minted with `--create` on the
+next launch, forever. The old `.fresh` route made it worse: with nothing to
+resume it auto-attached+created `default` on the first online workstation.
+
+**Fix:** `HauntedSessionRouter.route` now takes the last target's session list
+and returns `.resume` only when that session is still present; `openWindow`
+resumes with `create: false`; `.fresh` is gone. Anything else → `.empty` (the
+"Nothing here" state). Startup never creates. Tests: OPEN-01…06.
+
+### BUG-12 — killing the last session crashes the whole app — ✅ **confirmed, then fixed**
+
+**Symptom (user):** right-click the last session → "Kill Session" → the Terminal
+crashes (`make haunted-run` exits non-zero; Sentry captured a minidump).
+
+**Root cause (from the minidump, `arm64`):** `SIGABRT` in `objc_msgSend` called
+from `Ghostty.App.scrollbar(_:target:v:)` (`Ghostty.App.swift:2062`) via
+`Ghostty.App.action` (641). `HauntedManager.killSession` called
+`controller.window?.close()` on the last tab; window teardown freed the attached
+`SurfaceView`, and libghostty then delivered a `GHOSTTY_ACTION_SCROLLBAR` to it —
+`surfaceView(from:)` returns a dangling `Unmanaged.takeUnretainedValue()`, and the
+next message send aborts. A use-after-free.
+
+**Fix:** killing the *last* session no longer closes the window. It drops to the
+"Nothing here" empty state (empty surface tree + placeholder, sidebar kept) via
+`hauntedEmptyState`, so no window/surface teardown happens under a live libghostty
+action. The decision is the pure `sessionTabClosePlan`; the fork's
+`surfaceTreeDidChange` honours the flag (guarded by the KILL-01 grep test against
+an upstream "theirs" rebase). Tests: KILL-01 (`HauntedManagerLogicTests` +
+`HauntedForkInvariantTests`).
 
 ### BUG-8 — short read in `HauntedProcessRunner.run` — ✅ **confirmed, then fixed**
 

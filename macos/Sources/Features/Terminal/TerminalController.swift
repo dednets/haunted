@@ -42,6 +42,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// early if we don't care.
     private var tabListenForFrame: Bool = false
 
+    /// Haunted fork: true while this window is intentionally showing the
+    /// "Nothing here" empty state (sidebar, no attached session). It is set by
+    /// `HauntedManager` *before* the surface tree is emptied so that the fork's
+    /// "an empty surface tree closes the window" reaction (surfaceTreeDidChange
+    /// below) shows the placeholder instead of closing — which is both the UX
+    /// we want after killing the last session and the fix for a crash: closing
+    /// the window frees the attached `SurfaceView` while libghostty is still
+    /// delivering a surface action into it (use-after-free in Ghostty.App.scrollbar).
+    var hauntedEmptyState: Bool = false
+
     /// This is the hash value of the last tabGroup.windows array. We use this to detect order
     /// changes in the list.
     private var tabWindowsHash: Int = 0
@@ -180,9 +190,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             window.surfaceIsZoomed = to.zoomed != nil
         }
 
-        // If our surface tree is now nil then we close our window.
+        // If our surface tree is now empty we normally close the window. The
+        // Haunted fork has one exception: an *intentional* empty state keeps
+        // the window and shows the "Nothing here" placeholder instead (see
+        // `hauntedEmptyState`). Any other way of emptying the tree still closes.
         if to.isEmpty {
-            self.window?.close()
+            if hauntedEmptyState {
+                (window?.contentView as? HauntedContainerView)?.showEmptyState()
+            } else {
+                self.window?.close()
+            }
+        } else {
+            // A surface is present again (e.g. attach-in-place from the empty
+            // state): make sure the placeholder is gone.
+            (window?.contentView as? HauntedContainerView)?.hideEmptyState()
         }
     }
 
@@ -193,8 +214,11 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         undoAction: String? = nil
     ) {
         // We have a special case if our tree is empty to close our tab immediately.
-        // This makes it so that undo is handled properly.
-        if newTree.isEmpty {
+        // This makes it so that undo is handled properly. The Haunted empty
+        // state is the exception: it wants the window to survive an empty tree,
+        // so let the assignment fall through to surfaceTreeDidChange (which
+        // shows the placeholder) rather than closing the tab.
+        if newTree.isEmpty && !hauntedEmptyState {
             closeTabImmediately()
             return
         }

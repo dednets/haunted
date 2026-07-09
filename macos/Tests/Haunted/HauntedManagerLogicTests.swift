@@ -63,4 +63,25 @@ struct HauntedManagerLogicTests {
         #expect(!isSafeCLIArgument("a\u{1}b"))
         #expect(!isValidSessionName("a\u{1}b"))
     }
+
+    /// KILL-01. Killing the *last* session in a window must not close the
+    /// window: `window.close()` freed the attached SurfaceView while libghostty
+    /// was still delivering a surface action into it (a use-after-free that
+    /// aborted the app). The last tab drops to the "Nothing here" empty state;
+    /// only a window that still has sibling tabs closes the tab normally.
+    @Test("KILL-01: last tab → empty state, more tabs → close the tab")
+    func lastSessionEmptiesInsteadOfClosing() {
+        #expect(HauntedManager.sessionTabClosePlan(siblingTabCount: 1) == .emptyState)
+        // A tab group's count includes this tab, so "> 1" means real siblings.
+        #expect(HauntedManager.sessionTabClosePlan(siblingTabCount: 2) == .closeTab)
+        #expect(HauntedManager.sessionTabClosePlan(siblingTabCount: 5) == .closeTab)
+    }
+
+    /// A count of 0 should never happen (a window showing a session has at
+    /// least its own tab), but if it does, empty is the safe, non-crashing
+    /// choice — never a close that could re-trigger the teardown crash.
+    @Test("KILL-01: a degenerate zero count still avoids closing")
+    func zeroTabCountAvoidsClose() {
+        #expect(HauntedManager.sessionTabClosePlan(siblingTabCount: 0) == .emptyState)
+    }
 }

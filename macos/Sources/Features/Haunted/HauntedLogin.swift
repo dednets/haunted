@@ -42,14 +42,37 @@ final class HauntedLoginController: NSWindowController {
                     : try await HauntedCLI.workstations(identity: identity)
                 NSLog("[haunted] startup: %d workstation(s) via %@",
                       workstations.count, identity.consoleHost)
-                HauntedManager.shared.openWindow(
+                // Only fetch the last target's sessions when it is actually
+                // online — the router needs the list to confirm the remembered
+                // session still exists before resuming it (else it must never
+                // create one, so it lands on the empty state instead).
+                let lastSessions = await lastSessions(
                     identity: identity, workstations: workstations)
+                HauntedManager.shared.openWindow(
+                    identity: identity, workstations: workstations,
+                    lastSessions: lastSessions)
             } catch {
                 NSLog("[haunted] startup: workstation list failed (%@)",
                       "\(error)")
                 shared.showLoginMessage(error.localizedDescription)
             }
         }
+    }
+
+    /// The sessions on the last-attached workstation, or `[]` when there is no
+    /// remembered target or it is not currently online. The router uses this to
+    /// decide whether the remembered session still exists (resume) or is gone
+    /// (empty state); a failed list is treated as "no sessions", i.e. empty.
+    @MainActor
+    private static func lastSessions(
+        identity: HauntedClientIdentity,
+        workstations: [HauntedWorkstation]
+    ) async -> [HauntedWorkstationSession] {
+        guard let target = HauntedManager.shared.lastAttachedTarget,
+              workstations.contains(where: { $0.target == target && $0.online })
+        else { return [] }
+        return (try? await HauntedCLI.sessions(
+            identity: identity, target: target)) ?? []
     }
 
     /// Right after a cold-launch spawn of the local workstation daemons,

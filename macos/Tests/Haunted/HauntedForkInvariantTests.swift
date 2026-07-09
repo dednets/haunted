@@ -72,8 +72,9 @@ struct HauntedForkInvariantTests {
     /// through `HauntedManager` / `HauntedLoginController`, or add it below with
     /// its classification.
     private static let expectedNewWindowCallSites: [String: Int] = [
-        // Haunted-owned: the sanctioned way to get a window.
-        "Features/Haunted/HauntedManager.swift": 1,
+        // Haunted-owned: the sanctioned ways to get a window — one attached
+        // (resume), one straight into the "Nothing here" empty state.
+        "Features/Haunted/HauntedManager.swift": 2,
 
         // Internal recursion/dispatch inside newWindow itself.
         "Features/Terminal/TerminalController.swift": 3,
@@ -164,6 +165,35 @@ struct HauntedForkInvariantTests {
             .appendingPathComponent("Features/Haunted/HauntedManager.swift")
         let contents = try String(contentsOf: manager, encoding: .utf8)
         #expect(contents.contains("config.waitAfterCommand = true"))
+    }
+
+    /// KILL-01. The fork's `TerminalController.surfaceTreeDidChange` overrides
+    /// upstream's "empty surface tree closes the window" with a `hauntedEmptyState`
+    /// exception. That exception is *the* crash fix: closing the window on the
+    /// last session freed the attached SurfaceView while libghostty was still
+    /// delivering a scrollbar action into it (a use-after-free that aborted the
+    /// app). Upstream owns this method; a rebase that resolves the conflict as
+    /// "theirs" silently drops the guard and the crash returns — hence a grep.
+    @Test("KILL-01: the empty-tree close still honours the Haunted empty state")
+    func emptyTreeCloseHonoursEmptyState() throws {
+        let controller = Self.sourcesDirectory
+            .appendingPathComponent("Features/Terminal/TerminalController.swift")
+        let contents = try String(contentsOf: controller, encoding: .utf8)
+        // Normalize whitespace so the guard survives reformatting but still
+        // pins the *branch*, not merely the flag's declaration — an upstream
+        // "theirs" resolution of surfaceTreeDidChange drops the branch while
+        // the fork-added property survives, and that must fail loudly.
+        let normalized = contents
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        #expect(normalized.contains("if hauntedEmptyState {"), """
+            TerminalController.surfaceTreeDidChange no longer guards the \
+            empty-surface-tree close with `if hauntedEmptyState`. Killing the \
+            last session will close the window and crash (SurfaceView freed \
+            under a live libghostty action) instead of showing the "Nothing \
+            here" empty state.
+            """)
     }
 
     /// The invariant's other half: the `newWindow:`/`newTab:` menu actions and

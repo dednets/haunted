@@ -86,10 +86,27 @@ final class HauntedManager {
         return controller.window != nil
     }
 
-    /// Kills a session and closes its tab if one is showing it. Tab first:
-    /// the surface's attach exits when the session dies, and with
-    /// wait-after-command that would strand an exit banner the user has to
-    /// close by hand.
+    /// What to do with the tab showing a session we are about to kill.
+    enum SessionTabClose: Equatable {
+        /// The window has sibling tabs; close just this one.
+        case closeTab
+        /// This is the window's only tab. Do NOT tear the window down — that
+        /// crashed: `window.close()` frees the attached `SurfaceView` while
+        /// libghostty is still delivering surface actions (a scrollbar update)
+        /// into it, a use-after-free. Empty the window to the "Nothing here"
+        /// state instead, which is also the UX we want: the sidebar stays.
+        case emptyState
+    }
+
+    /// Pure so the crash-avoidance rule is testable without a live window:
+    /// only the *last* tab becomes the empty state; any other closes normally.
+    static func sessionTabClosePlan(siblingTabCount: Int) -> SessionTabClose {
+        siblingTabCount > 1 ? .closeTab : .emptyState
+    }
+
+    /// Kills a session and updates the tab showing it. Tab first: the surface's
+    /// attach exits when the session dies, and with wait-after-command that
+    /// would strand an exit banner the user has to close by hand.
     @MainActor
     func killSession(
         identity: HauntedClientIdentity,
@@ -97,7 +114,13 @@ final class HauntedManager {
         sessionName: String
     ) {
         if let controller = sessionTabs.object(forKey: Self.tabKey(target, sessionName)) {
-            controller.window?.close()
+            let tabs = controller.window?.tabGroup?.windows.count ?? 1
+            switch Self.sessionTabClosePlan(siblingTabCount: tabs) {
+            case .closeTab:
+                controller.window?.close()
+            case .emptyState:
+                enterEmptyState(controller)
+            }
         }
         Task {
             do {
@@ -109,6 +132,29 @@ final class HauntedManager {
             }
             NotificationCenter.default.post(
                 name: .hauntedSessionsDidChange, object: nil)
+        }
+    }
+
+    /// Drops a Haunted window to the "Nothing here" empty state: sidebar still
+    /// shown, terminal area replaced by a placeholder, no attached session and
+    /// no local shell. Sets the flag *before* emptying the surface tree so the
+    /// fork's "empty tree closes the window" reaction yields to the placeholder.
+    @MainActor
+    private func enterEmptyState(_ controller: TerminalController) {
+        // No longer attached to anything, so forget the tab mapping — a stale
+        // entry would make a later sidebar click focus this now-empty tab.
+        removeSessionTabs(for: controller)
+        controller.hauntedEmptyState = true
+        controller.surfaceTree = .init()
+    }
+
+    /// Forget every (target, session) → controller mapping pointing at this
+    /// controller. NSMapTable has no reverse lookup, so we sweep the keys.
+    @MainActor
+    private func removeSessionTabs(for controller: TerminalController) {
+        guard let keys = sessionTabs.keyEnumerator().allObjects as? [NSString] else { return }
+        for key in keys where sessionTabs.object(forKey: key) === controller {
+            sessionTabs.removeObject(forKey: key)
         }
     }
 
@@ -175,38 +221,54 @@ final class HauntedManager {
     @MainActor
     func openWindow(
         identity: HauntedClientIdentity,
-        workstations: [HauntedWorkstation]
+        workstations: [HauntedWorkstation],
+        lastSessions: [HauntedWorkstationSession] = []
     ) {
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
 
-        var target: String?
-        var sessionName = "default"
         switch HauntedSessionRouter.route(
-            lastAttached: Self.lastAttached, workstations: workstations) {
-        case .resume(let resumeTarget, let resumeSession):
-            (target, sessionName) = (resumeTarget, resumeSession)
-        case .fresh(let freshTarget):
-            target = freshTarget
-        case .plainShell:
-            target = nil
+            lastAttached: Self.lastAttached,
+            workstations: workstations,
+            sessionsOnLastTarget: lastSessions) {
+        case .resume(let target, let sessionName):
+            NSLog("[haunted] openWindow: resume target=%@ session=%@",
+                  target, sessionName)
+            // create:false — resume never mints a session. The router only
+            // returns .resume when the session is known to still exist.
+            let config = buildConfiguration(
+                target: target, sessionName: sessionName, create: false)
+            let controller = TerminalController.newWindow(
+                appDelegate.ghostty, withBaseConfig: config)
+            register(controller, identity: identity,
+                     target: target, sessionName: sessionName)
+        case .empty:
+            NSLog("[haunted] openWindow: empty state (nothing to resume)")
+            openEmptyWindow(appDelegate: appDelegate, identity: identity)
         }
-
-        let config: Ghostty.SurfaceConfiguration
-        if let target {
-            config = buildConfiguration(
-                target: target, sessionName: sessionName, create: true)
-        } else {
-            // No workstation online yet: a plain shell alongside the sidebar.
-            config = Ghostty.SurfaceConfiguration()
-        }
-
-        NSLog("[haunted] openWindow: target=%@ session=%@",
-              target ?? "none", sessionName)
-        let controller = TerminalController.newWindow(
-            appDelegate.ghostty, withBaseConfig: config)
-        register(controller, identity: identity,
-                 target: target, sessionName: sessionName)
     }
+
+    /// Opens a Haunted window straight into the "Nothing here" empty state:
+    /// sidebar plus a placeholder, no attached session and no local shell. A
+    /// throwaway shell surface is created by `newWindow` and torn down before
+    /// the window is presented; that is cheaper than teaching `newWindow` to
+    /// start surfaceless, and invisible to the user.
+    @MainActor
+    private func openEmptyWindow(
+        appDelegate: AppDelegate,
+        identity: HauntedClientIdentity
+    ) {
+        let controller = TerminalController.newWindow(
+            appDelegate.ghostty, withBaseConfig: Ghostty.SurfaceConfiguration())
+        register(controller, identity: identity, target: nil, sessionName: nil)
+        controller.hauntedEmptyState = true
+        controller.surfaceTree = .init()
+    }
+
+    /// The workstation target of the last session the user attached to, for
+    /// deciding at startup whether to fetch its session list (to confirm the
+    /// remembered session still exists before resuming it).
+    @MainActor
+    var lastAttachedTarget: String? { Self.lastAttached?.target }
 
     /// Last (workstation, session) the user attached to, persisted so a
     /// relaunch lands back in it. GUI-generated split/tab session names are
@@ -240,9 +302,40 @@ final class HauntedManager {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        // Existing sessions are attached as-is; a generated name is created.
+        // A generated name is created; existing sessions are attached as-is.
+        let create = sessionName == nil
+        // Opening from an empty-state window fills that window in place rather
+        // than leaving a lingering "Nothing here" tab behind a new one.
+        if parent.hauntedEmptyState {
+            attachInPlace(controller: parent, target: workstation.target,
+                          sessionName: name, create: create)
+            return
+        }
         openTab(from: parent, target: workstation.target,
-                sessionName: name, create: sessionName == nil)
+                sessionName: name, create: create)
+    }
+
+    /// Replaces an empty-state window's placeholder with a live attached
+    /// surface, reusing the same window and its already-attached sidebar.
+    @MainActor
+    private func attachInPlace(
+        controller: TerminalController,
+        target: String,
+        sessionName: String,
+        create: Bool
+    ) {
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              let app = appDelegate.ghostty.app,
+              let identity = self.identity(for: controller)
+        else { return }
+        let config = buildConfiguration(
+            target: target, sessionName: sessionName, create: create)
+        // Clear the flag before installing the surface so the surfaceTree
+        // change is treated as a real attach, not another empty transition.
+        controller.hauntedEmptyState = false
+        controller.surfaceTree = .init(view: Ghostty.SurfaceView(app, baseConfig: config))
+        register(controller, identity: identity,
+                 target: target, sessionName: sessionName)
     }
 
     /// Opens a new tab attached to a named session on a workstation.
@@ -585,6 +678,7 @@ final class HauntedSidebarDivider: NSView {
 final class HauntedContainerView: NSView {
     private let terminalArea: NSView
     private var connectingOverlay: NSView?
+    private var emptyStateView: NSView?
     private var sidebarWidth: NSLayoutConstraint!
     private var wasCollapsed: Bool
     private var layoutObserver: AnyCancellable?
@@ -699,5 +793,43 @@ final class HauntedContainerView: NSView {
         } else {
             overlay.removeFromSuperview()
         }
+    }
+
+    /// The "Nothing here" state: covers the terminal area (not the sidebar) with
+    /// a placeholder when the window has no attached session — at startup with
+    /// nothing to resume, or after the last session in the window is killed.
+    /// Idempotent, so a redundant show is a no-op rather than a stack of covers.
+    func showEmptyState() {
+        // A stale connecting overlay would sit on top of the placeholder.
+        hideConnectingOverlay(animated: false)
+        guard emptyStateView == nil else { return }
+
+        let overlay = NSVisualEffectView()
+        overlay.material = .windowBackground
+        overlay.blendingMode = .withinWindow
+        overlay.state = .active
+
+        let label = NSTextField(labelWithString: "Nothing here")
+        label.textColor = .secondaryLabelColor
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+
+        overlay.addSubview(label)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(overlay)
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            overlay.leadingAnchor.constraint(equalTo: terminalArea.leadingAnchor),
+            overlay.topAnchor.constraint(equalTo: terminalArea.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: terminalArea.bottomAnchor),
+            overlay.trailingAnchor.constraint(equalTo: terminalArea.trailingAnchor),
+            label.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+        ])
+        emptyStateView = overlay
+    }
+
+    func hideEmptyState() {
+        emptyStateView?.removeFromSuperview()
+        emptyStateView = nil
     }
 }
