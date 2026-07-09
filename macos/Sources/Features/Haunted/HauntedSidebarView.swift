@@ -43,6 +43,9 @@ final class HauntedSidebarModel: ObservableObject {
     /// Killing a session closes its tab, which only `HauntedManager` can do.
     /// Injected so a test can observe the request without a window.
     private let killSession: @MainActor (HauntedClientIdentity, String, String) -> Void
+    /// Closing every tab of a removed workstation is likewise `HauntedManager`'s
+    /// job; injected so the removal reconciliation is observable without windows.
+    private let closeWorkstation: @MainActor (String) -> Void
     private let pollInterval: TimeInterval
     /// Attach/kill take a moment to land daemon-side, so the change
     /// notification refreshes after a beat rather than racing the daemon.
@@ -58,11 +61,15 @@ final class HauntedSidebarModel: ObservableObject {
             HauntedManager.shared.killSession(
                 identity: $0, target: $1, sessionName: $2)
         },
-        pollInterval: TimeInterval = 10,
+        closeWorkstation: @escaping @MainActor (String) -> Void = {
+            HauntedManager.shared.closeTabs(forTarget: $0)
+        },
+        pollInterval: TimeInterval = 4,
         refreshDelay: TimeInterval = 1.2
     ) {
         self.client = client
         self.killSession = killSession
+        self.closeWorkstation = closeWorkstation
         self.pollInterval = pollInterval
         self.refreshDelay = refreshDelay
         observer = NotificationCenter.default.addObserver(
@@ -118,6 +125,39 @@ final class HauntedSidebarModel: ObservableObject {
         killSession(identity, workstation.target, sessionName)
     }
 
+    /// Absorb a topology change between two successful polls: hosts the console
+    /// added since `previous`, and hosts it removed. Runs only inside the poll's
+    /// success path, so a transient CLI failure (which leaves `workstations`
+    /// untouched) can never be mistaken for every host being removed.
+    ///
+    /// - Removed hosts: close their open tabs (the daemon is gone; a tab left
+    ///   attached only reconnect-loops and then strands a dead banner) and drop
+    ///   their now-unreachable sessions and expansion state.
+    /// - Newly-appeared online hosts: expand them so their sessions are visible.
+    ///   Only the new ones — re-deriving expansion for hosts already present
+    ///   would reopen whatever the user just collapsed (MOD-06). On the first
+    ///   poll `previous` is empty, so this expands every online host, which is
+    ///   the first-load behavior (MOD-05).
+    private func reconcile(previous: [HauntedWorkstation], fresh: [HauntedWorkstation]) {
+        let previousIDs = Set(previous.map { $0.id })
+        let freshIDs = Set(fresh.map { $0.id })
+
+        for removed in previousIDs.subtracting(freshIDs) {
+            sessionsByTarget[removed] = nil
+            expanded.remove(removed)
+            // `id` is the target ("user/daemon/app"); closeWorkstation takes the
+            // target. They are the same string here, but resolve it explicitly.
+            if let target = previous.first(where: { $0.id == removed })?.target {
+                closeWorkstation(target)
+            }
+        }
+
+        for workstation in fresh
+        where workstation.online && !previousIDs.contains(workstation.id) {
+            expanded.insert(workstation.id)
+        }
+    }
+
     /// One workstation's failure must not blank the others: a mesh blip on one
     /// daemon should not empty the whole sidebar.
     func refreshSessions() async {
@@ -136,15 +176,11 @@ final class HauntedSidebarModel: ObservableObject {
             guard let identity else { return }
             do {
                 let fresh = try await client.workstations(identity: identity)
+                let previous = workstations
                 workstations = fresh.sorted { $0.target < $1.target }
                 errorMessage = nil
 
-                // On first load, expand online workstations so sessions are
-                // visible. Only on first load: re-deriving it every poll would
-                // undo the user's collapses every ten seconds.
-                if !loaded {
-                    expanded = Set(fresh.filter { $0.online }.map { $0.id })
-                }
+                reconcile(previous: previous, fresh: fresh)
 
                 await refreshSessions()
             } catch {

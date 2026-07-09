@@ -417,12 +417,21 @@ or every test poisons the next.
 | MOD-03 | Poll throws | `errorMessage` set, **previous `workstations` retained** (no flash-to-empty) |
 | MOD-04 | Poll recovers | `errorMessage` cleared |
 | MOD-05 | First successful load | online workstations auto-expanded; offline ones not |
-| MOD-06 | Second load | expansion set **not** re-derived (`!loaded` guard) — a user collapse survives the poll |
+| MOD-06 | Second load | expansion **not** re-derived for hosts already present — a user collapse survives the poll |
 | MOD-07 | `kill` | session optimistically removed from `sessionsByTarget` immediately |
 | MOD-08 | `hauntedSessionsDidChange` posted | refresh fires after the 1.2s debounce, once |
 | MOD-09 | Ordering | workstations by `target`, sessions by `name` |
 | MOD-10 | `refreshSessions` with one workstation failing | other workstations still update |
 | MOD-11 | Poll task cancelled (window closed) | no data reset; a later `start` resumes |
+| MOD-12 | A host removed from the console vanishes from a later poll | its tabs closed (`closeWorkstation` seam), `sessionsByTarget` + `expanded` pruned; surviving hosts untouched |
+| MOD-13 | A host added to the console appears on a later poll | it arrives auto-expanded (online only); a user's earlier collapse of another host survives |
+
+MOD-05/06/13 now share one path (`reconcile`): first-load expansion is the
+`previous == []` case of "expand newly-appeared online hosts", so a broken
+expand loop fails MOD-05 and MOD-13 together (verified by surgical revert). The
+removal half (MOD-12) is independent. Discovery is poll-only — the client has no
+push channel for topology (mesh read loop handles only heartbeat + punch), so
+add/remove reflect within the poll interval (dropped to 4s), not instantly.
 
 Views (L0 via `ViewInspector`, or fold into L3 if that dependency is unwanted —
 prefer folding; do not add a dependency for four assertions):

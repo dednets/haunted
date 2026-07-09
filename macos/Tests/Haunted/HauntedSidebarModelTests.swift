@@ -77,11 +77,13 @@ struct HauntedSidebarModelTests {
         _ client: FakeListing,
         pollInterval: TimeInterval = 3600,
         refreshDelay: TimeInterval = 0.05,
-        killed: @escaping @MainActor (String, String) -> Void = { _, _ in }
+        killed: @escaping @MainActor (String, String) -> Void = { _, _ in },
+        closedWorkstation: @escaping @MainActor (String) -> Void = { _ in }
     ) -> HauntedSidebarModel {
         HauntedSidebarModel(
             client: client,
             killSession: { _, target, name in killed(target, name) },
+            closeWorkstation: closedWorkstation,
             pollInterval: pollInterval,
             refreshDelay: refreshDelay)
     }
@@ -382,5 +384,72 @@ struct HauntedSidebarModelTests {
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
         #expect(client.sessionCalls.isEmpty)
+    }
+
+    // MARK: MOD-12/13 — the console topology changed under us
+
+    /// A host removed on the console vanishes from the next poll. Dropping its
+    /// row is not enough: its open tabs would otherwise reconnect-loop for
+    /// minutes and then strand a dead banner, and its sessions would linger in
+    /// the model. The removal has to close those tabs and prune the sessions.
+    @Test("MOD-12: a workstation removed from the poll closes its tabs and drops its sessions")
+    func removedWorkstationClosesTabs() async throws {
+        let client = FakeListing()
+        let a = Self.workstation("u/a/haunted", online: true)
+        let b = Self.workstation("u/b/haunted", online: true)
+        // Second poll onward, b is gone — the admin removed it on the console.
+        client.workstationResults = [.success([a, b]), .success([a])]
+        client.sessionsByTarget = [
+            "u/a/haunted": [Self.session("s1")],
+            "u/b/haunted": [Self.session("s2")],
+        ]
+        var closed: [String] = []
+        let model = makeModel(client, pollInterval: 0.05,
+                              closedWorkstation: { closed.append($0) })
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.sessionsByTarget["u/b/haunted"] != nil },
+                            "b's sessions loaded on the first poll")
+
+        try await waitUntil(
+            { !model.workstations.contains { $0.id == "u/b/haunted" } },
+            "b drops off on the second poll")
+
+        #expect(closed == ["u/b/haunted"],
+                "the removed host's tabs are closed exactly once")
+        #expect(model.sessionsByTarget["u/b/haunted"] == nil,
+                "its stale sessions are pruned")
+        #expect(!model.expanded.contains("u/b/haunted"))
+        #expect(model.sessionsByTarget["u/a/haunted"] != nil,
+                "the surviving host is untouched")
+    }
+
+    /// A host added on the console appears on the next poll. It must arrive
+    /// *expanded* so its sessions are visible — the first-load auto-expand
+    /// (MOD-05) otherwise never fires for a host that shows up later, and the
+    /// user sees a bare collapsed row that reads as "add didn't work".
+    @Test("MOD-13: a workstation appearing on a later poll is auto-expanded, and a collapse survives")
+    func addedWorkstationAutoExpands() async throws {
+        let client = FakeListing()
+        let a = Self.workstation("u/a/haunted", online: true)
+        let b = Self.workstation("u/b/haunted", online: true)
+        client.workstationResults = [.success([a]), .success([a, b])]
+        client.sessionsByTarget = ["u/a/haunted": [], "u/b/haunted": []]
+        let model = makeModel(client, pollInterval: 0.05)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded })
+        model.toggle(a) // the user collapses the one host they can see
+        try #require(!model.expanded.contains("u/a/haunted"))
+
+        try await waitUntil({ model.workstations.contains { $0.id == "u/b/haunted" } },
+                            "b appears on a later poll")
+
+        #expect(model.expanded.contains("u/b/haunted"),
+                "the newly-added host is expanded so its sessions show")
+        #expect(!model.expanded.contains("u/a/haunted"),
+                "and the user's collapse of the existing host survives")
     }
 }

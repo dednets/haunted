@@ -135,6 +135,36 @@ final class HauntedManager {
         }
     }
 
+    /// Closes every open tab attached to `target`, used when that workstation is
+    /// removed from the console. The daemon is no longer reachable, so there is
+    /// nothing to kill over the mesh — the tabs can only be closed locally;
+    /// otherwise each one reconnect-loops for ~3 minutes and then strands a dead
+    /// exit banner the user must dismiss by hand.
+    @MainActor
+    func closeTabs(forTarget target: String) {
+        let prefix = "\(target)\u{1}"
+        guard let keys = sessionTabs.keyEnumerator().allObjects as? [NSString] else { return }
+        // Collect distinct controllers first: one window may hold several of the
+        // target's sessions as tabs, and closing/emptying it invalidates the
+        // other keys mid-enumeration.
+        var doomed: [TerminalController] = []
+        for key in keys where (key as String).hasPrefix(prefix) {
+            if let controller = sessionTabs.object(forKey: key),
+               !doomed.contains(where: { $0 === controller }) {
+                doomed.append(controller)
+            }
+        }
+        for controller in doomed {
+            let tabs = controller.window?.tabGroup?.windows.count ?? 1
+            switch Self.sessionTabClosePlan(siblingTabCount: tabs) {
+            case .closeTab:
+                controller.window?.close()
+            case .emptyState:
+                enterEmptyState(controller)
+            }
+        }
+    }
+
     /// Drops a Haunted window to the "Nothing here" empty state: sidebar still
     /// shown, terminal area replaced by a placeholder, no attached session and
     /// no local shell. Sets the flag *before* emptying the surface tree so the
