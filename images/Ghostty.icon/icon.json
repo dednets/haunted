@@ -110,7 +110,7 @@
         {
           "blend-mode" : "normal",
           "fill" : {
-            "solid" : "extended-srgb:0.00000,0.47843,1.00000,1.00000"
+            "solid" : "extended-srgb:0.54510,0.24706,0.91020,1.00000"
           },
           "glass" : true,
           "hidden" : false,
