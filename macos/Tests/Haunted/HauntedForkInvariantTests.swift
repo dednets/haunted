@@ -282,6 +282,65 @@ struct HauntedForkInvariantTests {
                 "SurfaceView.deinit no longer unregisters — a freed view stays 'live' and its dangling userdata is resurrected (BUG-15 returns).")
     }
 
+    // MARK: UPD-01 — Sparkle must never trust upstream Ghostty's update channel
+
+    /// The fork inherits upstream's whole Sparkle integration, and upstream's
+    /// version of it points at Ghostty's appcast and trusts Ghostty's EdDSA
+    /// key. Left in place, a user who enables `auto-update` gets offered stock
+    /// Ghostty releases — validly signed by a key the app trusts — and
+    /// accepting one replaces Haunted.app wholesale. Both values live in files
+    /// upstream owns (UpdateDelegate.swift, Ghostty-Info.plist), so a rebase
+    /// resolved as "theirs" silently restores them — hence a grep.
+    /// See docs/terminal-updates.md.
+    @Test("UPD-01: no Swift source points Sparkle at ghostty.org artifacts")
+    func noUpstreamUpdateFeed() throws {
+        let files = try Self.swiftFiles(under: Self.sourcesDirectory)
+        try #require(!files.isEmpty)
+
+        var offenders: [String] = []
+        for file in files {
+            let contents = try String(contentsOf: file, encoding: .utf8)
+            for (number, line) in contents.components(separatedBy: .newlines).enumerated()
+            where line.contains("files.ghostty.org") {
+                offenders.append("\(file.lastPathComponent):\(number + 1)")
+            }
+        }
+        #expect(offenders.isEmpty, """
+            files.ghostty.org is upstream Ghostty's artifact host. Feeding it to \
+            Sparkle offers users an "update" that replaces Haunted.app with stock \
+            Ghostty. Point at https://releases.dednets.com instead.
+            \(offenders.joined(separator: "\n"))
+            """)
+    }
+
+    @Test("UPD-01: the update feed points at releases.dednets.com, both channels")
+    func updateFeedPointsAtDedNets() throws {
+        let delegate = try String(
+            contentsOf: Self.sourcesDirectory
+                .appendingPathComponent("Features/Update/UpdateDelegate.swift"),
+            encoding: .utf8)
+        for url in ["https://releases.dednets.com/appcast.xml",
+                    "https://releases.dednets.com/tip/appcast.xml"] {
+            #expect(delegate.contains(url),
+                    "UpdateDelegate.feedURLString no longer serves \(url) — an upstream rebase probably took \"theirs\"")
+        }
+    }
+
+    @Test("UPD-01: the bundle trusts DedNets' Sparkle key, not Ghostty's")
+    func sparklePublicKeyIsOurs() throws {
+        let plist = try String(
+            contentsOf: Self.sourcesDirectory
+                .deletingLastPathComponent()  // macos
+                .appendingPathComponent("Ghostty-Info.plist"),
+            encoding: .utf8)
+        #expect(!plist.contains("wsNcGf5hirwtdXMVnYoxRIX/SqZQLMOsYlD3q3imeok="),
+                "Ghostty-Info.plist carries upstream Ghostty's SUPublicEDKey — the app will accept updates signed by Ghostty's release key")
+        #expect(plist.contains("<key>SUPublicEDKey</key>"),
+                "Ghostty-Info.plist lost SUPublicEDKey — Sparkle will refuse every update for lack of a trusted key")
+        #expect(plist.contains("Bgqf3WsSqHaemD8aHJ3CKImpYu1PnvhjUUsfLdWJRqg="),
+                "SUPublicEDKey is neither Ghostty's nor DedNets' release key — updates signed by the DedNets private key will be rejected")
+    }
+
     // MARK: Helpers
 
     /// `macos/Sources`, located relative to this test file so the check needs

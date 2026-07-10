@@ -473,9 +473,27 @@ func isValidSessionName(_ value: String) -> Bool {
 /// non-interactive `zsh -lc`, which never sources .zshrc), so "it's on my
 /// PATH" is true in the user's terminal and false inside the app.
 enum HauntedCLI {
-    /// Well-known install locations, most specific first. PATH remains the
-    /// last resort for setups that install elsewhere.
-    static func resolve(_ tool: String, fs: HauntedFileSystem = .real) -> String {
+    /// The app's own copy wins, then well-known install locations most
+    /// specific first. PATH remains the last resort for setups that install
+    /// elsewhere.
+    ///
+    /// The bundle carries `haunted` and `dedmeshctl` (Contents/MacOS, copied
+    /// in by the Make recipes) so a drag-install is complete and a Sparkle
+    /// update replaces app and CLIs atomically — version skew between the two
+    /// already shipped a breakage once (LOOP-08). Only those pure-client CLIs
+    /// may live in the bundle: `dedmeshd` self-updates by rewriting its own
+    /// executable, which inside the bundle would break the code-signing seal,
+    /// so the daemons stay under `~/.local/bin` and simply never hit the
+    /// bundle probe.
+    static func resolve(
+        _ tool: String,
+        fs: HauntedFileSystem = .real,
+        bundledTools: URL? = Bundle.main.executableURL?.deletingLastPathComponent()
+    ) -> String {
+        if let bundled = bundledTools?.appendingPathComponent(tool).path,
+           fs.isExecutableFile(atPath: bundled) {
+            return bundled
+        }
         let home = fs.homeDirectory.path
         let candidates = [
             "\(home)/.local/bin/\(tool)",

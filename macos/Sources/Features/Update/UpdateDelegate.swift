@@ -10,9 +10,14 @@ extension UpdateDriver: SPUUpdaterDelegate {
         // Sparkle supports a native concept of "channels" but it requires that
         // you share a single appcast file. We don't want to do that so we
         // do this instead.
+        //
+        // HAUNTED: these MUST point at DedNets, never at ghostty.org — the
+        // upstream feed serves stock Ghostty, and accepting one of its updates
+        // would replace Haunted.app wholesale (docs/terminal-updates.md; the
+        // UPD-01 fork-invariant guard pins this).
         switch appDelegate.ghostty.config.autoUpdateChannel {
-        case .tip: return "https://tip.files.ghostty.org/appcast.xml"
-        case .stable: return "https://release.files.ghostty.org/appcast.xml"
+        case .tip: return "https://releases.dednets.com/tip/appcast.xml"
+        case .stable: return "https://releases.dednets.com/appcast.xml"
         }
     }
 

@@ -327,6 +327,34 @@ struct HauntedCLIRunTests {
         }
     }
 
+    /// The copy shipped inside Haunted.app (Contents/MacOS) beats every
+    /// install on disk: a Sparkle update replaces app and CLIs atomically, so
+    /// preferring the bundle is what keeps the two from skewing (LOOP-08). An
+    /// installed-but-older `~/.local/bin/haunted` must not shadow it.
+    @Test("resolve: the bundled CLI wins over ~/.local/bin")
+    func resolvePrefersBundledCopy() throws {
+        let bundleDir = URL(fileURLWithPath: "/Applications/Haunted.app/Contents/MacOS")
+        try withResolveFS(
+            system: ["/Applications/Haunted.app/Contents/MacOS/haunted"],
+            homeFiles: [".local/bin/haunted": 0o755]
+        ) { fs in
+            #expect(HauntedCLI.resolve("haunted", fs: fs, bundledTools: bundleDir)
+                == "/Applications/Haunted.app/Contents/MacOS/haunted")
+        }
+    }
+
+    /// A tool the bundle does not carry (the daemons, deliberately — a
+    /// self-updating dedmeshd would break the bundle's signing seal) falls
+    /// through to the on-disk candidates unchanged.
+    @Test("resolve: a tool absent from the bundle falls through to ~/.local/bin")
+    func resolveSkipsBundleForUnbundledTool() throws {
+        let bundleDir = URL(fileURLWithPath: "/Applications/Haunted.app/Contents/MacOS")
+        try withResolveFS(homeFiles: [".local/bin/dedmeshd": 0o755]) { fs in
+            #expect(HauntedCLI.resolve("dedmeshd", fs: fs, bundledTools: bundleDir)
+                == "\(fs.homeDirectory.path)/.local/bin/dedmeshd")
+        }
+    }
+
     /// "Skips non-executable candidates": a file that *exists* at a
     /// higher-priority candidate but carries no `x` bit must not shadow a real
     /// tool further down. Resolving to it would hand `zsh -lc` an absolute path
