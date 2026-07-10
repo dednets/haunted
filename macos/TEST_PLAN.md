@@ -288,6 +288,8 @@ lone surrogate scalar. Harmless, but do not write a test that pretends to cover 
 | LOOP-04 | First call | script written, mode `0755` |
 | LOOP-05 | Second call in the same launch | not rewritten (`wroteAttachLoop`), same path returned |
 | LOOP-06 | Application Support dir unwritable | returns a path, logs, does not throw |
+| LOOP-08 | tab-scoped lifetime | `gui-*` session names get ` --kill-grace <tabScopedKillGrace>` — the daemon reaps them if their client vanishes without a detach and nobody reattaches (the fleet-wide dedmeshd re-exec used to strand them in every sidebar forever); `default` and user-named sessions are never armed (persistence is the product) |
+| LOOP-09 | `--kill-grace` across retries | the flag reaches `attach-remote`'s argv on EVERY reconnect attempt (an attach clears the arm daemon-side, so a retry that forgot it would demote the session to persistent), with the session still the last positional |
 
 #### `attach-loop.sh` behavior — L1, driven by `/bin/sh` with a stub `haunted`
 
