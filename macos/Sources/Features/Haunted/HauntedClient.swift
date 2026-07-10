@@ -682,25 +682,17 @@ enum HauntedCLI {
             fs: fs)
     }
 
-    /// How long a `gui-*` session survives its client VANISHING (severed
-    /// relay stream, killed Terminal, ⌘Q) before the daemon reaps it. Must
-    /// comfortably exceed the attach loop's full retry budget (~3 minutes),
-    /// so a session is never reaped out from under a reconnect that is about
-    /// to land. Ten minutes: blips reattach, corpses get collected.
-    static let tabScopedKillGrace = 600
-
     /// The command a terminal tab runs to attach to a workstation session.
     /// create=true for fresh session names (the daemon does not create on
     /// raw attach).
     ///
-    /// GUI-generated (`gui-*`) sessions are TAB-SCOPED: their lifetime is
-    /// their tab's, so the attach arms the daemon's kill-on-vanish grace
-    /// (`--kill-grace`) — a broken transport that never reconnects must not
-    /// strand them in every sidebar forever (the dedmeshd self-update re-exec
-    /// severed every attach stream at once and did exactly that). `default`
-    /// and user-named sessions stay persistent: never armed. Reattaching to
-    /// a `gui-*` row re-arms it — the attach clears the arm daemon-side, and
-    /// whoever shows it in a tab owns its lifetime again.
+    /// This command may ONLY use flags the OLDEST deployed `haunted` CLI
+    /// understands (`--create`). The tab-scoped kill grace for `gui-*`
+    /// sessions is deliberately NOT emitted here: it is `haunted
+    /// attach-remote`'s own default — when the app briefly passed
+    /// `--kill-grace` itself, every attach through an older `~/.local/bin/
+    /// haunted` died on a usage error and the reconnect loop spun uselessly.
+    /// The CLI knows its own flags; the app must keep working across skew.
     ///
     /// The heavy lifting lives in a generated helper script (attachLoopPath):
     /// initialInput is TYPED into the starting shell and echoed raw back at
@@ -714,9 +706,6 @@ enum HauntedCLI {
     ) -> String {
         var cmd = "exec \(quote(attachLoopPath(fs: fs))) \(quote(target)) \(quote(sessionName))"
         if create { cmd += " --create" }
-        if sessionName.hasPrefix("gui-") {
-            cmd += " --kill-grace \(Self.tabScopedKillGrace)"
-        }
         return cmd
     }
 

@@ -265,35 +265,33 @@ struct HauntedAttachLoopTests {
         #expect(argv.contains("--target alice/box/haunted"))
     }
 
-    /// LOOP-08. GUI-generated (`gui-*`) sessions are tab-scoped: the attach
-    /// arms the daemon's kill-on-vanish grace so a broken transport that
-    /// never reconnects cannot strand them in every sidebar (the dedmeshd
-    /// self-update re-exec did exactly that, fleet-wide). `default` and
-    /// user-named sessions stay persistent — never armed.
-    @Test("LOOP-08: gui-* sessions get --kill-grace; default and named do not")
-    func killGraceOnlyForGUISessions() throws {
+    /// LOOP-08. The generated command may only use flags the OLDEST deployed
+    /// `haunted` CLI understands. The tab-scoped kill grace is `haunted
+    /// attach-remote`'s own gui-* default, NOT an app-emitted flag: when the
+    /// app briefly emitted `--kill-grace`, every attach through an older
+    /// `~/.local/bin/haunted` died on a usage error and the reconnect loop
+    /// spun to exhaustion — a new app must never require a new CLI.
+    @Test("LOOP-08: attachCommand emits no flags an old haunted CLI rejects")
+    func attachCommandStaysOldCLICompatible() throws {
         let harness = try makeHarness(hauntedBody: "exit 0")
         defer { harness.remove() }
 
-        let tab = HauntedCLI.attachCommand(
-            target: "a/b/c", sessionName: "gui-1a2b3c4d5e6f7a8b",
-            create: true, fs: harness.fs)
-        #expect(tab.contains(" --kill-grace \(HauntedCLI.tabScopedKillGrace)"))
-
-        for persistent in ["default", "work", "guidance"] {
+        for (name, create) in [
+            ("gui-1a2b3c4d5e6f7a8b", true), ("default", true), ("work", false),
+        ] {
             let cmd = HauntedCLI.attachCommand(
-                target: "a/b/c", sessionName: persistent,
-                create: false, fs: harness.fs)
-            #expect(!cmd.contains("--kill-grace"),
-                    "\(persistent) must stay persistent")
+                target: "a/b/c", sessionName: name, create: create, fs: harness.fs)
+            let flags = cmd.split(separator: " ").filter { $0.hasPrefix("--") }
+            #expect(flags.allSatisfy { $0 == "--create" },
+                    "unexpected flag(s) \(flags) for \(name); old CLIs reject them")
         }
     }
 
-    /// LOOP-09. The flag must reach attach-remote on EVERY retry, not just
-    /// the first attempt — an attach clears the arm daemon-side, so a
-    /// reconnect that forgot to re-arm would silently demote the session
-    /// back to persistent.
-    @Test("LOOP-09: --kill-grace reaches attach-remote on every retry")
+    /// LOOP-09. Extra flags handed to the loop script must reach attach-remote
+    /// on EVERY retry, not just the first attempt — an attach clears the
+    /// kill-grace arm daemon-side, so a retry that dropped the flags would
+    /// silently change semantics mid-loop.
+    @Test("LOOP-09: extra flags reach attach-remote on every retry")
     func killGraceReachesEveryRetry() throws {
         let harness = try makeHarness(hauntedBody: "exit 0")
         defer { harness.remove() }
