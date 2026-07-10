@@ -30,3 +30,6 @@ glad.zip
 
 vgcore.*
 
+
+# LLVM coverage artifacts from test runs
+*.profraw
