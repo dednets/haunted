@@ -446,6 +446,9 @@ or every test poisons the next.
 | MOD-12 | A host removed from the console vanishes from a later poll | its tabs closed (`closeWorkstation` seam), `sessionsByTarget` + `expanded` pruned; surviving hosts untouched |
 | MOD-13 | A host added to the console appears on a later poll | it arrives auto-expanded (online only); a user's earlier collapse of another host survives |
 | MOD-15 | `localTabs` ("This computer") | populated from the injected provider on every poll AND on `hauntedSessionsDidChange` (openLocalTab posts it), so a new local tab appears without waiting out the interval |
+| MOD-16 | session-list queries | only EXPANDED online workstations are queried (a collapsed group is a wasted Console session); expanding fetches on the spot, collapsing stops. First-load auto-expand keeps coverage unchanged |
+| MOD-17 | inactive backoff | an inactive app (injected `isAppActive == false`) sleeps the slow `inactivePollInterval` instead of re-polling on the active cadence; reactivation restarts the loop (production only, `wakesOnAppActivation`) |
+| MOD-18 | refresh coalescing | a `refreshSessions` request arriving while one runs sets a pending flag and the in-flight pass re-runs once, rather than launching a concurrent second round of subprocesses |
 | MOD-14 | `applyLocalTitle` for a session the model knows | the row's `title` updates **without a CLI round-trip** — the daemon pushes titles to attached clients instantly (that is what retitles the tab), so an open session's sidebar row follows its tab rather than the next list poll. Unknown target/session: strict no-op, no row fabricated. |
 
 MOD-05/06/13 now share one path (`reconcile`): first-load expansion is the

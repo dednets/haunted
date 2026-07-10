@@ -168,6 +168,8 @@ final class HauntedSidebarModel: ObservableObject {
         // one poll loop for the whole sidebar. Only the production singleton
         // hooks it up: the default (nil) keeps tests hermetic, since
         // HauntedLimaModel.shared would probe the real filesystem for limactl.
+        isAppActive: { NSApplication.shared.isActive },
+        wakesOnAppActivation: true,
         limaRefresh: { await HauntedLimaModel.shared.refresh() },
         localTabsProvider: { HauntedManager.shared.localTabs() })
 
@@ -190,7 +192,19 @@ final class HauntedSidebarModel: ObservableObject {
     /// Closing every tab of a removed workstation is likewise `HauntedManager`'s
     /// job; injected so the removal reconciliation is observable without windows.
     private let closeWorkstation: @MainActor (String) -> Void
+    /// The poll cadence while the app is active. Each cycle costs one Console
+    /// mTLS session for the workstation list plus one per EXPANDED online
+    /// workstation (see refreshSessions) — so a tight interval is only paid
+    /// for what the user is looking at.
     private let pollInterval: TimeInterval
+    /// The (slower) cadence while the app is inactive or occluded: nobody is
+    /// watching the sidebar, so trade latency for a fraction of the mesh
+    /// traffic. Reactivation wakes the loop immediately, so the slow interval
+    /// never delays what the user sees on return.
+    private let inactivePollInterval: TimeInterval
+    /// Whether the app is frontmost/visible; drives which interval a cycle
+    /// sleeps. Injected so tests stay hermetic (default: always active).
+    private let isAppActive: @MainActor () -> Bool
     /// Attach/kill take a moment to land daemon-side, so the change
     /// notification refreshes after a beat rather than racing the daemon.
     private let refreshDelay: TimeInterval
@@ -204,6 +218,12 @@ final class HauntedSidebarModel: ObservableObject {
     private var identity: HauntedClientIdentity?
     private var pollTask: Task<Void, Never>?
     private var observer: (any NSObjectProtocol)?
+    private var activeObserver: (any NSObjectProtocol)?
+    /// refreshSessions coalescing: a request arriving while one runs sets
+    /// `refreshPending` instead of launching a second round of subprocesses;
+    /// the in-flight pass re-runs once at the end. Both are main-actor state.
+    private var refreshing = false
+    private var refreshPending = false
 
     init(
         client: HauntedSessionListing = HauntedCLISessionListing(),
@@ -215,6 +235,11 @@ final class HauntedSidebarModel: ObservableObject {
             HauntedManager.shared.closeTabs(forTarget: $0)
         },
         pollInterval: TimeInterval = 4,
+        inactivePollInterval: TimeInterval = 30,
+        isAppActive: @escaping @MainActor () -> Bool = { true },
+        // Wake the poll on NSApplication reactivation. Off by default so test
+        // models never react to the host app's own activation events.
+        wakesOnAppActivation: Bool = false,
         refreshDelay: TimeInterval = 1.2,
         limaRefresh: (@MainActor () async -> Void)? = nil,
         localTabsProvider: @escaping @MainActor () -> [HauntedLocalTab] = { [] }
@@ -223,6 +248,8 @@ final class HauntedSidebarModel: ObservableObject {
         self.killSession = killSession
         self.closeWorkstation = closeWorkstation
         self.pollInterval = pollInterval
+        self.inactivePollInterval = inactivePollInterval
+        self.isAppActive = isAppActive
         self.refreshDelay = refreshDelay
         self.limaRefresh = limaRefresh
         self.localTabsProvider = localTabsProvider
@@ -235,12 +262,22 @@ final class HauntedSidebarModel: ObservableObject {
                 await self.refreshSessions()
             }
         }
+        // Coming back to the app must not wait out the slow inactive interval:
+        // restart the poll for an immediate fresh cycle.
+        if wakesOnAppActivation {
+            activeObserver = NotificationCenter.default.addObserver(
+                forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.restartPoll() }
+            }
+        }
     }
 
     deinit {
         // Block-based observers outlive their target; without this a test's
         // model keeps answering notifications meant for the next one.
         if let observer { NotificationCenter.default.removeObserver(observer) }
+        if let activeObserver { NotificationCenter.default.removeObserver(activeObserver) }
         pollTask?.cancel()
     }
 
@@ -263,11 +300,24 @@ final class HauntedSidebarModel: ObservableObject {
         pollTask?.cancel()
     }
 
+    /// Restarts the poll for an immediate cycle without discarding data (used
+    /// when the app reactivates so a slow inactive sleep doesn't delay the
+    /// refresh). A no-op until the first `start` has set an identity.
+    private func restartPoll() {
+        guard identity != nil else { return }
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in await self?.poll() }
+    }
+
     func toggle(_ workstation: HauntedWorkstation) {
         if expanded.contains(workstation.id) {
             expanded.remove(workstation.id)
         } else {
             expanded.insert(workstation.id)
+            // Expanding reveals a workstation whose sessions may be stale (it
+            // was skipped while collapsed) — fetch them now rather than
+            // leaving the empty list until the next poll.
+            Task { [weak self] in await self?.refreshSessions() }
         }
     }
 
@@ -349,18 +399,40 @@ final class HauntedSidebarModel: ObservableObject {
         sessionsByTarget[target] = sessions
     }
 
+    /// Refreshes the session lists shown in the sidebar. Two efficiency rules:
+    ///
+    ///  - **Only EXPANDED online workstations are queried.** Each query is a
+    ///    Console mTLS session (a `haunted list` over the relay); a collapsed
+    ///    group shows no sessions, so polling it every cycle is pure waste.
+    ///    Expanding one fetches it on the spot (see toggle), and reconcile
+    ///    auto-expands newly-online hosts, so first-load coverage is unchanged.
+    ///  - **Overlapping calls coalesce.** The poll loop and the change
+    ///    notification both call this; a request arriving mid-run sets a
+    ///    pending flag and the in-flight pass re-runs once, rather than firing
+    ///    a second concurrent round of subprocesses.
+    ///
     /// One workstation's failure must not blank the others: a mesh blip on one
     /// daemon should not empty the whole sidebar.
     func refreshSessions() async {
         localTabs = localTabsProvider()
         guard let identity else { return }
-        for workstation in workstations where workstation.online {
-            if let sessions = try? await client.sessions(
-                identity: identity, target: workstation.target) {
-                sessionsByTarget[workstation.id] =
-                    sessions.sorted { $0.name < $1.name }
-            }
+        if refreshing {
+            refreshPending = true
+            return
         }
+        refreshing = true
+        defer { refreshing = false }
+        repeat {
+            refreshPending = false
+            for workstation in workstations
+            where workstation.online && expanded.contains(workstation.id) {
+                if let sessions = try? await client.sessions(
+                    identity: identity, target: workstation.target) {
+                    sessionsByTarget[workstation.id] =
+                        sessions.sorted { $0.name < $1.name }
+                }
+            }
+        } while refreshPending
     }
 
     private func poll() async {
@@ -382,7 +454,10 @@ final class HauntedSidebarModel: ObservableObject {
                 errorMessage = error.localizedDescription
             }
             loaded = true
-            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            // Nobody watching → poll far less often (reactivation restarts the
+            // loop, so the slow interval never delays what the user sees).
+            let interval = isAppActive() ? pollInterval : inactivePollInterval
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
         }
     }
 }

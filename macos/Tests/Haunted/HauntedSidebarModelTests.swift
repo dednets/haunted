@@ -49,6 +49,15 @@ struct HauntedSidebarModelTests {
             return try result.get()
         }
 
+        /// When true, `sessions` records the call and then spins until it is
+        /// cleared — lets a test hold one refresh in-flight to observe
+        /// coalescing (MOD-18).
+        var sessionsHold: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _sessionsHold }
+            set { lock.lock(); _sessionsHold = newValue; lock.unlock() }
+        }
+        private var _sessionsHold = false
+
         func sessions(
             identity: HauntedClientIdentity, target: String
         ) async throws -> [HauntedWorkstationSession] {
@@ -56,6 +65,7 @@ struct HauntedSidebarModelTests {
             _sessionCalls.append(target)
             let sessions = sessionsByTarget[target]
             lock.unlock()
+            while sessionsHold { await Task.yield() }
             guard let sessions else { throw HauntedCLIError(message: "unreachable") }
             return sessions
         }
@@ -558,5 +568,100 @@ struct HauntedSidebarModelTests {
         NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
         try await waitUntil({ model.localTabs.count == 2 }, "the refresh lands")
         #expect(model.localTabs == box.tabs)
+    }
+
+    // MARK: MOD-16/17/18 — poll efficiency
+
+    /// Only EXPANDED online workstations are queried for sessions: a collapsed
+    /// group shows nothing, so polling it is a wasted Console session. Expand
+    /// fetches on the spot; collapse stops the queries.
+    @Test("MOD-16: collapsed workstations are not queried; expanding fetches immediately")
+    func expandedOnlyQuerying() async throws {
+        let client = FakeListing()
+        let ws = Self.workstation("a/x/haunted", online: true)
+        client.workstationResults = [.success([ws])]
+        client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded })
+        try #require(model.expanded.contains("a/x/haunted"), "online host auto-expands")
+        let afterLoad = client.sessionCalls.count
+        #expect(afterLoad >= 1, "the expanded workstation is queried on load")
+
+        // Collapse → a refresh must not query it.
+        model.toggle(ws)
+        try #require(!model.expanded.contains("a/x/haunted"))
+        await model.refreshSessions()
+        #expect(client.sessionCalls.count == afterLoad,
+                "a collapsed workstation is not queried")
+
+        // Re-expand → fetched at once, not left to the next poll.
+        model.toggle(ws)
+        try await waitUntil({ client.sessionCalls.count > afterLoad },
+                            "expanding fetches sessions immediately")
+    }
+
+    /// An inactive app polls on the slow interval — the workstation list is
+    /// not re-fetched on the active cadence while nobody is watching.
+    @Test("MOD-17: an inactive app backs off to the slow poll interval")
+    func inactiveBackoff() async throws {
+        let client = FakeListing()
+        client.workstationResults = [.success([])]
+        let model = HauntedSidebarModel(
+            client: client,
+            killSession: { _, _, _ in },
+            closeWorkstation: { _ in },
+            pollInterval: 0.05,
+            inactivePollInterval: 3600,
+            isAppActive: { false })
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded }, "the first poll completes")
+        let after = client.workstationCalls
+        // 6× the active interval: an active app would have re-polled several
+        // times; an inactive one is asleep on the 3600s interval.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        #expect(client.workstationCalls == after,
+                "an inactive app does not re-poll on the active interval")
+    }
+
+    /// The poll loop and the change notification both call refreshSessions;
+    /// a request arriving mid-run coalesces into a single re-run rather than
+    /// launching a concurrent second round of subprocesses.
+    @Test("MOD-18: overlapping refreshes coalesce into one re-run")
+    func refreshCoalesces() async throws {
+        let client = FakeListing()
+        let ws = Self.workstation("a/x/haunted", online: true)
+        client.workstationResults = [.success([ws])]
+        client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded })
+
+        // Hold the next refresh in sessions(), then fire it.
+        client.sessionsHold = true
+        Task { await model.refreshSessions() }
+        try await waitUntil({ client.sessionCalls.count >= 2 },
+                            "a refresh entered sessions() and is held")
+        let held = client.sessionCalls.count
+
+        // Two more requests while one is in flight: no concurrent extra round.
+        Task { await model.refreshSessions() }
+        Task { await model.refreshSessions() }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(client.sessionCalls.count == held,
+                "no concurrent round is launched while a refresh runs")
+
+        // Releasing runs exactly one coalesced re-run.
+        client.sessionsHold = false
+        try await waitUntil({ client.sessionCalls.count == held + 1 },
+                            "the pending requests collapse into one re-run")
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(client.sessionCalls.count == held + 1, "no further rounds")
     }
 }
