@@ -161,7 +161,10 @@ final class HauntedLoginController: NSWindowController {
 }
 
 struct HauntedLoginView: View {
-    static let defaultConsoleURL = "https://console.staging.dednets.com"
+    // Production is the default a shipped build must carry (the DMG on
+    // releases.dednets.com talks to the prod console); staging/dev are the
+    // opt-in, via this field or the HauntedConsoleURL default.
+    static let defaultConsoleURL = "https://console.dednets.com"
 
     @State private var consoleURL = UserDefaults.standard.string(
         forKey: "HauntedConsoleURL") ?? HauntedLoginView.defaultConsoleURL
