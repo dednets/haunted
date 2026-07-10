@@ -547,6 +547,13 @@ the reason the fork exists in this shape. Upstream adds a new code path to
 `TerminalController.newWindow(...)` and the app quietly opens an unattached local
 shell. Nothing today would catch it.
 
+Precisely stated, the invariant is "never an **accidental** plain local
+terminal": the sidebar's **This computer** row deliberately opens one
+(`HauntedManager.openLocalTab` — upstream's default surface, sidebar attached,
+splits stay local via `splitPlan .passthrough`). That is the user explicitly
+asking for a local shell, which the invariant was never meant to forbid; every
+*upstream entry point* must still route through Haunted.
+
 L3 (XCUITest) unless noted:
 
 | ID | Trigger | Expect |

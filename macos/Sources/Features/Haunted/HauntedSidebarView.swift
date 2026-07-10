@@ -365,6 +365,8 @@ struct HauntedSidebarView: View {
     let identity: HauntedClientIdentity
     /// (workstation, sessionName?) — nil sessionName means "create a new session".
     let onOpen: (HauntedWorkstation, String?) -> Void
+    /// "This computer": open a plain local terminal on this Mac.
+    let onOpenLocal: () -> Void
 
     @ObservedObject private var model = HauntedSidebarModel.shared
     @ObservedObject private var layout = HauntedSidebarLayout.shared
@@ -467,6 +469,10 @@ struct HauntedSidebarView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
+                    // Always first and always available: a regular terminal on
+                    // this Mac, exactly upstream Ghostty's default surface.
+                    LocalComputerRow(onOpen: onOpenLocal)
+
                     ForEach(mergedRows) { row in
                         if let workstation = row.workstation {
                             WorkstationGroup(
@@ -836,6 +842,44 @@ private struct SessionRow: View {
             Divider()
             Button("Kill Session", role: .destructive) { onKill() }
         }
+    }
+}
+
+/// "This computer": a regular terminal on this Mac — upstream Ghostty's
+/// default surface, no attach command, no mesh in the path. Always present
+/// and always enabled: the local machine needs no daemon to be reachable.
+/// Laid out to line up with the workstation rows (16pt icon slot where their
+/// chevron sits).
+private struct LocalComputerRow: View {
+    let onOpen: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onOpen) {
+            HStack(spacing: 0) {
+                Image(systemName: "laptopcomputer")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 16, height: 16)
+                HStack(spacing: 6) {
+                    Text("This computer")
+                        .fontWeight(.medium)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .background(
+                    RoundedRectangle(cornerRadius: 5)
+                        .fill(hovering ? Color.secondary.opacity(0.15) : Color.clear))
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Open a regular terminal on this Mac")
+        .padding(.leading, 2)
     }
 }
 

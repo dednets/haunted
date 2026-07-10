@@ -490,6 +490,35 @@ final class HauntedManager {
                  target: target, sessionName: sessionName)
     }
 
+    /// Opens a plain LOCAL terminal on this Mac (the sidebar's "This computer"
+    /// row): upstream Ghostty's default surface — the user's shell, no attach
+    /// command, no wait-after-command, no mesh anywhere in the path. This is
+    /// the one deliberate exception to "never a plain local terminal": that
+    /// invariant guards against *accidental* local shells from upstream entry
+    /// points, not against the user explicitly asking for one. From an
+    /// empty-state window the placeholder is filled in place (same reasoning
+    /// as attachInPlace); otherwise a new tab opens.
+    @MainActor
+    func openLocalTab(from parent: TerminalController) {
+        guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
+        if parent.hauntedEmptyState {
+            guard let app = appDelegate.ghostty.app else { return }
+            parent.hauntedEmptyState = false
+            parent.surfaceTree = .init(view: Ghostty.SurfaceView(
+                app, baseConfig: Ghostty.SurfaceConfiguration()))
+            return
+        }
+        guard let identity = self.identity(for: parent),
+              let controller = TerminalController.newTab(
+                appDelegate.ghostty, from: parent.window,
+                withBaseConfig: Ghostty.SurfaceConfiguration())
+        else { return }
+        // Registered with no target/session: the sidebar rides along in the
+        // new tab, nothing lands in sessionTabs, and a split from this
+        // surface stays local (splitPlan .passthrough).
+        register(controller, identity: identity, target: nil, sessionName: nil)
+    }
+
     /// Opens a new tab attached to a named session on a workstation.
     @MainActor
     func openTab(
@@ -738,14 +767,22 @@ final class HauntedManager {
               let terminalView = window.contentView,
               !(terminalView is HauntedContainerView) else { return }
 
-        let sidebar = HauntedSidebarView(identity: identity) { [weak self, weak controller] workstation, sessionName in
-            guard let self, let controller else { return }
-            Task { @MainActor in
-                self.focusOrOpen(from: controller,
-                                 workstation: workstation,
-                                 sessionName: sessionName)
-            }
-        }
+        let sidebar = HauntedSidebarView(
+            identity: identity,
+            onOpen: { [weak self, weak controller] workstation, sessionName in
+                guard let self, let controller else { return }
+                Task { @MainActor in
+                    self.focusOrOpen(from: controller,
+                                     workstation: workstation,
+                                     sessionName: sessionName)
+                }
+            },
+            onOpenLocal: { [weak self, weak controller] in
+                guard let self, let controller else { return }
+                Task { @MainActor in
+                    self.openLocalTab(from: controller)
+                }
+            })
         window.contentView = HauntedContainerView(
             sidebar: NSHostingView(rootView: sidebar),
             terminal: terminalView)
