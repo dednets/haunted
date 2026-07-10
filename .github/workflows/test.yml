@@ -79,7 +79,10 @@ jobs:
 
   required:
     name: "Required Checks: Test"
-    if: always()
+    # The namespace-profile-* runners only exist in ghostty-org. Every other job
+    # here is already gated on the same condition, but `always()` made this one
+    # request a runner that never comes, so the run queued forever in the fork.
+    if: always() && github.repository == 'ghostty-org/ghostty'
     runs-on: namespace-profile-ghostty-xsm
     needs:
       - skip
