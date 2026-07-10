@@ -445,6 +445,7 @@ or every test poisons the next.
 | MOD-11 | Poll task cancelled (window closed) | no data reset; a later `start` resumes |
 | MOD-12 | A host removed from the console vanishes from a later poll | its tabs closed (`closeWorkstation` seam), `sessionsByTarget` + `expanded` pruned; surviving hosts untouched |
 | MOD-13 | A host added to the console appears on a later poll | it arrives auto-expanded (online only); a user's earlier collapse of another host survives |
+| MOD-15 | `localTabs` ("This computer") | populated from the injected provider on every poll AND on `hauntedSessionsDidChange` (openLocalTab posts it), so a new local tab appears without waiting out the interval |
 | MOD-14 | `applyLocalTitle` for a session the model knows | the row's `title` updates **without a CLI round-trip** — the daemon pushes titles to attached clients instantly (that is what retitles the tab), so an open session's sidebar row follows its tab rather than the next list poll. Unknown target/session: strict no-op, no row fabricated. |
 
 MOD-05/06/13 now share one path (`reconcile`): first-load expansion is the
@@ -474,6 +475,14 @@ every other Terminal follows ≤4s later.
 | COL-08 | the write fails | error surfaces in `errorMessage`; the next poll reverts the optimistic tint to stored truth |
 | COL-09 | another Terminal changed the color | the next poll applies it (poll wins; no push channel) |
 | COL-10 | `setColor` with no identity | strict no-op |
+
+The "This computer" group renders local tabs (MOD-15's data) like a
+workstation: chevron (its expansion is `localExpanded`, deliberately outside
+`expanded` so reconcile() never touches it), a row per open local tab, and a
+"New session" action. The row of the tab HOSTING the sidebar renders selected
+(`hostTabID` / `currentSession` from the manager registry) — the sidebar
+mirror of the tab bar's highlight; the same treatment marks the current
+workstation session row. Both are view-level (L3).
 
 Views (L0 via `ViewInspector`, or fold into L3 if that dependency is unwanted —
 prefer folding; do not add a dependency for four assertions):

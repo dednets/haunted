@@ -72,6 +72,14 @@ enum HauntedWorkstationPalette {
     }
 }
 
+/// One open LOCAL terminal tab, as the sidebar's "This computer" group lists
+/// them. The id is the hosting tab controller's identity — stable for the
+/// tab's life, and what focusing resolves by.
+struct HauntedLocalTab: Identifiable, Equatable {
+    let id: ObjectIdentifier
+    let title: String
+}
+
 /// One sidebar row after joining the console's workstation list with the
 /// host's local Lima VMs: console-only (a remote workstation, or an orphan a
 /// failed revoke left behind), Lima-only (a VM that has not enrolled/come
@@ -160,13 +168,20 @@ final class HauntedSidebarModel: ObservableObject {
         // one poll loop for the whole sidebar. Only the production singleton
         // hooks it up: the default (nil) keeps tests hermetic, since
         // HauntedLimaModel.shared would probe the real filesystem for limactl.
-        limaRefresh: { await HauntedLimaModel.shared.refresh() })
+        limaRefresh: { await HauntedLimaModel.shared.refresh() },
+        localTabsProvider: { HauntedManager.shared.localTabs() })
 
     @Published var workstations: [HauntedWorkstation] = []
     @Published var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
     @Published var expanded: Set<String> = []
     @Published var errorMessage: String?
     @Published var loaded = false
+    /// The open local terminal tabs ("This computer"), refreshed on the same
+    /// poll (and change notification) as everything else.
+    @Published var localTabs: [HauntedLocalTab] = []
+    /// Whether the "This computer" group shows its tabs. Separate from
+    /// `expanded` (workstation ids) so reconcile() never touches it.
+    @Published var localExpanded = true
 
     private let client: HauntedSessionListing
     /// Killing a session closes its tab, which only `HauntedManager` can do.
@@ -182,6 +197,9 @@ final class HauntedSidebarModel: ObservableObject {
     /// Piggybacks the Lima manager's refresh on this model's poll loop
     /// (nil = no Lima integration; see `shared`).
     private let limaRefresh: (@MainActor () async -> Void)?
+    /// Source of the open local tabs (the manager's registry in production;
+    /// injected so tests stay hermetic).
+    private let localTabsProvider: @MainActor () -> [HauntedLocalTab]
 
     private var identity: HauntedClientIdentity?
     private var pollTask: Task<Void, Never>?
@@ -198,7 +216,8 @@ final class HauntedSidebarModel: ObservableObject {
         },
         pollInterval: TimeInterval = 4,
         refreshDelay: TimeInterval = 1.2,
-        limaRefresh: (@MainActor () async -> Void)? = nil
+        limaRefresh: (@MainActor () async -> Void)? = nil,
+        localTabsProvider: @escaping @MainActor () -> [HauntedLocalTab] = { [] }
     ) {
         self.client = client
         self.killSession = killSession
@@ -206,6 +225,7 @@ final class HauntedSidebarModel: ObservableObject {
         self.pollInterval = pollInterval
         self.refreshDelay = refreshDelay
         self.limaRefresh = limaRefresh
+        self.localTabsProvider = localTabsProvider
         observer = NotificationCenter.default.addObserver(
             forName: .hauntedSessionsDidChange, object: nil, queue: .main
         ) { [weak self] _ in
@@ -332,6 +352,7 @@ final class HauntedSidebarModel: ObservableObject {
     /// One workstation's failure must not blank the others: a mesh blip on one
     /// daemon should not empty the whole sidebar.
     func refreshSessions() async {
+        localTabs = localTabsProvider()
         guard let identity else { return }
         for workstation in workstations where workstation.online {
             if let sessions = try? await client.sessions(
@@ -379,6 +400,16 @@ struct HauntedSidebarView: View {
     let onOpen: (HauntedWorkstation, String?) -> Void
     /// "This computer": open a plain local terminal on this Mac.
     let onOpenLocal: () -> Void
+    /// Focus an already-open local tab (a "This computer" child row).
+    let onFocusLocalTab: (ObjectIdentifier) -> Void
+    /// The (target, session) of the tab hosting THIS sidebar — the row the
+    /// sidebar highlights as current. Re-evaluated on every render, so an
+    /// empty-state window that attaches in place starts highlighting without
+    /// a new sidebar.
+    let currentSession: @MainActor () -> (target: String, name: String)?
+    /// The hosting tab's identity, to highlight it under "This computer"
+    /// when the host tab is itself a local terminal.
+    let hostTabID: ObjectIdentifier?
 
     @ObservedObject private var model = HauntedSidebarModel.shared
     @ObservedObject private var layout = HauntedSidebarLayout.shared
@@ -480,8 +511,16 @@ struct HauntedSidebarView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
                     // Always first and always available: a regular terminal on
-                    // this Mac, exactly upstream Ghostty's default surface.
-                    LocalComputerRow(onOpen: onOpenLocal)
+                    // this Mac, exactly upstream Ghostty's default surface —
+                    // rendered like the workstations: expandable, its open
+                    // tabs listed, plus a "New session" action.
+                    LocalComputerGroup(
+                        tabs: model.localTabs,
+                        isExpanded: model.localExpanded,
+                        hostTabID: hostTabID,
+                        toggle: { model.localExpanded.toggle() },
+                        onOpen: onOpenLocal,
+                        onFocusTab: onFocusLocalTab)
 
                     ForEach(mergedRows) { row in
                         if let workstation = row.workstation {
@@ -490,6 +529,9 @@ struct HauntedSidebarView: View {
                                 displayName: row.displayName,
                                 sessions: model.sessionsByTarget[workstation.id] ?? [],
                                 isExpanded: model.expanded.contains(workstation.id),
+                                currentSessionName: currentSession().flatMap {
+                                    $0.target == workstation.target ? $0.name : nil
+                                },
                                 lima: row.lima,
                                 limaOp: row.op,
                                 // A console row with no local VM offers the
@@ -638,6 +680,10 @@ private struct WorkstationGroup: View {
     let displayName: String
     let sessions: [HauntedWorkstationSession]
     let isExpanded: Bool
+    /// The session name the hosting tab is attached to on THIS workstation
+    /// (nil when the host tab looks elsewhere) — the row highlighted as
+    /// current, beyond the open-in-this-app accent.
+    let currentSessionName: String?
     /// The local Lima VM backing this workstation (merged by name), if any.
     let lima: HauntedLimaInstance?
     let limaOp: HauntedLimaModel.Op?
@@ -731,6 +777,7 @@ private struct WorkstationGroup: View {
                         session: session,
                         isOpenHere: HauntedManager.shared.isSessionOpen(
                             target: workstation.target, sessionName: session.name),
+                        isCurrent: session.name == currentSessionName,
                         action: { onOpenSession(session.name) },
                         onKill: { onKillSession(session.name) })
                 }
@@ -823,6 +870,9 @@ private struct WorkstationGroup: View {
 private struct SessionRow: View {
     let session: HauntedWorkstationSession
     let isOpenHere: Bool
+    /// The hosting tab shows exactly this session: render selected, matching
+    /// the tab bar's own highlight.
+    let isCurrent: Bool
     let action: () -> Void
     let onKill: () -> Void
 
@@ -853,7 +903,8 @@ private struct SessionRow: View {
             .padding(.trailing, 6)
             .background(
                 RoundedRectangle(cornerRadius: 5)
-                    .fill(hovering ? Color.secondary.opacity(0.15) : Color.clear))
+                    .fill(isCurrent ? Color.accentColor.opacity(0.22)
+                        : hovering ? Color.secondary.opacity(0.15) : Color.clear))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
@@ -871,40 +922,119 @@ private struct SessionRow: View {
 }
 
 /// "This computer": a regular terminal on this Mac — upstream Ghostty's
-/// default surface, no attach command, no mesh in the path. Always present
-/// and always enabled: the local machine needs no daemon to be reachable.
-/// Laid out to line up with the workstation rows (16pt icon slot where their
-/// chevron sits).
-private struct LocalComputerRow: View {
+/// default surface, no attach command, no mesh in the path. Rendered like a
+/// workstation group: chevron, the open local tabs as child rows (the
+/// hosting tab highlighted), and a "New session" action. Clicking the name
+/// opens a new local terminal; clicking a child row focuses that tab.
+private struct LocalComputerGroup: View {
+    let tabs: [HauntedLocalTab]
+    let isExpanded: Bool
+    /// The hosting tab's identity: when it is one of `tabs`, that row renders
+    /// selected — the sidebar mirror of the tab bar's highlight.
+    let hostTabID: ObjectIdentifier?
+    let toggle: () -> Void
     let onOpen: () -> Void
+    let onFocusTab: (ObjectIdentifier) -> Void
 
     @State private var hovering = false
 
     var body: some View {
-        Button(action: onOpen) {
+        VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 0) {
-                Image(systemName: "laptopcomputer")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 16, height: 16)
-                HStack(spacing: 6) {
-                    Text("This computer")
-                        .fontWeight(.medium)
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
+                Button(action: toggle) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
                 }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(hovering ? Color.secondary.opacity(0.15) : Color.clear))
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Collapse local tabs" : "Show local tabs")
+
+                Button(action: onOpen) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "laptopcomputer")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("This computer")
+                            .fontWeight(.medium)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(hovering ? Color.secondary.opacity(0.15) : Color.clear))
+                }
+                .buttonStyle(.plain)
+                .onHover { hovering = $0 }
+                .help("Open a regular terminal on this Mac")
+            }
+            .padding(.leading, 2)
+
+            if isExpanded {
+                ForEach(tabs) { tab in
+                    LocalTabRow(
+                        tab: tab,
+                        isCurrent: tab.id == hostTabID,
+                        action: { onFocusTab(tab.id) })
+                }
+                Button(action: onOpen) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "plus")
+                            .font(.caption2)
+                        Text("New session")
+                            .font(.callout)
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 3)
+                    .padding(.leading, 26)
+                    .padding(.trailing, 6)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// One open local terminal tab under "This computer".
+private struct LocalTabRow: View {
+    let tab: HauntedLocalTab
+    let isCurrent: Bool
+    let action: () -> Void
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: "terminal")
+                    .font(.caption2)
+                    .foregroundStyle(isCurrent ? Color.accentColor : Color.secondary)
+                Text(tab.title)
+                    .fontWeight(isCurrent ? .medium : .regular)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
             }
             .contentShape(Rectangle())
+            .padding(.vertical, 3)
+            .padding(.leading, 26)
+            .padding(.trailing, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(isCurrent ? Color.accentColor.opacity(0.22)
+                        : hovering ? Color.secondary.opacity(0.15) : Color.clear))
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
-        .help("Open a regular terminal on this Mac")
-        .padding(.leading, 2)
+        .help(isCurrent
+              ? "\(tab.title) — this tab"
+              : "Focus \(tab.title)")
     }
 }
 

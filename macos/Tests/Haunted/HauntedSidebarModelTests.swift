@@ -94,14 +94,16 @@ struct HauntedSidebarModelTests {
         pollInterval: TimeInterval = 3600,
         refreshDelay: TimeInterval = 0.05,
         killed: @escaping @MainActor (String, String) -> Void = { _, _ in },
-        closedWorkstation: @escaping @MainActor (String) -> Void = { _ in }
+        closedWorkstation: @escaping @MainActor (String) -> Void = { _ in },
+        localTabsProvider: @escaping @MainActor () -> [HauntedLocalTab] = { [] }
     ) -> HauntedSidebarModel {
         HauntedSidebarModel(
             client: client,
             killSession: { _, target, name in killed(target, name) },
             closeWorkstation: closedWorkstation,
             pollInterval: pollInterval,
-            refreshDelay: refreshDelay)
+            refreshDelay: refreshDelay,
+            localTabsProvider: localTabsProvider)
     }
 
     /// Spins the main runloop until `condition` holds or the deadline passes.
@@ -516,5 +518,45 @@ struct HauntedSidebarModelTests {
                 "the newly-added host is expanded so its sessions show")
         #expect(!model.expanded.contains("u/a/haunted"),
                 "and the user's collapse of the existing host survives")
+    }
+
+    // MARK: MOD-15 — the This-computer group's local tabs
+
+    /// A mutable stand-in for the manager's registry, plus anchor objects for
+    /// the ObjectIdentifier-based ids.
+    final class LocalTabsBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _tabs: [HauntedLocalTab] = []
+        var tabs: [HauntedLocalTab] {
+            get { lock.lock(); defer { lock.unlock() }; return _tabs }
+            set { lock.lock(); _tabs = newValue; lock.unlock() }
+        }
+    }
+
+    @Test("MOD-15: localTabs come from the injected provider, on poll and on the change notification")
+    func localTabsRefresh() async throws {
+        let anchor1 = NSObject()
+        let anchor2 = NSObject()
+        let box = LocalTabsBox()
+        box.tabs = [HauntedLocalTab(id: ObjectIdentifier(anchor1), title: "zsh")]
+
+        let client = FakeListing()
+        client.workstationResults = [.success([])]
+        let model = makeModel(client, localTabsProvider: { box.tabs })
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded })
+        #expect(model.localTabs == box.tabs, "the first poll populates the local tabs")
+
+        // A new local tab appears (openLocalTab posts the change
+        // notification): the debounced refresh picks it up without a poll.
+        box.tabs = [
+            HauntedLocalTab(id: ObjectIdentifier(anchor1), title: "zsh"),
+            HauntedLocalTab(id: ObjectIdentifier(anchor2), title: "vim"),
+        ]
+        NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
+        try await waitUntil({ model.localTabs.count == 2 }, "the refresh lands")
+        #expect(model.localTabs == box.tabs)
     }
 }

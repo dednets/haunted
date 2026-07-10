@@ -331,6 +331,55 @@ final class HauntedManager {
         controllers.keyEnumerator().allObjects.contains { ($0 as? TerminalController)?.window != nil }
     }
 
+    /// The open LOCAL terminal tabs — registered controllers with no attach
+    /// target and not in the empty state — for the sidebar's "This computer"
+    /// group. Titles are the windows' (tab) titles, which Ghostty keeps
+    /// current from the running program.
+    @MainActor
+    func localTabs() -> [HauntedLocalTab] {
+        var tabs: [HauntedLocalTab] = []
+        for case let controller as TerminalController in controllers.keyEnumerator().allObjects {
+            guard let window = controller.window,
+                  !controller.hauntedEmptyState,
+                  target(for: controller) == nil else { continue }
+            let title = window.title.isEmpty ? "Terminal" : window.title
+            tabs.append(HauntedLocalTab(
+                id: ObjectIdentifier(controller), title: title))
+        }
+        // Object identity has no meaningful order; sort by title so the list
+        // is stable between polls.
+        return tabs.sorted { ($0.title, "\($0.id)") < ($1.title, "\($1.id)") }
+    }
+
+    /// Focuses the window of a local tab listed by localTabs().
+    @MainActor
+    func focusLocalTab(id: ObjectIdentifier) {
+        for case let controller as TerminalController in controllers.keyEnumerator().allObjects
+        where ObjectIdentifier(controller) == id {
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+    }
+
+    /// The (target, session) the given tab is attached to — what its own
+    /// sidebar highlights as the CURRENT row. Focused surface first (splits),
+    /// else the root, mirroring target(for:).
+    @MainActor
+    func sessionInfo(for controller: TerminalController) -> (target: String, name: String)? {
+        if let focused = controller.focusedSurface,
+           let info = surfaces.object(forKey: focused),
+           let target = info.target, let name = info.sessionName {
+            return (target, name)
+        }
+        if let root = controller.surfaceTree.root?.leftmostLeaf(),
+           let info = surfaces.object(forKey: root),
+           let target = info.target, let name = info.sessionName {
+            return (target, name)
+        }
+        return nil
+    }
+
     /// Focuses an existing Haunted window if one is open. Returns whether it did.
     @MainActor
     @discardableResult
@@ -506,6 +555,7 @@ final class HauntedManager {
             parent.hauntedEmptyState = false
             parent.surfaceTree = .init(view: Ghostty.SurfaceView(
                 app, baseConfig: Ghostty.SurfaceConfiguration()))
+            NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
             return
         }
         guard let identity = self.identity(for: parent),
@@ -517,6 +567,10 @@ final class HauntedManager {
         // new tab, nothing lands in sessionTabs, and a split from this
         // surface stays local (splitPlan .passthrough).
         register(controller, identity: identity, target: nil, sessionName: nil)
+        // register() only notifies for attached sessions; the sidebar's
+        // This-computer group lists local tabs too, so tell it now rather
+        // than leaving the new row to the next poll.
+        NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
     }
 
     /// Opens a new tab attached to a named session on a workstation.
@@ -782,7 +836,15 @@ final class HauntedManager {
                 Task { @MainActor in
                     self.openLocalTab(from: controller)
                 }
-            })
+            },
+            onFocusLocalTab: { [weak self] id in
+                self?.focusLocalTab(id: id)
+            },
+            currentSession: { [weak self, weak controller] in
+                guard let self, let controller else { return nil }
+                return self.sessionInfo(for: controller)
+            },
+            hostTabID: ObjectIdentifier(controller))
         window.contentView = HauntedContainerView(
             sidebar: NSHostingView(rootView: sidebar),
             terminal: terminalView)
