@@ -180,6 +180,89 @@ struct HauntedCLIRunTests {
         }
     }
 
+    // MARK: - RUN-09…11: no run() outlives its deadline
+
+    /// The production freeze this guards (TEST_PLAN §11 BUG-13): `run()` used
+    /// to finish its pipe reads and then call `Process.waitUntilExit` on a
+    /// dispatch worker, which can miss the child's termination wakeup and
+    /// block forever — observed live as a thread parked in
+    /// `waitUntilExit → CFRunLoopRun → mach_msg` while the child was long
+    /// gone. The sidebar's poll loop awaited that `run()`, so polling froze
+    /// silently for the life of the app. The invariant a caller may now rely
+    /// on: **no `run()` outlives its deadline** — a wedged child fails the
+    /// call with a thrown timeout, never hangs it.
+    @Test("RUN-09: a child that never exits fails the call at the deadline, promptly")
+    func runFailsWedgedChildAtDeadline() async throws {
+        let runner = HauntedProcessRunner(timeout: 1)
+        let started = Date()
+        var thrown: (any Error)?
+        do {
+            _ = try await withDeadline("RUN-09", seconds: 30) {
+                try await runner.run("sleep 300")
+            }
+        } catch let error as DeadlineExceeded {
+            throw error // a hang and a wrong error are different bugs
+        } catch {
+            thrown = error
+        }
+        let error = try #require(thrown as? HauntedCLIError)
+        #expect(error.message.contains("timed out"),
+                "the caller must learn it was a timeout, got: \(error.message)")
+        // 1s deadline + 2s reader grace + slop; anywhere near 300s is the bug.
+        #expect(Date().timeIntervalSince(started) < 20)
+    }
+
+    /// The deadline must *kill* the wedged child, not merely abandon it — an
+    /// abandoned `dedmeshctl` would go on holding mesh connections forever.
+    @Test("RUN-10: the deadline SIGKILLs the wedged child")
+    func deadlineKillsChild() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("haunted-run10-\(UUID().uuidString).pid")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+
+        let runner = HauntedProcessRunner(timeout: 1)
+        _ = try? await withDeadline("RUN-10", seconds: 30) {
+            // exec: the pidfile holds the pid of `sleep` itself.
+            try await runner.run("echo $$ > '\(pidFile.path)'; exec sleep 300")
+        }
+
+        let contents = try String(contentsOf: pidFile, encoding: .utf8)
+        let pid = try #require(Int32(contents.trimmingCharacters(in: .whitespacesAndNewlines)))
+        // SIGKILL delivery is asynchronous; give it a bounded moment.
+        let deadline = Date().addingTimeInterval(10)
+        var dead = false
+        while Date() < deadline {
+            // kill(pid, 0) probes liveness without signalling.
+            if kill(pid, 0) != 0 && errno == ESRCH { dead = true; break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        #expect(dead, "child \(pid) still alive after the deadline")
+    }
+
+    /// The deadline is a ceiling, not a floor: a child that finishes on time
+    /// is completely unaffected by it.
+    @Test("RUN-11: a prompt child is unaffected by the deadline")
+    func promptChildUnaffectedByDeadline() async throws {
+        let runner = HauntedProcessRunner(timeout: 5)
+        let data = try await withDeadline("RUN-11", seconds: 30) {
+            try await runner.run("printf ok")
+        }
+        #expect(data == Data("ok".utf8))
+    }
+
+    /// Same hazard, synchronous flavor: `runToCompletion` also used
+    /// `waitUntilExit`, and it runs on paths (workstation supervision) that
+    /// must never wedge. A wedged child reports -1 at the deadline.
+    @Test("RUN-09b: runToCompletion fails a wedged child at the deadline")
+    func runToCompletionFailsWedgedChildAtDeadline() async throws {
+        let runner = HauntedProcessRunner(timeout: 1)
+        let status = try await withDeadline("RUN-09b", seconds: 30) {
+            runner.runToCompletion(
+                executable: "/bin/sh", arguments: ["-c", "sleep 300"])
+        }
+        #expect(status == -1)
+    }
+
     // MARK: - RUN-08: stdin
 
     /// `standardInput = FileHandle.nullDevice`. A child that reads stdin must see

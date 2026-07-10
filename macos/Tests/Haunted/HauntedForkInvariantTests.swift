@@ -213,6 +213,41 @@ struct HauntedForkInvariantTests {
         }
     }
 
+    // MARK: BUG-13 — nothing may wait on a child with waitUntilExit
+
+    /// `Process.waitUntilExit` spins the calling thread's run loop and, called
+    /// from a dispatch worker, can miss the termination wakeup and block
+    /// forever after the child is gone. That shipped as BUG-13: the sidebar's
+    /// poll loop awaited a `run()` wedged exactly there (observed live:
+    /// `waitUntilExit → CFRunLoopRun → mach_msg`, 100% of a 2s sample), so the
+    /// sidebar silently never refreshed again — frozen titles, ⌘T/⌘D sessions
+    /// that never appeared. The replacement is `terminationHandler` plus a
+    /// deadline (RUN-09…11); this grep keeps the hazard from being
+    /// reintroduced by a refactor or an upstream rebase.
+    @Test("BUG-13: no Swift source waits on a child with waitUntilExit")
+    func noWaitUntilExitAnywhere() throws {
+        let files = try Self.swiftFiles(under: Self.sourcesDirectory)
+        try #require(!files.isEmpty)
+
+        var offenders: [String] = []
+        for file in files {
+            let contents = try String(contentsOf: file, encoding: .utf8)
+            for (number, line) in contents.components(separatedBy: .newlines).enumerated() {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.hasPrefix("//"), trimmed.contains("waitUntilExit") else {
+                    continue
+                }
+                offenders.append("\(file.lastPathComponent):\(number + 1): \(trimmed)")
+            }
+        }
+        #expect(offenders.isEmpty, """
+            waitUntilExit is banned — it hangs forever on a missed termination \
+            wakeup (BUG-13, froze the sidebar in production). Wait via \
+            terminationHandler with a deadline instead (HauntedProcessRunner).
+            \(offenders.joined(separator: "\n"))
+            """)
+    }
+
     // MARK: Helpers
 
     /// `macos/Sources`, located relative to this test file so the check needs

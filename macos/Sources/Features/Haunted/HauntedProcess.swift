@@ -34,11 +34,35 @@ protocol HauntedProcessRunning: Sendable {
 
 /// The real thing: `/bin/zsh -lc` and friends. A stateless struct, so `shared`
 /// is a `let` and stays trivially Sendable.
+///
+/// **Never wait on a child with `Process.waitUntilExit`.** It spins the calling
+/// thread's run loop waiting for a wakeup that is delivered on a race-prone
+/// path; called from a dispatch worker it can miss the termination and block
+/// forever even though the child is long gone. That exact hang shipped: the
+/// sidebar's poll loop awaited a `run()` whose notify block sat in
+/// `waitUntilExit` (`CFRunLoopRun` → `mach_msg`, child exited and reaped),
+/// so the sidebar silently stopped refreshing for the life of the app — titles
+/// froze and new ⌘T/⌘D sessions never appeared. `terminationHandler` is armed
+/// at launch time on a dispatch source and has no such race; the `timeout`
+/// deadline below is the belt-and-braces guarantee that no caller can be
+/// wedged by one child no matter what.
 struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
     static let shared = HauntedProcessRunner()
 
-    /// One reader per pipe, each draining to EOF on its own queue, joined by a
-    /// group before the result is assembled.
+    /// Ceiling on any single child's lifetime. Every command here is a short
+    /// CLI invocation (list/kill finish in ~1s; enroll dials the console once),
+    /// so a child alive this long is wedged, not slow — it is killed and the
+    /// call throws rather than hanging its caller. Injectable so tests don't
+    /// wait half a minute to observe the deadline.
+    let timeout: TimeInterval
+
+    init(timeout: TimeInterval = 30) {
+        self.timeout = timeout
+    }
+
+    /// One reader per pipe, each draining to EOF on its own queue, plus the
+    /// termination handler, all joined by one group before the result is
+    /// assembled.
     ///
     /// The obvious shape — `readabilityHandler` to drain, then
     /// `readDataToEndOfFile` in `terminationHandler` — silently drops bytes.
@@ -50,14 +74,16 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
     /// means a CLI error the user never sees, replaced by "command failed (1)".
     ///
     /// Both readers start before `run()`, so a chatty child can never fill a
-    /// ~64 KiB pipe buffer and deadlock against `waitUntilExit`.
+    /// ~64 KiB pipe buffer and deadlock against the termination wait.
     ///
-    /// Known limitation: if the child spawns a grandchild that inherits the pipe
-    /// write end, EOF waits for the grandchild too. Every command here is a short
-    /// CLI invocation, and `spawnDetached` is the path for anything that outlives
-    /// us.
+    /// A child that outlives `timeout` is SIGKILLed and the call throws. If a
+    /// grandchild inherited the pipe write ends and keeps them open past the
+    /// kill, the readers stay blocked; a short grace later the call throws
+    /// anyway and the blocked readers are abandoned — a bounded leak on a
+    /// pathological child, instead of a caller frozen forever.
     func run(_ command: String) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
+        let timeout = self.timeout
+        return try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-lc", command]
@@ -68,51 +94,84 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
             process.standardInput = FileHandle.nullDevice
 
             let collector = OutputCollector()
-            let readers = DispatchGroup()
+            let resumer = RunResumer(continuation)
+            let pieces = DispatchGroup()
             let queue = DispatchQueue(
                 label: "org.thenets.haunted.process-read", attributes: .concurrent)
 
-            readers.enter()
+            pieces.enter() // stdout EOF
             queue.async {
                 collector.appendOut(stdout.fileHandleForReading.readDataToEndOfFile())
-                readers.leave()
+                pieces.leave()
             }
-            readers.enter()
+            pieces.enter() // stderr EOF
             queue.async {
                 collector.appendErr(stderr.fileHandleForReading.readDataToEndOfFile())
-                readers.leave()
+                pieces.leave()
             }
+
+            // Armed before run(), so an exit can never slip between launch and
+            // observation. This slot replaces waitUntilExit — see the type doc.
+            pieces.enter() // termination
+            process.terminationHandler = { _ in pieces.leave() }
 
             do {
                 try process.run()
             } catch {
                 // The readers are blocked on pipes nobody will ever write to.
                 // Closing the write ends gives them their EOF so they can exit.
+                // The termination slot will never fire for a child that never
+                // launched, so balance it by hand.
+                process.terminationHandler = nil
+                pieces.leave()
                 try? stdout.fileHandleForWriting.close()
                 try? stderr.fileHandleForWriting.close()
-                readers.wait()
-                continuation.resume(throwing: error)
+                pieces.notify(queue: queue) {
+                    resumer.resume(.failure(error))
+                }
                 return
             }
 
-            // Both pipes are at EOF, so the child's every byte is in hand before
-            // its status is read. `waitUntilExit` cannot block: EOF already
-            // implies the write ends are closed.
-            readers.notify(queue: queue) {
-                process.waitUntilExit()
+            let pid = process.processIdentifier
+            queue.asyncAfter(deadline: .now() + timeout) {
+                // markTimedOut is false once resumed, so a finished child is
+                // never signalled — no window for the pid to have been reused.
+                guard resumer.markTimedOut() else { return }
+                kill(pid, SIGKILL)
+                queue.asyncAfter(deadline: .now() + 2) {
+                    // Readers still blocked (a grandchild holds the pipes):
+                    // abandon them and fail the call.
+                    resumer.resume(.failure(Self.timeoutError(command, timeout)))
+                }
+            }
+
+            // All three pieces are in: every byte is in hand and the status is
+            // valid (the termination handler has run).
+            pieces.notify(queue: queue) {
+                if resumer.didTimeOut {
+                    resumer.resume(.failure(Self.timeoutError(command, timeout)))
+                    return
+                }
                 let (out, err) = collector.snapshot()
                 if process.terminationStatus == 0 {
-                    continuation.resume(returning: out)
+                    resumer.resume(.success(out))
                 } else {
                     let message = String(data: err, encoding: .utf8)?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    continuation.resume(throwing: HauntedCLIError(
+                    resumer.resume(.failure(HauntedCLIError(
                         message: message.isEmpty
                             ? "command failed (\(process.terminationStatus))"
-                            : message))
+                            : message)))
                 }
             }
         }
+    }
+
+    private static func timeoutError(
+        _ command: String, _ timeout: TimeInterval
+    ) -> HauntedCLIError {
+        HauntedCLIError(
+            message: "timed out after \(Int(timeout))s: \(command.prefix(80))")
     }
 
     @discardableResult
@@ -123,8 +182,19 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
+        // Same reasoning as run(): waitUntilExit can hang forever, and this
+        // method is called synchronously on paths (workstation supervision)
+        // that must never wedge. terminationHandler + a bounded semaphore wait.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         guard (try? process.run()) != nil else { return -1 }
-        process.waitUntilExit()
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            kill(process.processIdentifier, SIGKILL)
+            // Let the termination handler observe the kill (bounded), then
+            // report "did not run to completion" either way.
+            _ = exited.wait(timeout: .now() + 2)
+            return -1
+        }
         return process.terminationStatus
     }
 
@@ -137,6 +207,45 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
         return (try? process.run()) != nil
+    }
+}
+
+/// Single-shot continuation guard for HauntedProcessRunner.run: the normal
+/// completion path and the timeout watchdog race to resume, and exactly one
+/// may win. Also carries the timed-out flag so the completion path (which runs
+/// after the SIGKILL lands and the pipes close) reports the timeout instead of
+/// a meaningless "command failed (9)".
+private final class RunResumer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, any Error>?
+    private var timedOut = false
+
+    init(_ continuation: CheckedContinuation<Data, any Error>) {
+        self.continuation = continuation
+    }
+
+    /// Marks the run timed out. False if the run already resumed — in which
+    /// case the caller must NOT signal the pid, which may already be reused.
+    func markTimedOut() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard continuation != nil else { return false }
+        timedOut = true
+        return true
+    }
+
+    var didTimeOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
+    }
+
+    func resume(_ result: Result<Data, any Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
     }
 }
 

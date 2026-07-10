@@ -84,4 +84,106 @@ struct HauntedManagerLogicTests {
     func zeroTabCountAvoidsClose() {
         #expect(HauntedManager.sessionTabClosePlan(siblingTabCount: 0) == .emptyState)
     }
+
+    // MARK: LAND-01…04 — sessionLanded (the ⌘T/⌘D → sidebar hand-off)
+
+    /// Scripted per-call answers; the last repeats. Local rather than shared:
+    /// `HauntedSidebarModelTests.FakeListing` answers statically per target,
+    /// and these cases are about the *sequence* of polls.
+    private final class ScriptedListing: HauntedSessionListing, @unchecked Sendable {
+        private let lock = NSLock()
+        private var answers: [Result<[HauntedWorkstationSession], any Error>]
+        private var _calls = 0
+
+        init(_ answers: [Result<[HauntedWorkstationSession], any Error>]) {
+            self.answers = answers
+        }
+
+        var calls: Int {
+            lock.lock(); defer { lock.unlock() }; return _calls
+        }
+
+        func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
+            []
+        }
+
+        func sessions(
+            identity: HauntedClientIdentity, target: String
+        ) async throws -> [HauntedWorkstationSession] {
+            lock.lock()
+            let index = min(_calls, answers.count - 1)
+            _calls += 1
+            let result = answers[index]
+            lock.unlock()
+            return try result.get()
+        }
+    }
+
+    private static let identity = HauntedClientIdentity(
+        stateDir: URL(fileURLWithPath: "/nonexistent"), console: nil)
+
+    private static func session(_ name: String, clients: Int) -> HauntedWorkstationSession {
+        HauntedWorkstationSession(
+            name: name, pid: 1, clients: clients, cols: 80, rows: 24,
+            created: 0, title: nil)
+    }
+
+    /// LAND-01. A ⌘T tab / ⌘D split runs `haunted attach --create` inside its
+    /// surface; the session exists daemon-side only once that lands. The
+    /// sidebar is told the moment it does, so the new row appears in ~a
+    /// second instead of waiting out the next poll.
+    @Test("LAND-01: landed as soon as the daemon lists the session with a client")
+    func landedOnFirstSighting() async {
+        let listing = ScriptedListing([
+            .success([Self.session("gui-abc", clients: 1)]),
+        ])
+        let landed = await HauntedManager.sessionLanded(
+            identity: Self.identity, target: "u/ws/haunted", sessionName: "gui-abc",
+            listing: listing, pollEvery: 0.01, deadline: 1)
+        #expect(landed)
+        #expect(listing.calls == 1, "no extra polls once seen")
+    }
+
+    /// LAND-02. Listed but with no client yet means the attach is still in
+    /// flight — keep polling until it is real.
+    @Test("LAND-02: a session without an attached client is not yet landed")
+    func keepsPollingUntilClientAttaches() async {
+        let listing = ScriptedListing([
+            .success([Self.session("gui-abc", clients: 0)]),
+            .success([Self.session("gui-abc", clients: 0)]),
+            .success([Self.session("gui-abc", clients: 1)]),
+        ])
+        let landed = await HauntedManager.sessionLanded(
+            identity: Self.identity, target: "u/ws/haunted", sessionName: "gui-abc",
+            listing: listing, pollEvery: 0.01, deadline: 5)
+        #expect(landed)
+        #expect(listing.calls == 3)
+    }
+
+    /// LAND-03. An attach that never lands gives up at the deadline — false,
+    /// not forever. (The poll loop then owns eventual consistency.)
+    @Test("LAND-03: gives up at the deadline when the session never appears")
+    func givesUpAtDeadline() async {
+        let listing = ScriptedListing([.success([])])
+        let landed = await HauntedManager.sessionLanded(
+            identity: Self.identity, target: "u/ws/haunted", sessionName: "gui-abc",
+            listing: listing, pollEvery: 0.01, deadline: 0.1)
+        #expect(!landed)
+        #expect(listing.calls >= 2, "it polled rather than checking once")
+    }
+
+    /// LAND-04. A listing that throws (mesh blip mid-attach) is retried, not
+    /// fatal — and still bounded by the deadline.
+    @Test("LAND-04: listing failures are retried until the deadline")
+    func listingFailuresRetried() async {
+        let listing = ScriptedListing([
+            .failure(HauntedCLIError(message: "mesh down")),
+            .success([Self.session("gui-abc", clients: 1)]),
+        ])
+        let landed = await HauntedManager.sessionLanded(
+            identity: Self.identity, target: "u/ws/haunted", sessionName: "gui-abc",
+            listing: listing, pollEvery: 0.01, deadline: 5)
+        #expect(landed)
+        #expect(listing.calls == 2)
+    }
 }

@@ -25,6 +25,11 @@ final class HauntedManager {
         let identity: HauntedClientIdentity
         let target: String?
         let sessionName: String?
+        /// Feeds the surface's local title (which the daemon pushes on every
+        /// change) straight into the sidebar, so an open session's row
+        /// retitles the moment the tab does. Owned here so the subscription
+        /// dies with the surface's map entry.
+        var titleObserver: AnyCancellable?
 
         init(identity: HauntedClientIdentity, target: String?, sessionName: String?) {
             self.identity = identity
@@ -452,10 +457,10 @@ final class HauntedManager {
         guard let info = surfaces.object(forKey: parent) else { return }
         let name = pendingSplitSessionName
         pendingSplitSessionName = nil
-        surfaces.setObject(
-            Attachment(identity: info.identity,
-                       target: info.target, sessionName: name),
-            forKey: surface)
+        let attachment = Attachment(
+            identity: info.identity, target: info.target, sessionName: name)
+        surfaces.setObject(attachment, forKey: surface)
+        observeLocalTitle(of: surface, attachment: attachment)
 
         // Index this split's session to the controller whose tab contains it.
         if let target = info.target, let name,
@@ -463,6 +468,68 @@ final class HauntedManager {
             where: { $0.surfaceTree.contains(surface) }) {
             sessionTabs.setObject(controller, forKey: Self.tabKey(target, name))
         }
+
+        // A split's fresh session exists daemon-side only once its attach
+        // command has run; tell the sidebar the moment it does instead of
+        // leaving the new row to the next poll (⌘D otherwise reads as "the
+        // split didn't make a session").
+        if let target = info.target, let name {
+            let identity = info.identity
+            Task { @MainActor in
+                if await Self.sessionLanded(
+                    identity: identity, target: target, sessionName: name) {
+                    NotificationCenter.default.post(
+                        name: .hauntedSessionsDidChange, object: nil)
+                }
+            }
+        }
+    }
+
+    /// True once the daemon lists `sessionName` on `target` with an attached
+    /// client — i.e. the tab/split that just ran `haunted attach --create`
+    /// made it all the way. Polls briefly; parameters are injectable so tests
+    /// drive it with a fake listing in milliseconds.
+    static func sessionLanded(
+        identity: HauntedClientIdentity,
+        target: String,
+        sessionName: String,
+        listing: any HauntedSessionListing = HauntedCLISessionListing(),
+        pollEvery: TimeInterval = 0.7,
+        deadline: TimeInterval = 15
+    ) async -> Bool {
+        let end = Date().addingTimeInterval(deadline)
+        repeat {
+            if let sessions = try? await listing.sessions(
+                identity: identity, target: target),
+               sessions.contains(where: { $0.name == sessionName && $0.clients > 0 }) {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: UInt64(pollEvery * 1_000_000_000))
+        } while Date() < end
+        return false
+    }
+
+    /// Mirrors the surface's title into the sidebar model. The daemon pushes
+    /// the session's title to the attached client on every change, and the
+    /// client retitles the terminal — so the surface title IS the session
+    /// title, available locally the instant it changes. Without this, an open
+    /// session's sidebar row waits out the next list poll to catch up with
+    /// the tab above it.
+    @MainActor
+    private func observeLocalTitle(
+        of surface: Ghostty.SurfaceView, attachment: Attachment
+    ) {
+        guard let target = attachment.target,
+              let sessionName = attachment.sessionName else { return }
+        attachment.titleObserver = surface.$title
+            .removeDuplicates()
+            .sink { title in
+                guard !title.isEmpty else { return }
+                Task { @MainActor in
+                    HauntedSidebarModel.shared.applyLocalTitle(
+                        target: target, sessionName: sessionName, title: title)
+                }
+            }
     }
 
     // MARK: Internals
@@ -476,10 +543,10 @@ final class HauntedManager {
     ) {
         controllers.setObject(ClientRef(identity), forKey: controller)
         if let view = controller.surfaceTree.root?.leftmostLeaf() {
-            surfaces.setObject(
-                Attachment(identity: identity,
-                           target: target, sessionName: sessionName),
-                forKey: view)
+            let attachment = Attachment(
+                identity: identity, target: target, sessionName: sessionName)
+            surfaces.setObject(attachment, forKey: view)
+            observeLocalTitle(of: view, attachment: attachment)
         }
         if let target, let sessionName {
             sessionTabs.setObject(controller, forKey: Self.tabKey(target, sessionName))
@@ -531,16 +598,15 @@ final class HauntedManager {
         container.showConnectingOverlay(text: "Connecting to \(daemon)…")
 
         Task { @MainActor [weak container] in
-            let deadline = Date().addingTimeInterval(15)
-            while Date() < deadline {
-                if let sessions = try? await HauntedCLI.sessions(
-                    identity: identity, target: target),
-                   sessions.contains(where: { $0.name == sessionName && $0.clients > 0 }) {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
+            let landed = await Self.sessionLanded(
+                identity: identity, target: target, sessionName: sessionName)
             container?.hideConnectingOverlay()
+            // The session provably exists now — refresh the sidebar rather
+            // than leaving the new row to the next poll.
+            if landed {
+                NotificationCenter.default.post(
+                    name: .hauntedSessionsDidChange, object: nil)
+            }
         }
     }
 

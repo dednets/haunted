@@ -386,6 +386,55 @@ struct HauntedSidebarModelTests {
         #expect(client.sessionCalls.isEmpty)
     }
 
+    // MARK: MOD-14 — local title pushes
+
+    /// A session open in this app gets its title pushed by the daemon to the
+    /// attached client instantly (that is what retitles the tab). The sidebar
+    /// row must follow the tab, not the next list poll — the gap between the
+    /// two is the reported "top tab updates immediately, sidebar takes ages".
+    @Test("MOD-14: applyLocalTitle retitles a known session without a poll")
+    func localTitleAppliesImmediately() async throws {
+        let client = FakeListing()
+        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.count == 1 })
+        let before = client.sessionCalls.count
+
+        model.applyLocalTitle(target: "a/b/haunted", sessionName: "work", title: "htop")
+
+        let session = try #require(model.sessionsByTarget["a/b/haunted"]?.first)
+        #expect(session.title == "htop")
+        #expect(session.displayTitle == "htop")
+        #expect(client.sessionCalls.count == before, "no CLI round-trip")
+        // Only the title moved; identity/geometry are the daemon's to change.
+        #expect(session.name == "work")
+        #expect(session.cols == 80)
+    }
+
+    @Test("MOD-14: applyLocalTitle for an unknown session or target is a no-op")
+    func localTitleUnknownIsNoOp() async throws {
+        let client = FakeListing()
+        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.count == 1 })
+
+        model.applyLocalTitle(target: "a/b/haunted", sessionName: "ghost", title: "htop")
+        model.applyLocalTitle(target: "a/nowhere/haunted", sessionName: "work", title: "htop")
+
+        #expect(model.sessionsByTarget["a/b/haunted"]?.map(\.name) == ["work"],
+                "no row is fabricated for a session the daemon has not listed")
+        #expect(model.sessionsByTarget["a/b/haunted"]?.first?.title == nil)
+        #expect(model.sessionsByTarget["a/nowhere/haunted"] == nil)
+    }
+
     // MARK: MOD-12/13 — the console topology changed under us
 
     /// A host removed on the console vanishes from the next poll. Dropping its

@@ -158,6 +158,22 @@ final class HauntedSidebarModel: ObservableObject {
         }
     }
 
+    /// Retitles one session's row from a locally-observed title change (the
+    /// daemon pushes titles to attached clients instantly, so a session open
+    /// in this app never has to wait for the next list poll to catch up with
+    /// its own tab). A session the model has not seen yet is skipped — the
+    /// row itself arrives via refresh, title included.
+    func applyLocalTitle(target: String, sessionName: String, title: String) {
+        guard var sessions = sessionsByTarget[target],
+              let index = sessions.firstIndex(where: { $0.name == sessionName }),
+              sessions[index].title != title else { return }
+        let old = sessions[index]
+        sessions[index] = HauntedWorkstationSession(
+            name: old.name, pid: old.pid, clients: old.clients,
+            cols: old.cols, rows: old.rows, created: old.created, title: title)
+        sessionsByTarget[target] = sessions
+    }
+
     /// One workstation's failure must not blank the others: a mesh blip on one
     /// daemon should not empty the whole sidebar.
     func refreshSessions() async {

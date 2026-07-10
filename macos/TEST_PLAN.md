@@ -318,6 +318,10 @@ nonzero = transport failure) is what SH-01/04 depend on. Pin it C-side too — s
 | RUN-06 | Executable does not exist | throws, no hang |
 | RUN-07 | 32 concurrent `run` calls under **ThreadSanitizer** | no data race in `OutputCollector` |
 | RUN-08 | Child reads stdin | gets EOF (`nullDevice`), does not block |
+| RUN-09 | Child never exits (`sleep 300`, 1s deadline) | the call **throws a timeout promptly** — no `run()` outlives its deadline. Regression test for BUG-13 (§11): the `waitUntilExit` freeze that silently killed the sidebar poll loop. |
+| RUN-09b | Same, synchronous `runToCompletion` | returns `-1` at the deadline |
+| RUN-10 | Child wedged past the deadline | the child is **SIGKILLed**, not merely abandoned |
+| RUN-11 | Prompt child under a generous deadline | unaffected — the deadline is a ceiling, not a floor |
 
 `HauntedCLI.resolve` — L1: prefers `~/.local/bin`, then `/opt/homebrew/bin`,
 then `/usr/local/bin`, then bare name; skips non-executable candidates.
@@ -381,6 +385,18 @@ Split inheritance (L1, `@MainActor`):
 | SPL-04 | `splitConfiguration` where surface creation then fails | ⚠️ `pendingSplitSessionName` leaks into the next split, which adopts the wrong name. **Expected to fail.** |
 | SPL-05 | Swift 6 strict concurrency | ⚠️ `splitConfiguration` is non-isolated but mutates `pendingSplitSessionName`; `surfaceCreated` is `@MainActor`. Compile the target with `-strict-concurrency=complete` and assert it builds. |
 
+Session landing (`HauntedManager.sessionLanded`, L1 with an injected listing) —
+the ⌘T/⌘D → sidebar hand-off: a fresh tab/split's session exists daemon-side
+only once its `haunted attach --create` runs, and the sidebar is told the
+moment it does instead of waiting out the next poll:
+
+| ID | Case | Expect |
+|---|---|---|
+| LAND-01 | Session listed with `clients > 0` on the first poll | `true`, exactly one listing call |
+| LAND-02 | Listed with `clients == 0`, attaches on the third poll | keeps polling, `true` after three calls |
+| LAND-03 | Session never appears | `false` at the deadline — bounded, never forever |
+| LAND-04 | Listing throws once, then lists the session | the failure is retried, `true` |
+
 Overlay (L1):
 
 | ID | Case | Expect |
@@ -425,6 +441,7 @@ or every test poisons the next.
 | MOD-11 | Poll task cancelled (window closed) | no data reset; a later `start` resumes |
 | MOD-12 | A host removed from the console vanishes from a later poll | its tabs closed (`closeWorkstation` seam), `sessionsByTarget` + `expanded` pruned; surviving hosts untouched |
 | MOD-13 | A host added to the console appears on a later poll | it arrives auto-expanded (online only); a user's earlier collapse of another host survives |
+| MOD-14 | `applyLocalTitle` for a session the model knows | the row's `title` updates **without a CLI round-trip** — the daemon pushes titles to attached clients instantly (that is what retitles the tab), so an open session's sidebar row follows its tab rather than the next list poll. Unknown target/session: strict no-op, no row fabricated. |
 
 MOD-05/06/13 now share one path (`reconcile`): first-load expansion is the
 `previous == []` case of "expand newly-appeared online hosts", so a broken
@@ -854,8 +871,47 @@ IPv6), BUG-3 (`pgrep` ERE injection, was §4.2 SUP-08), BUG-4 (state-dir mode, w
 LOG-04), BUG-5 (`certIdentity` chains, was ID-11), BUG-6 (`generateSessionName`
 entropy); and in Phase 3 — BUG-8 (the short read below) and BUG-9 (LAY-07's
 stranded reversal); and in Phase 4 — BUG-11 (startup auto-creates a session) and
-BUG-12 (killing the last session crashes the app). Each has a regression test
-named for its ID. §4 marks them ✅.
+BUG-12 (killing the last session crashes the app); and after Phase 4 —
+BUG-13 (the sidebar poll loop freezes forever in `waitUntilExit`). Each has a
+regression test named for its ID. §4 marks them ✅.
+
+### BUG-13 — the sidebar silently stops refreshing forever — ✅ **confirmed, then fixed**
+
+**Symptom (user):** "htop retitles the top tab immediately but the sidebar takes
+dozens of seconds", and "⌘T / ⌘D sessions don't show up in the sidebar". Both
+were one bug wearing two costumes.
+
+**Reproduction (live app, not a test):** the running GUI spawned **zero**
+poller children for 45+ seconds (the poll interval is 4s), while a `sample` of
+the process showed a dispatch worker parked for 100% of the sample in
+`HauntedProcessRunner.run` → `-[NSConcreteTask waitUntilExit]` →
+`_CFRunLoopRunSpecificWithOptions` → `mach_msg` — waiting on a child that had
+already exited and been reaped (no zombie, no live child, no peer holding the
+pipes).
+
+**Mechanism:** `run()` drained both pipes to EOF, then called
+`Process.waitUntilExit()` from a dispatch worker. `waitUntilExit` spins the
+calling thread's run loop waiting for a termination wakeup; that delivery can be
+missed when the child exits in the window around the observation being set up,
+and once missed it never re-fires — the continuation never resumes. The sidebar
+poll loop (`HauntedSidebarModel.poll`) `await`s that call, so one lost wakeup
+froze workstation *and* session refresh for the life of the app, with no error
+surfaced. Titles then only moved when an open/kill posted
+`hauntedSessionsDidChange` (whose refresh path spawns fresh children) — hence
+"dozens of seconds", i.e. "whenever the user next did something".
+`runToCompletion` had the same hazard on the supervisor path.
+
+**Fix:** `HauntedProcessRunner` never calls `waitUntilExit`. Termination joins
+the same `DispatchGroup` as the two pipe readers via `terminationHandler`
+(armed *before* launch, dispatch-source based), and every child gets a hard
+deadline (`timeout`, default 30s): a wedged child is SIGKILLed and the call
+throws a timeout instead of hanging its caller — the poll loop degrades to an
+`errorMessage` and keeps polling. Latency halves of the two symptoms got their
+own fixes: `sessionLanded` tells the sidebar the moment a fresh ⌘T/⌘D session
+exists daemon-side (LAND-01…04), and `applyLocalTitle` mirrors the local
+surface title (which the daemon pushes on every change) straight into the row
+(MOD-14). Tests: RUN-09/09b/10/11; the `noWaitUntilExitAnywhere` grep in
+`HauntedForkInvariantTests` bans the API from the whole tree.
 
 ### BUG-11 — startup silently creates a session on every launch — ✅ **confirmed, then fixed**
 
