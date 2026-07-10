@@ -243,6 +243,23 @@ struct HauntedWorkstation: Decodable, Identifiable, Equatable {
     let online: Bool
     let state: String?
     let error: String?
+    /// The console-stored display color ("#rrggbb", validated at the decode
+    /// boundary — see normalizedColor); nil = default. Old `dedmeshctl` /
+    /// console builds omit it entirely.
+    let color: String?
+
+    init(
+        target: String, daemon: String, app: String, online: Bool,
+        state: String?, error: String?, color: String? = nil
+    ) {
+        self.target = target
+        self.daemon = daemon
+        self.app = app
+        self.online = online
+        self.state = state
+        self.error = error
+        self.color = color
+    }
 
     var id: String { target }
     var status: String {
@@ -253,6 +270,40 @@ struct HauntedWorkstation: Decodable, Identifiable, Equatable {
             return state
         }
         return "offline"
+    }
+
+    /// Canonicalizes a display color coming out of remote-controlled JSON:
+    /// exactly `#` + six ASCII hex digits, lowercased; anything else — wrong
+    /// length, wrong characters, fullwidth lookalikes — degrades to nil (the
+    /// default tint) rather than reaching the UI. Byte-wise on UTF-8 like
+    /// isValidSessionName, so no Unicode "hex digit" generosity applies.
+    static func normalizedColor(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let lower = value.lowercased()
+        let bytes = Array(lower.utf8)
+        guard bytes.count == 7, bytes[0] == UInt8(ascii: "#") else { return nil }
+        for byte in bytes.dropFirst() {
+            let isHex = (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+            guard isHex else { return nil }
+        }
+        return lower
+    }
+
+    /// A copy whose color survived normalization (nil otherwise). Applied at
+    /// the decode boundary so nothing downstream ever sees a raw color.
+    func normalizingColor() -> HauntedWorkstation {
+        HauntedWorkstation(
+            target: target, daemon: daemon, app: app, online: online,
+            state: state, error: error, color: Self.normalizedColor(color))
+    }
+
+    /// A copy carrying `color` verbatim — the optimistic local recolor (the
+    /// caller passes an already-normalized palette value or nil).
+    func withColor(_ color: String?) -> HauntedWorkstation {
+        HauntedWorkstation(
+            target: target, daemon: daemon, app: app, online: online,
+            state: state, error: error, color: color)
     }
 }
 
@@ -364,6 +415,7 @@ enum HauntedCLI {
     static func decodeWorkstations(_ data: Data) throws -> [HauntedWorkstation] {
         try JSONDecoder().decode([HauntedWorkstation].self, from: data)
             .filter { isSafeCLIArgument($0.target) }
+            .map { $0.normalizingColor() }
     }
 
     /// The decode boundary for `haunted list --json`.
@@ -402,6 +454,34 @@ enum HauntedCLI {
     ) async throws {
         _ = try await runner.run(
             "\(quote(resolve("haunted", fs: fs))) kill \(quote(sessionName)) --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
+    }
+
+    /// Sets (or, with nil, clears) a workstation daemon's display color on the
+    /// console, via `dedmeshctl workstation color`. `daemon` came out of the
+    /// workstation list (remote JSON), so it is re-checked at this call
+    /// boundary; `color` must be an already-normalized "#rrggbb" — anything
+    /// else is refused rather than interpolated into an argv.
+    static func setWorkstationColor(
+        identity: HauntedClientIdentity,
+        daemon: String,
+        color: String?,
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) async throws {
+        guard isSafeCLIArgument(daemon) else {
+            throw HauntedCLIError(message: "invalid daemon name")
+        }
+        let value: String
+        if let color {
+            guard HauntedWorkstation.normalizedColor(color) == color else {
+                throw HauntedCLIError(message: "invalid color")
+            }
+            value = color
+        } else {
+            value = "default"
+        }
+        _ = try await runner.run(
+            "\(quote(resolve("dedmeshctl", fs: fs))) workstation color \(quote(daemon)) \(quote(value)) -state-dir \(quote(identity.stateDir.path))")
     }
 
     /// One-time enrollment: join token → client mTLS certificate (plus the

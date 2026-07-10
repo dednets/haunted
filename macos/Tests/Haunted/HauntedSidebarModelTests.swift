@@ -26,12 +26,18 @@ struct HauntedSidebarModelTests {
         var workstationResults: [Result<[HauntedWorkstation], any Error>] = [.success([])]
         /// Per-target session answers. A missing target throws.
         var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
+        /// What `setWorkstationColor` answers; recorded calls in `colorCalls`.
+        var setColorResult: Result<Void, any Error> = .success(())
+        private var _colorCalls: [(daemon: String, color: String?)] = []
 
         var workstationCalls: Int {
             lock.lock(); defer { lock.unlock() }; return _workstationCalls
         }
         var sessionCalls: [String] {
             lock.lock(); defer { lock.unlock() }; return _sessionCalls
+        }
+        var colorCalls: [(daemon: String, color: String?)] {
+            lock.lock(); defer { lock.unlock() }; return _colorCalls
         }
 
         func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
@@ -52,6 +58,16 @@ struct HauntedSidebarModelTests {
             lock.unlock()
             guard let sessions else { throw HauntedCLIError(message: "unreachable") }
             return sessions
+        }
+
+        func setWorkstationColor(
+            identity: HauntedClientIdentity, daemon: String, color: String?
+        ) async throws {
+            lock.lock()
+            _colorCalls.append((daemon: daemon, color: color))
+            let result = setColorResult
+            lock.unlock()
+            try result.get()
         }
     }
 

@@ -118,6 +118,13 @@ struct HauntedManagerLogicTests {
             lock.unlock()
             return try result.get()
         }
+
+        func setWorkstationColor(
+            identity: HauntedClientIdentity, daemon: String, color: String?
+        ) async throws {
+            // These cases never set colors; a call reaching here is a bug.
+            throw HauntedCLIError(message: "unexpected setWorkstationColor")
+        }
     }
 
     private static let identity = HauntedClientIdentity(

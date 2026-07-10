@@ -1,12 +1,17 @@
 import SwiftUI
 
-/// What the sidebar model reads from the mesh. A seam, so the poll loop can be
-/// driven without spawning `dedmeshctl`/`haunted` (§5.4).
+/// What the sidebar model reads from — and writes to — the mesh. A seam, so
+/// the poll loop can be driven without spawning `dedmeshctl`/`haunted` (§5.4).
 protocol HauntedSessionListing: Sendable {
     func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation]
     func sessions(
         identity: HauntedClientIdentity, target: String
     ) async throws -> [HauntedWorkstationSession]
+    /// Persists a workstation daemon's display color on the console
+    /// (nil = back to the default).
+    func setWorkstationColor(
+        identity: HauntedClientIdentity, daemon: String, color: String?
+    ) async throws
 }
 
 /// The real one: the CLIs own all mesh transport and mTLS state.
@@ -19,6 +24,50 @@ struct HauntedCLISessionListing: HauntedSessionListing {
         identity: HauntedClientIdentity, target: String
     ) async throws -> [HauntedWorkstationSession] {
         try await HauntedCLI.sessions(identity: identity, target: target)
+    }
+
+    func setWorkstationColor(
+        identity: HauntedClientIdentity, daemon: String, color: String?
+    ) async throws {
+        try await HauntedCLI.setWorkstationColor(
+            identity: identity, daemon: daemon, color: color)
+    }
+}
+
+/// The color choices offered on a workstation row, plus "Default". A fixed
+/// palette rather than a color picker: eight distinguishable hues that read at
+/// sidebar-text size, whose values are exactly what the console stores.
+enum HauntedWorkstationPalette {
+    struct Preset: Identifiable, Equatable {
+        let name: String
+        let hex: String // "#rrggbb", lowercase — the stored form
+        var id: String { hex }
+    }
+
+    static let presets: [Preset] = [
+        Preset(name: "Red", hex: "#e5484d"),
+        Preset(name: "Orange", hex: "#f76b15"),
+        Preset(name: "Amber", hex: "#ffc53d"),
+        Preset(name: "Green", hex: "#30a46c"),
+        Preset(name: "Teal", hex: "#12a594"),
+        Preset(name: "Blue", hex: "#0090ff"),
+        Preset(name: "Purple", hex: "#8e4ec6"),
+        Preset(name: "Pink", hex: "#d6409f"),
+    ]
+
+    /// Parses an already-normalized "#rrggbb" into 0…1 components. Pure, so
+    /// the mapping is testable without SwiftUI. Nil for anything that is not
+    /// exactly that shape (the decode boundary should have caught it, but the
+    /// renderer must not trust that).
+    static func hexToRGB(_ hex: String) -> (red: Double, green: Double, blue: Double)? {
+        guard HauntedWorkstation.normalizedColor(hex) == hex else { return nil }
+        var value: UInt64 = 0
+        guard Scanner(string: String(hex.dropFirst())).scanHexInt64(&value) else { return nil }
+        return (
+            red: Double((value >> 16) & 0xFF) / 255.0,
+            green: Double((value >> 8) & 0xFF) / 255.0,
+            blue: Double(value & 0xFF) / 255.0
+        )
     }
 }
 
@@ -123,6 +172,27 @@ final class HauntedSidebarModel: ObservableObject {
         // refresh reconciles.
         sessionsByTarget[workstation.id]?.removeAll { $0.name == sessionName }
         killSession(identity, workstation.target, sessionName)
+    }
+
+    /// Sets (nil clears) a workstation's display color: an optimistic local
+    /// recolor — of every row on that daemon, since the color is per-daemon
+    /// console state — then the console write. On failure the error surfaces
+    /// in the sidebar and the next poll reverts the tint to the stored truth;
+    /// on success the next poll simply confirms what is already shown.
+    func setColor(workstation: HauntedWorkstation, color: String?) {
+        guard let identity else { return }
+        workstations = workstations.map {
+            $0.daemon == workstation.daemon ? $0.withColor(color) : $0
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.client.setWorkstationColor(
+                    identity: identity, daemon: workstation.daemon, color: color)
+            } catch {
+                self.errorMessage = error.localizedDescription
+            }
+        }
     }
 
     /// Absorb a topology change between two successful polls: hosts the console
@@ -321,6 +391,9 @@ struct HauntedSidebarView: View {
                             onNewSession: { onOpen(workstation, nil) },
                             onKillSession: {
                                 model.kill(workstation: workstation, session: $0)
+                            },
+                            onSetColor: {
+                                model.setColor(workstation: workstation, color: $0)
                             })
                     }
                 }
@@ -349,6 +422,8 @@ private struct WorkstationGroup: View {
     let onOpenSession: (String) -> Void
     let onNewSession: () -> Void
     let onKillSession: (String) -> Void
+    /// nil = back to the default color.
+    let onSetColor: (String?) -> Void
 
     @State private var hovering = false
 
@@ -364,6 +439,7 @@ private struct WorkstationGroup: View {
                 }
                 .buttonStyle(.plain)
                 .help(isExpanded ? "Collapse sessions" : "Show sessions")
+                .disabled(!workstation.online)
 
                 Button(action: onOpenPrimary) {
                     HStack(spacing: 6) {
@@ -373,6 +449,7 @@ private struct WorkstationGroup: View {
                         Text(workstation.daemon)
                             .fontWeight(.medium)
                             .lineLimit(1)
+                            .foregroundStyle(nameColor)
                         Spacer(minLength: 0)
                     }
                     .contentShape(Rectangle())
@@ -388,10 +465,13 @@ private struct WorkstationGroup: View {
                 .help(workstation.online
                       ? "Open a terminal on \(workstation.daemon) (its persistent default session)"
                       : workstation.error ?? "\(workstation.target) (\(workstation.status))")
+                .disabled(!workstation.online)
             }
-            .disabled(!workstation.online)
             .opacity(workstation.online ? 1 : 0.5)
             .padding(.leading, 2)
+            // Attached to the row, NOT inside the .disabled buttons: the color
+            // is console state, so an offline workstation's row keeps its menu.
+            .contextMenu { colorMenu }
 
             if isExpanded && workstation.online {
                 ForEach(sessions) { session in
@@ -419,6 +499,35 @@ private struct WorkstationGroup: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    /// The user-chosen color menu. Checkmark on the current choice; picking
+    /// one recolors locally at once and persists via the model.
+    @ViewBuilder private var colorMenu: some View {
+        Menu("Color") {
+            ForEach(HauntedWorkstationPalette.presets) { preset in
+                Button {
+                    onSetColor(preset.hex)
+                } label: {
+                    Text(workstation.color == preset.hex ? "✓ \(preset.name)" : preset.name)
+                }
+            }
+            Divider()
+            Button {
+                onSetColor(nil)
+            } label: {
+                Text(workstation.color == nil ? "✓ Default" : "Default")
+            }
+        }
+    }
+
+    /// The workstation name's tint: the user-chosen color when set, else the
+    /// default label color. The status dot keeps its online/error semantics —
+    /// the color rides the NAME, never the dot.
+    private var nameColor: Color {
+        guard let hex = workstation.color,
+              let rgb = HauntedWorkstationPalette.hexToRGB(hex) else { return .primary }
+        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 
     private var statusColor: Color {

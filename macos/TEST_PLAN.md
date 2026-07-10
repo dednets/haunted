@@ -454,6 +454,27 @@ removal half (MOD-12) is independent. Discovery is poll-only — the client has 
 push channel for topology (mesh read loop handles only heartbeat + punch), so
 add/remove reflect within the poll interval (dropped to 4s), not instantly.
 
+#### Workstation colors — `HauntedWorkstationColorTests`
+
+The per-daemon display color: console state, rendered as the workstation-name
+tint (the status dot keeps its online/error semantics). Colors sync by the
+same poll as everything else — the setting Terminal recolors optimistically,
+every other Terminal follows ≤4s later.
+
+| ID | Case | Expect |
+|---|---|---|
+| COL-01 | `decodeWorkstations` color matrix | lowercase `#rrggbb` passes; uppercase is normalized; anything else (garbage, truncated, fullwidth lookalikes) decodes to nil — never a raw string into the UI |
+| COL-02 | JSON without a `color` key (old ctl/console) | decodes, `color == nil` |
+| COL-03 | `HauntedWorkstation.normalizedColor` table | byte-strict `#` + six ASCII hex digits, lowercased; no Unicode "hex digit" generosity |
+| COL-04 | `hexToRGB` | normalized colors map to 0…1 components; non-normalized input (uppercase, names) returns nil — the renderer re-checks the boundary |
+| COL-04b | palette presets | every preset is its own normalized form, renderable, and unique |
+| COL-05 | `HauntedCLI.setWorkstationColor` argv | the exact `dedmeshctl workstation color <daemon> <#rrggbb\|default> -state-dir …` string, `default` for nil |
+| COL-06 | hostile daemon / non-normalized color | throws before any spawn; `invocations` stays empty |
+| COL-07 | `model.setColor` | synchronous optimistic recolor of **every row of that daemon** (color is per-daemon), other daemons untouched; then the console write |
+| COL-08 | the write fails | error surfaces in `errorMessage`; the next poll reverts the optimistic tint to stored truth |
+| COL-09 | another Terminal changed the color | the next poll applies it (poll wins; no push channel) |
+| COL-10 | `setColor` with no identity | strict no-op |
+
 Views (L0 via `ViewInspector`, or fold into L3 if that dependency is unwanted —
 prefer folding; do not add a dependency for four assertions):
 
