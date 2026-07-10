@@ -220,6 +220,7 @@ whole point is what the shell does with it.
 | DEC-04 | Workstation JSON with `error` and `state` absent | decodes |
 | DEC-05 | `pid` at `UInt32.max` | decodes |
 | DEC-06 | Malformed JSON | throws, does not crash |
+| DEC-07 | Combined `workstations -json -sessions` row (`HauntedWorkstationListing`) | flat ref keys + `sessions` summaries decode; the three live states are distinct — titled list, `live: []` (queried, none — the caller must clear its cache), key absent (not queried — keep what you have); hostile session names dropped from BOTH lists, colors normalized, unsafe targets dropped; a plain `workstations -json` row decodes as an unqueried listing |
 
 #### `HauntedWorkstation.status` / `statusColor` — L0
 
@@ -441,15 +442,27 @@ or every test poisons the next.
 | MOD-07 | `kill` | session optimistically removed from `sessionsByTarget` immediately |
 | MOD-08 | `hauntedSessionsDidChange` posted | refresh fires after the 1.2s debounce, once |
 | MOD-09 | Ordering | workstations by `target`, sessions by `name` |
-| MOD-10 | `refreshSessions` with one workstation failing | other workstations still update |
+| MOD-10 | one workstation's live listing failing (`live_error` row) | other workstations still update, and the failed row KEEPS the sessions it last showed — a mesh blip must not blank a list the user is looking at |
 | MOD-11 | Poll task cancelled (window closed) | no data reset; a later `start` resumes |
 | MOD-12 | A host removed from the console vanishes from a later poll | its tabs closed (`closeWorkstation` seam), `sessionsByTarget` + `expanded` pruned; surviving hosts untouched |
 | MOD-13 | A host added to the console appears on a later poll | it arrives auto-expanded (online only); a user's earlier collapse of another host survives |
 | MOD-15 | `localTabs` ("This computer") | populated from the injected provider on every poll AND on `hauntedSessionsDidChange` (openLocalTab posts it), so a new local tab appears without waiting out the interval |
-| MOD-16 | session-list queries | only EXPANDED online workstations are queried (a collapsed group is a wasted Console session); expanding fetches on the spot, collapsing stops. First-load auto-expand keeps coverage unchanged |
+| MOD-16 | the poll's `live` argument | exactly the EXPANDED online set is queried live (collapsed rows still ride the ONE multiplexed call, summaries included); expanding fetches on the spot, collapsing stops the live queries. First-load auto-expand triggers a follow-up pass so titles arrive in the same cycle |
 | MOD-17 | inactive backoff | an inactive app (injected `isAppActive == false`) sleeps the slow `inactivePollInterval` instead of re-polling on the active cadence; reactivation restarts the loop (production only, `wakesOnAppActivation`) |
 | MOD-18 | refresh coalescing | a `refreshSessions` request arriving while one runs sets a pending flag and the in-flight pass re-runs once, rather than launching a concurrent second round of subprocesses |
+| MOD-19 | console snapshot summaries | seed a row whose live list never loaded (instant title-less list instead of a blank group); NEVER overwrite an already-loaded titled list — summaries only fill absence |
+| MOD-20 | legacy dedmeshctl fallback (`HauntedCLISessionListing`) | an old dedmeshctl rejecting `-sessions` (Go's "flag provided but not defined") latches the 1+N legacy path — probed once per launch, live sessions still delivered; a NON-flag error does NOT latch; the matcher is loose/case-insensitive |
 | MOD-14 | `applyLocalTitle` for a session the model knows | the row's `title` updates **without a CLI round-trip** — the daemon pushes titles to attached clients instantly (that is what retitles the tab), so an open session's sidebar row follows its tab rather than the next list poll. Unknown target/session: strict no-op, no row fabricated. |
+
+Since the multiplexed poll landed, one cycle = ONE `dedmeshctl workstations
+-json -sessions -live <expanded>` subprocess (one Console mTLS session; the
+old shape was 1 + N). The fakes mirror that: `FakeListing.list` answers the
+host list AND the live lists in one call, so count-sensitive tests count
+`listCalls`/`liveArgs`, and tests that script per-poll sequences must budget
+the auto-expand follow-up pass (the first cycle consumes two answers).
+Count-sensitive tests also pass `refreshDelay: 3600` — other suites post
+`.hauntedSessionsDidChange` in parallel, and a default-delay model would fold
+their refreshes into its counts.
 
 MOD-05/06/13 now share one path (`reconcile`): first-load expansion is the
 `previous == []` case of "expand newly-appeared online hosts", so a broken

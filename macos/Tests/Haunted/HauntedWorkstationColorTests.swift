@@ -30,19 +30,21 @@ struct HauntedWorkstationColorTests {
             lock.lock(); defer { lock.unlock() }; return _colorCalls
         }
 
-        func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
+        func list(
+            identity: HauntedClientIdentity, live: [String]
+        ) async throws -> [HauntedWorkstationListing] {
             lock.lock()
             let index = min(_workstationCalls, workstationResults.count - 1)
             _workstationCalls += 1
             let result = workstationResults[index]
             lock.unlock()
-            return result
-        }
-
-        func sessions(
-            identity: HauntedClientIdentity, target: String
-        ) async throws -> [HauntedWorkstationSession] {
-            []
+            let wanted = Set(live)
+            return result.map { workstation in
+                HauntedWorkstationListing(
+                    workstation: workstation,
+                    live: workstation.online && wanted.contains(workstation.target)
+                        ? [] : nil)
+            }
         }
 
         func setWorkstationColor(

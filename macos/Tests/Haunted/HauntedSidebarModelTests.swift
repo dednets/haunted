@@ -17,57 +17,83 @@ struct HauntedSidebarModelTests {
     /// Records calls and replays scripted answers. `@unchecked Sendable`: it is
     /// only ever touched from the main actor, but `HauntedSessionListing` is
     /// `Sendable` because the real one crosses to a subprocess.
+    ///
+    /// `list` mirrors the real multiplexed CLI: one call answers the host list
+    /// AND the live lists for the requested targets — a target present in
+    /// `sessionsByTarget` answers live, a missing one answers a per-row
+    /// `liveError` (the isolated-failure path), and every row carries its
+    /// `summariesByTarget` snapshot.
     final class FakeListing: HauntedSessionListing, @unchecked Sendable {
         private let lock = NSLock()
-        private var _workstationCalls = 0
-        private var _sessionCalls: [String] = []
+        private var _listCalls = 0
+        private var _liveArgs: [[String]] = []
 
-        /// Answers for successive `workstations` calls; the last repeats.
+        /// Answers for successive `list` calls; the last repeats.
         var workstationResults: [Result<[HauntedWorkstation], any Error>] = [.success([])]
-        /// Per-target session answers. A missing target throws.
+        /// Per-target LIVE answers. A requested target missing here gets a
+        /// per-row liveError instead.
         var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
+        /// Per-target console snapshot summaries (never titled in production;
+        /// these fakes don't enforce that).
+        var summariesByTarget: [String: [HauntedWorkstationSession]] = [:]
         /// What `setWorkstationColor` answers; recorded calls in `colorCalls`.
         var setColorResult: Result<Void, any Error> = .success(())
         private var _colorCalls: [(daemon: String, color: String?)] = []
 
-        var workstationCalls: Int {
-            lock.lock(); defer { lock.unlock() }; return _workstationCalls
+        var listCalls: Int {
+            lock.lock(); defer { lock.unlock() }; return _listCalls
         }
-        var sessionCalls: [String] {
-            lock.lock(); defer { lock.unlock() }; return _sessionCalls
+        /// The `live` argument of every `list` call, in order — what MOD-16
+        /// pins: the poll asks live lists for exactly the expanded rows.
+        var liveArgs: [[String]] {
+            lock.lock(); defer { lock.unlock() }; return _liveArgs
         }
+        /// Every live target ever requested, flattened (the old per-target
+        /// query log's analog).
+        var liveRequests: [String] { liveArgs.flatMap { $0 } }
         var colorCalls: [(daemon: String, color: String?)] {
             lock.lock(); defer { lock.unlock() }; return _colorCalls
         }
 
-        func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
-            lock.lock()
-            let index = min(_workstationCalls, workstationResults.count - 1)
-            _workstationCalls += 1
-            let result = workstationResults[index]
-            lock.unlock()
-            return try result.get()
-        }
-
-        /// When true, `sessions` records the call and then spins until it is
+        /// When true, `list` records the call and then spins until it is
         /// cleared — lets a test hold one refresh in-flight to observe
         /// coalescing (MOD-18).
-        var sessionsHold: Bool {
-            get { lock.lock(); defer { lock.unlock() }; return _sessionsHold }
-            set { lock.lock(); _sessionsHold = newValue; lock.unlock() }
+        var listHold: Bool {
+            get { lock.lock(); defer { lock.unlock() }; return _listHold }
+            set { lock.lock(); _listHold = newValue; lock.unlock() }
         }
-        private var _sessionsHold = false
+        private var _listHold = false
 
-        func sessions(
-            identity: HauntedClientIdentity, target: String
-        ) async throws -> [HauntedWorkstationSession] {
+        func list(
+            identity: HauntedClientIdentity, live: [String]
+        ) async throws -> [HauntedWorkstationListing] {
             lock.lock()
-            _sessionCalls.append(target)
-            let sessions = sessionsByTarget[target]
+            let index = min(_listCalls, workstationResults.count - 1)
+            _listCalls += 1
+            _liveArgs.append(live)
+            let result = workstationResults[index]
             lock.unlock()
-            while sessionsHold { await Task.yield() }
-            guard let sessions else { throw HauntedCLIError(message: "unreachable") }
-            return sessions
+            while listHold { await Task.yield() }
+            let wanted = Set(live)
+            lock.lock()
+            let liveMap = sessionsByTarget
+            let summaries = summariesByTarget
+            lock.unlock()
+            return try result.get().map { workstation in
+                var liveOut: [HauntedWorkstationSession]?
+                var liveError: String?
+                if workstation.online, wanted.contains(workstation.target) {
+                    if let sessions = liveMap[workstation.target] {
+                        liveOut = sessions
+                    } else {
+                        liveError = "unreachable"
+                    }
+                }
+                return HauntedWorkstationListing(
+                    workstation: workstation,
+                    sessions: summaries[workstation.target] ?? [],
+                    live: liveOut, liveError: liveError)
+            }
         }
 
         func setWorkstationColor(
@@ -138,16 +164,18 @@ struct HauntedSidebarModelTests {
     func startIsIdempotent() async throws {
         let client = FakeListing()
         client.workstationResults = [.success([Self.workstation("a/b/haunted", online: false)])]
-        let model = makeModel(client)
+        // Cross-test isolation: other suites post .hauntedSessionsDidChange;
+        // a huge refreshDelay keeps those from inflating this test's counts.
+        let model = makeModel(client, refreshDelay: 3600)
         defer { model.stop() }
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded }, "first load")
-        let after = client.workstationCalls
+        let after = client.listCalls
 
         model.start(identity: Self.identity)
         try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(client.workstationCalls == after, "a second start must not re-poll")
+        #expect(client.listCalls == after, "a second start must not re-poll")
     }
 
     @Test("MOD-02: start with a different identity restarts the poll")
@@ -159,10 +187,10 @@ struct HauntedSidebarModelTests {
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
-        let after = client.workstationCalls
+        let after = client.listCalls
 
         model.start(identity: Self.otherIdentity)
-        try await waitUntil({ client.workstationCalls > after }, "re-poll after re-login")
+        try await waitUntil({ client.listCalls > after }, "re-poll after re-login")
     }
 
     /// MOD-11. `pollTask` stays non-nil after cancellation, so a `start()` that
@@ -176,14 +204,14 @@ struct HauntedSidebarModelTests {
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
-        let after = client.workstationCalls
+        let after = client.listCalls
 
         model.stop()
         try await Task.sleep(nanoseconds: 50_000_000)
         #expect(model.workstations.count == 1, "stopping must not discard data")
 
         model.start(identity: Self.identity)
-        try await waitUntil({ client.workstationCalls > after }, "poll resumes")
+        try await waitUntil({ client.listCalls > after }, "poll resumes")
     }
 
     // MARK: MOD-03/04 — error handling
@@ -258,8 +286,8 @@ struct HauntedSidebarModelTests {
         model.toggle(Self.workstation("a/on/haunted", online: true))
         #expect(model.expanded.isEmpty)
 
-        let calls = client.workstationCalls
-        try await waitUntil({ client.workstationCalls > calls + 1 }, "two more polls")
+        let calls = client.listCalls
+        try await waitUntil({ client.listCalls > calls + 1 }, "two more polls")
         #expect(model.expanded.isEmpty, "the poll must not reopen a collapsed workstation")
     }
 
@@ -306,10 +334,10 @@ struct HauntedSidebarModelTests {
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
-        let before = client.sessionCalls.count
+        let before = client.liveRequests.count
 
         NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
-        try await waitUntil({ client.sessionCalls.count > before }, "the debounced refresh")
+        try await waitUntil({ client.liveRequests.count > before }, "the debounced refresh")
     }
 
     // MARK: EXIT-03 — a session that ended must leave the sidebar
@@ -379,15 +407,17 @@ struct HauntedSidebarModelTests {
         #expect(model.sessionsByTarget["a/z/haunted"]?.map(\.name) == ["alpha", "zeta"])
     }
 
-    /// MOD-10. A mesh blip on one daemon must not empty the whole sidebar.
-    @Test("MOD-10: one workstation's session listing failing leaves the others intact")
+    /// MOD-10. A mesh blip on one daemon must not empty the whole sidebar:
+    /// its row answers `live_error` and keeps whatever it last showed.
+    @Test("MOD-10: one workstation's live listing failing leaves the others intact")
     func partialSessionFailure() async throws {
         let client = FakeListing()
         client.workstationResults = [.success([
             Self.workstation("a/good/haunted", online: true),
             Self.workstation("a/bad/haunted", online: true),
         ])]
-        // "a/bad/haunted" is absent, so the fake throws for it.
+        // "a/bad/haunted" is absent, so the fake answers its row with a
+        // liveError instead of a live list.
         client.sessionsByTarget = ["a/good/haunted": [Self.session("one")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -396,12 +426,33 @@ struct HauntedSidebarModelTests {
         try await waitUntil({ model.loaded })
 
         #expect(model.sessionsByTarget["a/good/haunted"]?.map(\.name) == ["one"])
-        #expect(model.sessionsByTarget["a/bad/haunted"] == nil)
+        #expect(model.sessionsByTarget["a/bad/haunted"]?.isEmpty != false,
+                "the failed row shows nothing, not garbage")
         #expect(model.workstations.count == 2, "both rows still show")
     }
 
-    /// Offline workstations are never listed — an offline daemon has no sessions
-    /// to report and the attempt would just fail slowly.
+    /// MOD-10. A row that HAD sessions keeps them across a live failure —
+    /// the user is looking at that list, and a blip must not blank it.
+    @Test("MOD-10: a live failure keeps the sessions the row last showed")
+    func liveFailureKeepsPreviousSessions() async throws {
+        let client = FakeListing()
+        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.count == 1 })
+
+        // The daemon wedges: live queries now fail for this target.
+        client.sessionsByTarget = [:]
+        await model.refreshSessions()
+        #expect(model.sessionsByTarget["a/b/haunted"]?.map(\.name) == ["work"],
+                "the last-known sessions survive a live failure")
+    }
+
+    /// Offline workstations are never queried live — an offline daemon has no
+    /// sessions to report and the attempt would just fail slowly.
     @Test("MOD-10: offline workstations are not queried for sessions")
     func offlineWorkstationsNotQueried() async throws {
         let client = FakeListing()
@@ -411,7 +462,7 @@ struct HauntedSidebarModelTests {
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
-        #expect(client.sessionCalls.isEmpty)
+        #expect(client.liveRequests.isEmpty)
     }
 
     // MARK: MOD-14 — local title pushes
@@ -425,19 +476,19 @@ struct HauntedSidebarModelTests {
         let client = FakeListing()
         client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
-        let model = makeModel(client)
+        let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.count == 1 })
-        let before = client.sessionCalls.count
+        let before = client.listCalls
 
         model.applyLocalTitle(target: "a/b/haunted", sessionName: "work", title: "htop")
 
         let session = try #require(model.sessionsByTarget["a/b/haunted"]?.first)
         #expect(session.title == "htop")
         #expect(session.displayTitle == "htop")
-        #expect(client.sessionCalls.count == before, "no CLI round-trip")
+        #expect(client.listCalls == before, "no CLI round-trip")
         // Only the title moved; identity/geometry are the daemon's to change.
         #expect(session.name == "work")
         #expect(session.cols == 80)
@@ -474,14 +525,16 @@ struct HauntedSidebarModelTests {
         let client = FakeListing()
         let a = Self.workstation("u/a/haunted", online: true)
         let b = Self.workstation("u/b/haunted", online: true)
-        // Second poll onward, b is gone — the admin removed it on the console.
-        client.workstationResults = [.success([a, b]), .success([a])]
+        // The first cycle consumes TWO answers (the auto-expand follow-up
+        // pass re-lists to fetch the new hosts' titles); b is gone from the
+        // next cycle — the admin removed it on the console.
+        client.workstationResults = [.success([a, b]), .success([a, b]), .success([a])]
         client.sessionsByTarget = [
             "u/a/haunted": [Self.session("s1")],
             "u/b/haunted": [Self.session("s2")],
         ]
         var closed: [String] = []
-        let model = makeModel(client, pollInterval: 0.05,
+        let model = makeModel(client, pollInterval: 0.05, refreshDelay: 3600,
                               closedWorkstation: { closed.append($0) })
         defer { model.stop() }
 
@@ -511,9 +564,10 @@ struct HauntedSidebarModelTests {
         let client = FakeListing()
         let a = Self.workstation("u/a/haunted", online: true)
         let b = Self.workstation("u/b/haunted", online: true)
-        client.workstationResults = [.success([a]), .success([a, b])]
+        // First cycle = two answers (follow-up pass); b appears after that.
+        client.workstationResults = [.success([a]), .success([a]), .success([a, b])]
         client.sessionsByTarget = ["u/a/haunted": [], "u/b/haunted": []]
-        let model = makeModel(client, pollInterval: 0.05)
+        let model = makeModel(client, pollInterval: 0.05, refreshDelay: 3600)
         defer { model.stop() }
 
         model.start(identity: Self.identity)
@@ -572,35 +626,39 @@ struct HauntedSidebarModelTests {
 
     // MARK: MOD-16/17/18 — poll efficiency
 
-    /// Only EXPANDED online workstations are queried for sessions: a collapsed
-    /// group shows nothing, so polling it is a wasted Console session. Expand
-    /// fetches on the spot; collapse stops the queries.
-    @Test("MOD-16: collapsed workstations are not queried; expanding fetches immediately")
+    /// The poll's `live` argument is exactly the expanded online set: a
+    /// collapsed group renders nothing, so fetching its titles is waste (its
+    /// row still rides the ONE multiplexed call, summaries included). Expand
+    /// fetches on the spot; collapse stops the live queries.
+    @Test("MOD-16: live queries exactly the expanded set; expanding fetches immediately")
     func expandedOnlyQuerying() async throws {
         let client = FakeListing()
         let ws = Self.workstation("a/x/haunted", online: true)
         client.workstationResults = [.success([ws])]
         client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
-        let model = makeModel(client)
+        let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
         try #require(model.expanded.contains("a/x/haunted"), "online host auto-expands")
-        let afterLoad = client.sessionCalls.count
-        #expect(afterLoad >= 1, "the expanded workstation is queried on load")
+        #expect(client.liveArgs.last == ["a/x/haunted"],
+                "the auto-expanded workstation is queried live on load")
+        let afterLoad = client.liveRequests.count
 
-        // Collapse → a refresh must not query it.
+        // Collapse → the next refresh still runs, but queries nothing live.
         model.toggle(ws)
         try #require(!model.expanded.contains("a/x/haunted"))
         await model.refreshSessions()
-        #expect(client.sessionCalls.count == afterLoad,
-                "a collapsed workstation is not queried")
+        #expect(client.liveArgs.last == [],
+                "a collapsed workstation is not queried live")
+        #expect(client.liveRequests.count == afterLoad)
 
         // Re-expand → fetched at once, not left to the next poll.
         model.toggle(ws)
-        try await waitUntil({ client.sessionCalls.count > afterLoad },
+        try await waitUntil({ client.liveRequests.count > afterLoad },
                             "expanding fetches sessions immediately")
+        #expect(client.liveArgs.last == ["a/x/haunted"])
     }
 
     /// An inactive app polls on the slow interval — the workstation list is
@@ -615,16 +673,17 @@ struct HauntedSidebarModelTests {
             closeWorkstation: { _ in },
             pollInterval: 0.05,
             inactivePollInterval: 3600,
-            isAppActive: { false })
+            isAppActive: { false },
+            refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded }, "the first poll completes")
-        let after = client.workstationCalls
+        let after = client.listCalls
         // 6× the active interval: an active app would have re-polled several
         // times; an inactive one is asleep on the 3600s interval.
         try await Task.sleep(nanoseconds: 300_000_000)
-        #expect(client.workstationCalls == after,
+        #expect(client.listCalls == after,
                 "an inactive app does not re-poll on the active interval")
     }
 
@@ -637,31 +696,143 @@ struct HauntedSidebarModelTests {
         let ws = Self.workstation("a/x/haunted", online: true)
         client.workstationResults = [.success([ws])]
         client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
-        let model = makeModel(client)
+        let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
 
         model.start(identity: Self.identity)
         try await waitUntil({ model.loaded })
+        let base = client.listCalls
 
-        // Hold the next refresh in sessions(), then fire it.
-        client.sessionsHold = true
+        // Hold the next refresh in list(), then fire it.
+        client.listHold = true
         Task { await model.refreshSessions() }
-        try await waitUntil({ client.sessionCalls.count >= 2 },
-                            "a refresh entered sessions() and is held")
-        let held = client.sessionCalls.count
+        try await waitUntil({ client.listCalls == base + 1 },
+                            "a refresh entered list() and is held")
 
         // Two more requests while one is in flight: no concurrent extra round.
         Task { await model.refreshSessions() }
         Task { await model.refreshSessions() }
         try await Task.sleep(nanoseconds: 50_000_000)
-        #expect(client.sessionCalls.count == held,
+        #expect(client.listCalls == base + 1,
                 "no concurrent round is launched while a refresh runs")
 
         // Releasing runs exactly one coalesced re-run.
-        client.sessionsHold = false
-        try await waitUntil({ client.sessionCalls.count == held + 1 },
+        client.listHold = false
+        try await waitUntil({ client.listCalls == base + 2 },
                             "the pending requests collapse into one re-run")
         try await Task.sleep(nanoseconds: 50_000_000)
-        #expect(client.sessionCalls.count == held + 1, "no further rounds")
+        #expect(client.listCalls == base + 2, "no further rounds")
+    }
+
+    // MARK: MOD-19 — console snapshot summaries seed unloaded rows
+
+    /// A row whose live list has never loaded (here: its daemon wedged, so
+    /// every live query fails) still shows the console's snapshot summaries —
+    /// an instant title-less list instead of a blank group.
+    @Test("MOD-19: summaries seed a row whose live list never loaded")
+    func summariesSeedUnloadedRows() async throws {
+        let client = FakeListing()
+        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.summariesByTarget = ["a/b/haunted": [Self.session("main")]]
+        // No sessionsByTarget entry: every live query answers liveError.
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.loaded })
+        #expect(model.sessionsByTarget["a/b/haunted"]?.map(\.name) == ["main"],
+                "the snapshot summary shows despite the live failure")
+    }
+
+    /// Once a row has a live (titled) list, a later pass that did not query
+    /// it must NOT downgrade it to the title-less summaries.
+    @Test("MOD-19: summaries never overwrite an already-loaded live list")
+    func summariesDoNotOverwriteLive() async throws {
+        let client = FakeListing()
+        let ws = Self.workstation("a/b/haunted", online: true)
+        client.workstationResults = [.success([ws])]
+        client.sessionsByTarget = ["a/b/haunted": [
+            HauntedWorkstationSession(
+                name: "work", pid: 1, clients: 0, cols: 80, rows: 24,
+                created: 0, title: "vim"),
+        ]]
+        client.summariesByTarget = ["a/b/haunted": [Self.session("work")]] // no title
+        let model = makeModel(client)
+        defer { model.stop() }
+
+        model.start(identity: Self.identity)
+        try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.first?.title == "vim" })
+
+        // Collapse: the row leaves the live set; its next listing carries
+        // only summaries. The titled list must survive for the re-expand.
+        model.toggle(ws)
+        await model.refreshSessions()
+        #expect(model.sessionsByTarget["a/b/haunted"]?.first?.title == "vim",
+                "a collapsed row keeps its titled list; summaries only seed")
+    }
+
+    // MARK: MOD-20 — legacy dedmeshctl fallback
+
+    /// The runner behind an old dedmeshctl: `-sessions` fails with Go's
+    /// flag-parse error; the plain list and per-target `haunted list` answer.
+    private func legacyRunner() -> FakeProcessRunner {
+        FakeProcessRunner(runHandler: { command in
+            if command.contains(" -sessions ") {
+                throw HauntedCLIError(
+                    message: "flag provided but not defined: -sessions")
+            }
+            if command.contains(" workstations -json ") {
+                return Data(#"""
+                [{"target":"a/b/haunted","daemon":"b","app":"haunted","online":true,"state":"active"}]
+                """#.utf8)
+            }
+            if command.contains(" list --json ") {
+                return Data(#"[{"name":"work","pid":1,"clients":0,"cols":80,"rows":24,"created":0}]"#.utf8)
+            }
+            throw HauntedCLIError(message: "unexpected command: \(command)")
+        })
+    }
+
+    @Test("MOD-20: an old dedmeshctl latches the legacy 1+N fallback")
+    func legacyFallbackLatches() async throws {
+        let runner = legacyRunner()
+        let listing = HauntedCLISessionListing(runner: runner, fs: HauntedTempFileSystem())
+
+        let rows = try await listing.list(identity: Self.identity, live: ["a/b/haunted"])
+        #expect(rows.count == 1)
+        #expect(rows[0].workstation.target == "a/b/haunted")
+        #expect(rows[0].live?.map(\.name) == ["work"],
+                "the legacy path still delivers live sessions")
+        #expect(listing.legacyCLI, "the failed probe latched")
+
+        _ = try await listing.list(identity: Self.identity, live: ["a/b/haunted"])
+        let probes = runner.invocations.filter {
+            $0.command?.contains(" -sessions ") == true
+        }
+        #expect(probes.count == 1,
+                "the -sessions probe is paid once, not once per poll")
+    }
+
+    @Test("MOD-20: a NON-flag error does not latch the legacy path")
+    func ordinaryErrorDoesNotLatch() async throws {
+        let runner = FakeProcessRunner(runHandler: { _ in
+            throw HauntedCLIError(message: "mesh down")
+        })
+        let listing = HauntedCLISessionListing(runner: runner, fs: HauntedTempFileSystem())
+
+        await #expect(throws: (any Error).self) {
+            _ = try await listing.list(identity: Self.identity, live: [])
+        }
+        #expect(!listing.legacyCLI, "a transient failure must not demote the CLI")
+    }
+
+    @Test("MOD-20: isLegacyFlagError matches Go's flag error, loosely")
+    func legacyFlagErrorMatching() {
+        #expect(HauntedCLISessionListing.isLegacyFlagError(
+            "flag provided but not defined: -sessions"))
+        #expect(HauntedCLISessionListing.isLegacyFlagError(
+            "dedmeshctl: Flag Provided But Not Defined: -live\nusage: ..."))
+        #expect(!HauntedCLISessionListing.isLegacyFlagError("mesh down"))
+        #expect(!HauntedCLISessionListing.isLegacyFlagError("connection refused"))
     }
 }

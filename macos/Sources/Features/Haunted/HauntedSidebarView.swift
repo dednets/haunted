@@ -4,10 +4,13 @@ import SwiftUI
 /// What the sidebar model reads from — and writes to — the mesh. A seam, so
 /// the poll loop can be driven without spawning `dedmeshctl`/`haunted` (§5.4).
 protocol HauntedSessionListing: Sendable {
-    func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation]
-    func sessions(
-        identity: HauntedClientIdentity, target: String
-    ) async throws -> [HauntedWorkstationSession]
+    /// One poll: every reachable workstation (console session summaries
+    /// included) plus fresh titled session lists for the `live` targets.
+    /// Empty `live` fetches the list alone. ONE Console mTLS session however
+    /// many targets are queried — the whole point (performance.md item 1).
+    func list(
+        identity: HauntedClientIdentity, live: [String]
+    ) async throws -> [HauntedWorkstationListing]
     /// Persists a workstation daemon's display color on the console
     /// (nil = back to the default).
     func setWorkstationColor(
@@ -16,22 +19,88 @@ protocol HauntedSessionListing: Sendable {
 }
 
 /// The real one: the CLIs own all mesh transport and mTLS state.
-struct HauntedCLISessionListing: HauntedSessionListing {
-    func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
-        try await HauntedCLI.workstations(identity: identity)
+///
+/// A class, not a struct, for the legacy latch: an old `dedmeshctl` on PATH
+/// predates `-sessions`, fails the first multiplexed call with Go's
+/// flag-parse error, and this listing then falls back — once, latched — to
+/// today's 1 + N shape (plain list + one `haunted list` per live target)
+/// instead of paying a doomed probe every 4s.
+final class HauntedCLISessionListing: HauntedSessionListing, @unchecked Sendable {
+    private let runner: HauntedProcessRunning
+    private let fs: HauntedFileSystem
+    private let lock = NSLock()
+    private var _legacyCLI = false
+
+    init(
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) {
+        self.runner = runner
+        self.fs = fs
     }
 
-    func sessions(
-        identity: HauntedClientIdentity, target: String
-    ) async throws -> [HauntedWorkstationSession] {
-        try await HauntedCLI.sessions(identity: identity, target: target)
+    /// Whether the installed dedmeshctl was seen rejecting `-sessions`.
+    var legacyCLI: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _legacyCLI }
+        set { lock.lock(); _legacyCLI = newValue; lock.unlock() }
+    }
+
+    /// Go's flag package explains an unknown flag with exactly this phrase on
+    /// stderr, which `run` surfaces as the error message. Loose, substring,
+    /// case-insensitive: cosmetic coupling whose worst failure mode is
+    /// staying on the legacy path.
+    static func isLegacyFlagError(_ message: String) -> Bool {
+        message.lowercased().contains("flag provided but not defined")
+    }
+
+    func list(
+        identity: HauntedClientIdentity, live: [String]
+    ) async throws -> [HauntedWorkstationListing] {
+        if !legacyCLI {
+            do {
+                return try await HauntedCLI.workstationSessions(
+                    identity: identity, live: live, runner: runner, fs: fs)
+            } catch let error as HauntedCLIError
+                where Self.isLegacyFlagError(error.message) {
+                legacyCLI = true // probed once; never retried this launch
+            }
+        }
+        return try await legacyList(identity: identity, live: live)
+    }
+
+    /// The pre-`-sessions` shape: one Console session for the list, one per
+    /// live target for its sessions. No summaries (old CLIs don't emit them).
+    private func legacyList(
+        identity: HauntedClientIdentity, live: [String]
+    ) async throws -> [HauntedWorkstationListing] {
+        let workstations = try await HauntedCLI.workstations(
+            identity: identity, runner: runner, fs: fs)
+        let wanted = Set(live)
+        var out: [HauntedWorkstationListing] = []
+        for workstation in workstations {
+            var liveSessions: [HauntedWorkstationSession]?
+            var liveError: String?
+            if workstation.online, wanted.contains(workstation.target) {
+                do {
+                    liveSessions = try await HauntedCLI.sessions(
+                        identity: identity, target: workstation.target,
+                        runner: runner, fs: fs)
+                } catch {
+                    liveError = error.localizedDescription
+                }
+            }
+            out.append(HauntedWorkstationListing(
+                workstation: workstation, live: liveSessions, liveError: liveError))
+        }
+        return out
     }
 
     func setWorkstationColor(
         identity: HauntedClientIdentity, daemon: String, color: String?
     ) async throws {
         try await HauntedCLI.setWorkstationColor(
-            identity: identity, daemon: daemon, color: color)
+            identity: identity, daemon: daemon, color: color,
+            runner: runner, fs: fs)
     }
 }
 
@@ -192,10 +261,10 @@ final class HauntedSidebarModel: ObservableObject {
     /// Closing every tab of a removed workstation is likewise `HauntedManager`'s
     /// job; injected so the removal reconciliation is observable without windows.
     private let closeWorkstation: @MainActor (String) -> Void
-    /// The poll cadence while the app is active. Each cycle costs one Console
-    /// mTLS session for the workstation list plus one per EXPANDED online
-    /// workstation (see refreshSessions) — so a tight interval is only paid
-    /// for what the user is looking at.
+    /// The poll cadence while the app is active. Each cycle costs ONE Console
+    /// mTLS session — a single multiplexed `dedmeshctl workstations -sessions`
+    /// carrying the host list plus live session lists for the expanded rows
+    /// (see refreshSessions).
     private let pollInterval: TimeInterval
     /// The (slower) cadence while the app is inactive or occluded: nobody is
     /// watching the sidebar, so trade latency for a fraction of the mesh
@@ -399,20 +468,24 @@ final class HauntedSidebarModel: ObservableObject {
         sessionsByTarget[target] = sessions
     }
 
-    /// Refreshes the session lists shown in the sidebar. Two efficiency rules:
+    /// One refresh cycle: a SINGLE `client.list` call carries the workstation
+    /// list (summaries included) and the live titled session lists for every
+    /// EXPANDED online workstation — one Console mTLS session per cycle,
+    /// however many rows are open (performance.md item 1; the old shape was
+    /// 1 + N sessions). Rules:
     ///
-    ///  - **Only EXPANDED online workstations are queried.** Each query is a
-    ///    Console mTLS session (a `haunted list` over the relay); a collapsed
-    ///    group shows no sessions, so polling it every cycle is pure waste.
-    ///    Expanding one fetches it on the spot (see toggle), and reconcile
-    ///    auto-expands newly-online hosts, so first-load coverage is unchanged.
+    ///  - **Only EXPANDED online workstations are queried live.** A collapsed
+    ///    group renders no sessions, so fetching its titles is pure waste; it
+    ///    seeds from the console's snapshot summaries instead, so expanding
+    ///    shows an instant (title-less) list while the on-expand refresh
+    ///    fetches titles.
     ///  - **Overlapping calls coalesce.** The poll loop and the change
     ///    notification both call this; a request arriving mid-run sets a
     ///    pending flag and the in-flight pass re-runs once, rather than firing
-    ///    a second concurrent round of subprocesses.
-    ///
-    /// One workstation's failure must not blank the others: a mesh blip on one
-    /// daemon should not empty the whole sidebar.
+    ///    a second concurrent subprocess.
+    ///  - **One workstation's live failure must not blank the others**: its
+    ///    row keeps the sessions it last showed (`liveError` rows), and a
+    ///    whole-call failure keeps everything (no flash-to-empty).
     func refreshSessions() async {
         localTabs = localTabsProvider()
         guard let identity else { return }
@@ -424,35 +497,56 @@ final class HauntedSidebarModel: ObservableObject {
         defer { refreshing = false }
         repeat {
             refreshPending = false
-            for workstation in workstations
-            where workstation.online && expanded.contains(workstation.id) {
-                if let sessions = try? await client.sessions(
-                    identity: identity, target: workstation.target) {
-                    sessionsByTarget[workstation.id] =
-                        sessions.sorted { $0.name < $1.name }
-                }
+            let requested = workstations
+                .filter { $0.online && expanded.contains($0.id) }
+                .map(\.target)
+            do {
+                let listings = try await client.list(identity: identity, live: requested)
+                errorMessage = nil
+                apply(listings: listings, requested: Set(requested))
+            } catch {
+                // Keep the last-known workstations: a transient CLI failure
+                // must not flash the sidebar to empty.
+                errorMessage = error.localizedDescription
             }
         } while refreshPending
     }
 
+    /// Folds one poll answer into the model: the host list (+ reconcile), then
+    /// per-row sessions — fresh titled `live` when queried, untouched on a
+    /// per-row `liveError` (a mesh blip must not blank a list the user is
+    /// looking at), seeded from the snapshot summaries when never loaded.
+    private func apply(listings: [HauntedWorkstationListing], requested: Set<String>) {
+        let fresh = listings.map(\.workstation)
+        let previous = workstations
+        workstations = fresh.sorted { $0.target < $1.target }
+        reconcile(previous: previous, fresh: fresh)
+
+        for listing in listings {
+            let id = listing.workstation.id
+            if let live = listing.live {
+                sessionsByTarget[id] = live.sorted { $0.name < $1.name }
+            } else if listing.liveError == nil, sessionsByTarget[id] == nil {
+                sessionsByTarget[id] = listing.sessions.sorted { $0.name < $1.name }
+            }
+        }
+
+        // reconcile may have auto-expanded hosts this pass did not query live
+        // (the first load, or a host that just appeared): run a follow-up pass
+        // so their titles arrive now, not at the next interval. Terminates:
+        // the re-run requests exactly the expanded set, after which nothing
+        // is missing.
+        let missing = workstations.contains {
+            $0.online && expanded.contains($0.id) && !requested.contains($0.target)
+        }
+        if missing { refreshPending = true }
+    }
+
     private func poll() async {
         while !Task.isCancelled {
-            guard let identity else { return }
+            guard identity != nil else { return }
             await limaRefresh?()
-            do {
-                let fresh = try await client.workstations(identity: identity)
-                let previous = workstations
-                workstations = fresh.sorted { $0.target < $1.target }
-                errorMessage = nil
-
-                reconcile(previous: previous, fresh: fresh)
-
-                await refreshSessions()
-            } catch {
-                // Keep the last-known workstations: a transient CLI failure must
-                // not flash the sidebar to empty.
-                errorMessage = error.localizedDescription
-            }
+            await refreshSessions()
             loaded = true
             // Nobody watching → poll far less often (reactivation restarts the
             // loop, so the slow interval never delays what the user sees).

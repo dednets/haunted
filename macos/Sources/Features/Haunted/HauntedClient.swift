@@ -347,6 +347,62 @@ struct HauntedWorkstationSession: Decodable, Identifiable, Equatable {
     }
 }
 
+/// One row of `dedmeshctl workstations -json -sessions`: the flat workstation
+/// ref plus the console's snapshot session summaries and — for workstations
+/// the call queried live — the fresh titled list. Exactly one of `live` /
+/// `liveError` is present for a queried workstation; both absent means "not
+/// queried this round" (a collapsed row), and `live: []` means "queried, zero
+/// sessions" — the caller must clear its cache, not keep stale rows.
+struct HauntedWorkstationListing: Decodable, Equatable {
+    let workstation: HauntedWorkstation
+    /// The console's last-snapshot summaries (≤30s stale, never titled).
+    let sessions: [HauntedWorkstationSession]
+    /// The fresh end-to-end list (titles included), when queried.
+    let live: [HauntedWorkstationSession]?
+    let liveError: String?
+
+    enum CodingKeys: String, CodingKey {
+        case sessions
+        case live
+        case liveError = "live_error"
+    }
+
+    init(
+        workstation: HauntedWorkstation,
+        sessions: [HauntedWorkstationSession] = [],
+        live: [HauntedWorkstationSession]? = nil,
+        liveError: String? = nil
+    ) {
+        self.workstation = workstation
+        self.sessions = sessions
+        self.live = live
+        self.liveError = liveError
+    }
+
+    init(from decoder: Decoder) throws {
+        // The ref keys are flat on the same object (pinned by a golden test
+        // on the Go side), so the workstation decodes from the same decoder.
+        workstation = try HauntedWorkstation(from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessions = try container.decodeIfPresent(
+            [HauntedWorkstationSession].self, forKey: .sessions) ?? []
+        live = try container.decodeIfPresent(
+            [HauntedWorkstationSession].self, forKey: .live)
+        liveError = try container.decodeIfPresent(String.self, forKey: .liveError)
+    }
+
+    /// A copy that survived the decode boundary: color normalized, session
+    /// records with names outside the daemon grammar dropped (both lists are
+    /// remote-controlled JSON, same rules as decodeSessions).
+    func sanitized() -> HauntedWorkstationListing {
+        HauntedWorkstationListing(
+            workstation: workstation.normalizingColor(),
+            sessions: sessions.filter { isValidSessionName($0.name) },
+            live: live.map { $0.filter { isValidSessionName($0.name) } },
+            liveError: liveError)
+    }
+}
+
 struct HauntedCLIError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -446,6 +502,13 @@ enum HauntedCLI {
             .filter { isValidSessionName($0.name) }
     }
 
+    /// The decode boundary for `dedmeshctl workstations -json -sessions`.
+    static func decodeWorkstationListings(_ data: Data) throws -> [HauntedWorkstationListing] {
+        try JSONDecoder().decode([HauntedWorkstationListing].self, from: data)
+            .filter { isSafeCLIArgument($0.workstation.target) }
+            .map { $0.sanitized() }
+    }
+
     static func workstations(
         identity: HauntedClientIdentity,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
@@ -454,6 +517,24 @@ enum HauntedCLI {
         let data = try await runner.run(
             "\(quote(resolve("dedmeshctl", fs: fs))) workstations -json -state-dir \(quote(identity.stateDir.path))")
         return try decodeWorkstations(data)
+    }
+
+    /// The multiplexed sidebar poll: ONE `dedmeshctl` invocation (one Console
+    /// mTLS session) returns every workstation with summaries, fanning out
+    /// live titled session lists for `live` targets only. `live` values came
+    /// out of remote-controlled JSON, so they are re-checked at this argv
+    /// boundary; a comma would smuggle a second target into the flag.
+    static func workstationSessions(
+        identity: HauntedClientIdentity,
+        live: [String],
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) async throws -> [HauntedWorkstationListing] {
+        let safe = live.filter { isSafeCLIArgument($0) && !$0.contains(",") }
+        let liveArg = safe.isEmpty ? "none" : safe.joined(separator: ",")
+        let data = try await runner.run(
+            "\(quote(resolve("dedmeshctl", fs: fs))) workstations -json -sessions -live \(quote(liveArg)) -state-dir \(quote(identity.stateDir.path))")
+        return try decodeWorkstationListings(data)
     }
 
     static func sessions(

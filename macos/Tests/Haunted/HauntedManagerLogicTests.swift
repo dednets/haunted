@@ -104,19 +104,25 @@ struct HauntedManagerLogicTests {
             lock.lock(); defer { lock.unlock() }; return _calls
         }
 
-        func workstations(identity: HauntedClientIdentity) async throws -> [HauntedWorkstation] {
-            []
-        }
-
-        func sessions(
-            identity: HauntedClientIdentity, target: String
-        ) async throws -> [HauntedWorkstationSession] {
+        func list(
+            identity: HauntedClientIdentity, live: [String]
+        ) async throws -> [HauntedWorkstationListing] {
             lock.lock()
             let index = min(_calls, answers.count - 1)
             _calls += 1
             let result = answers[index]
             lock.unlock()
-            return try result.get()
+            // sessionLanded queries exactly one target; the scripted sessions
+            // are that target's live list.
+            let sessions = try result.get()
+            return live.map { target in
+                HauntedWorkstationListing(
+                    workstation: HauntedWorkstation(
+                        target: target,
+                        daemon: String(target.split(separator: "/").dropFirst().first ?? "d"),
+                        app: "haunted", online: true, state: nil, error: nil),
+                    live: sessions)
+            }
         }
 
         func setWorkstationColor(

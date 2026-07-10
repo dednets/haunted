@@ -74,6 +74,62 @@ struct HauntedModelTests {
         let json = Data("{not json".utf8)
         #expect(throws: (any Error).self) { try HauntedCLI.decodeSessions(json) }
         #expect(throws: (any Error).self) { try HauntedCLI.decodeWorkstations(json) }
+        #expect(throws: (any Error).self) { try HauntedCLI.decodeWorkstationListings(json) }
+    }
+
+    /// DEC-07. The combined `workstations -json -sessions` row: flat ref keys
+    /// (the same object shape as the plain list — pinned by a golden test on
+    /// the Go side), `sessions` summaries, and the three live states — titled
+    /// list, `live: []` (queried, none), and `live_error`. The same decode
+    /// boundary rules apply: hostile session names are dropped from BOTH
+    /// lists, colors are normalized, unsafe targets are dropped.
+    @Test("DEC-07: combined listing decodes flat ref + sessions + live/live_error")
+    func decodeWorkstationListings() throws {
+        let json = Data("""
+        [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true,
+          "state":"active","color":"#E5484D",
+          "sessions":[{"name":"main","pid":4,"clients":1,"cols":120,"rows":40,"created":100},
+                      {"name":"bad name","pid":5,"clients":0,"cols":80,"rows":24,"created":0}],
+          "live":[{"name":"main","pid":4,"clients":1,"cols":120,"rows":40,"created":100,
+                   "title":"vim"}]},
+         {"target":"alice/idle/haunted","daemon":"idle","app":"haunted","online":true,
+          "state":"active","live":[]},
+         {"target":"alice/down/haunted","daemon":"down","app":"haunted","online":true,
+          "state":"active","live_error":"stream refused"},
+         {"target":"-hostile","daemon":"x","app":"haunted","online":true}]
+        """.utf8)
+        let rows = try HauntedCLI.decodeWorkstationListings(json)
+        #expect(rows.count == 3, "the unsafe target is dropped at the boundary")
+
+        let box = rows[0]
+        #expect(box.workstation.target == "alice/box/haunted")
+        #expect(box.workstation.color == "#e5484d", "color normalized like the plain list")
+        #expect(box.sessions.map(\.name) == ["main"], "hostile summary names dropped")
+        #expect(box.live?.map(\.name) == ["main"])
+        #expect(box.live?.first?.title == "vim")
+        #expect(box.liveError == nil)
+
+        #expect(rows[1].live?.isEmpty == true,
+                "queried-and-empty is [], distinct from not-queried")
+        #expect(rows[1].liveError == nil)
+
+        #expect(rows[2].live == nil)
+        #expect(rows[2].liveError == "stream refused")
+        #expect(rows[2].sessions.isEmpty)
+    }
+
+    /// DEC-07b. Plain `workstations -json` output (no -sessions run) decodes
+    /// through the same type: every listing field simply absent.
+    @Test("DEC-07b: a plain workstations row decodes as an unqueried listing")
+    func decodePlainRowAsListing() throws {
+        let json = Data("""
+        [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true}]
+        """.utf8)
+        let rows = try HauntedCLI.decodeWorkstationListings(json)
+        #expect(rows.count == 1)
+        #expect(rows[0].sessions.isEmpty)
+        #expect(rows[0].live == nil)
+        #expect(rows[0].liveError == nil)
     }
 
     // MARK: STAT-01…05

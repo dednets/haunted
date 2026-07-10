@@ -699,9 +699,10 @@ final class HauntedManager {
     ) async -> Bool {
         let end = Date().addingTimeInterval(deadline)
         repeat {
-            if let sessions = try? await listing.sessions(
-                identity: identity, target: target),
-               sessions.contains(where: { $0.name == sessionName && $0.clients > 0 }) {
+            if let listings = try? await listing.list(
+                identity: identity, live: [target]),
+               let live = listings.first(where: { $0.workstation.target == target })?.live,
+               live.contains(where: { $0.name == sessionName && $0.clients > 0 }) {
                 return true
             }
             try? await Task.sleep(nanoseconds: UInt64(pollEvery * 1_000_000_000))
