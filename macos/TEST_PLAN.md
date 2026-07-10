@@ -371,6 +371,9 @@ else lands on the `.empty` "Nothing here" state (sidebar shown, no shell).
 | TAB-05 | `tabKey("a/b", "c")` vs `tabKey("a", "b/c")` | distinct — the `\u{1}` separator is doing real work |
 | KILL-01 | `sessionTabClosePlan(siblingTabCount:)` | last tab → `.emptyState`; with siblings → `.closeTab`. Killing the *last* session must NOT close the window — `window.close()` frees the attached `SurfaceView` while libghostty is still delivering a scrollbar action into it (use-after-free, `SIGABRT` in `Ghostty.App.scrollbar`). The last tab drops to the "Nothing here" empty state instead. |
 | KILL-02 | CLI kill throws | logged, `hauntedSessionsDidChange` still posted |
+| CLOSE-01 | `closeTabChoice(for:)` | ⌘W default (`.alertFirstButtonReturn`) → `.close` (kill the remote session); second → `.runInBackground` (detach); third/Escape/nil → `.cancel`. **This is the bug (BUG-14)**: closing a Haunted tab only *detached* — the persistent session kept running on the workstation — while the old dialog claimed "the process will be killed". The default action must now actually exit the session. |
+| CLOSE-02 | `closeTabButtonTitles` | `["Close", "Run in Background", "Cancel"]` — NSAlert add-order makes Close the Enter default (first/rightmost); Cancel carries Escape. Renders L→R as "Cancel   Run in Background   Close". |
+| CLOSE-03 | `killSessionsRemote(identity:sessions:runner:)` | one `haunted kill '<name>' … --target '<target>'` per session through the process seam (verified with `FakeProcessRunner`); empty list is a no-op. The kill the old close path never performed. |
 | NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{16}$`, no collisions. ⚠️ The uniqueness half is a *statistical* claim: P(collision) ≈ 1 − exp(−n(n−1)/2N). At the original 8 hex digits (N = 2³²) that is **1.16% per run** — the Phase 1 test was flaky by construction, ~1 failure in 86 runs. Widened to 16 digits (2.7e-12) in Phase 2; a companion test asserts the entropy width the assertion depends on. Do not narrow the generator without deleting the uniqueness assertion. |
 | CFG-01 | `buildConfiguration` | `waitAfterCommand == true`, `initialInput` ends with `\n` |
 | LAST-01 | `HauntedLastTarget` set, `HauntedLastSession` unset | `lastAttached == nil` |
@@ -872,8 +875,32 @@ LOG-04), BUG-5 (`certIdentity` chains, was ID-11), BUG-6 (`generateSessionName`
 entropy); and in Phase 3 — BUG-8 (the short read below) and BUG-9 (LAY-07's
 stranded reversal); and in Phase 4 — BUG-11 (startup auto-creates a session) and
 BUG-12 (killing the last session crashes the app); and after Phase 4 —
-BUG-13 (the sidebar poll loop freezes forever in `waitUntilExit`). Each has a
+BUG-13 (the sidebar poll loop freezes forever in `waitUntilExit`) and
+BUG-14 (⌘W detaches instead of killing the remote session). Each has a
 regression test named for its ID. §4 marks them ✅.
+
+### BUG-14 — ⌘W claims to kill the process but only detaches — ✅ **confirmed, then fixed**
+
+**Symptom (user):** ⌘W on a tab shows "Close Tab? … the process will be killed",
+but the process keeps running on the workstation. Expected: closing kills the
+session by default (like `exit`), with a Cancel / Run in Background / Close
+choice (Close default).
+
+**Reproduction (live, against the ws1 Lima VM):** the workstation's session list
+accumulated four `gui-…` sessions, every one `clients=0` with `htop` still
+running — each a tab the user had closed. Closing a Haunted tab tears down only
+the *local* `attach-loop.sh` → `haunted attach-remote` client, which **detaches**;
+the persistent daemon session survives (that is the whole point of persistence).
+So the upstream dialog's "the process will be killed" was false for the fork,
+and nothing ever killed the remote session.
+
+**Fix:** ⌘W on a tab attached to Haunted session(s) now presents the real choice
+(`HauntedManager.CloseTabChoice`): **Close** (default) tears the tab down *and*
+issues `haunted kill` for every session in it (`killSessionsRemote`, one per
+split); **Run in Background** keeps the old detach-only behavior; **Cancel** does
+nothing. Wired into both `closeTab` and `closeWindow` (single-tab ⌘W routes
+through the latter). Tests: CLOSE-01…03. Validated live — opening a fresh tab
+(`gui-c778e790f44047bc`), ⌘W, Enter, and the session was gone from the daemon.
 
 ### BUG-13 — the sidebar silently stops refreshing forever — ✅ **confirmed, then fixed**
 

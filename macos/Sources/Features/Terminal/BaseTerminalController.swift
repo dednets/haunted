@@ -353,6 +353,33 @@ class BaseTerminalController: NSWindowController,
         return await alert.beginSheetModal(for: window)
     }
 
+    /// Fork: confirmation with caller-chosen buttons, for Haunted's three-way
+    /// close choice (Cancel / Run in Background / Close). Mirrors
+    /// `confirmCloseAsync`'s single-alert guard and Stage Manager focus
+    /// workaround; `buttonTitles` are added in order (first = default).
+    func confirmCloseChoiceAsync(
+        messageText: String,
+        informativeText: String,
+        buttonTitles: [String]
+    ) async -> NSApplication.ModalResponse? {
+        guard alert == nil else { return nil }
+        guard let window else { return nil }
+
+        let alert = NSAlert()
+        alert.messageText = messageText
+        alert.informativeText = informativeText
+        for title in buttonTitles {
+            alert.addButton(withTitle: title)
+        }
+        alert.alertStyle = .warning
+        self.alert = alert
+        defer {
+            alert.window.orderOut(nil)
+            self.alert = nil
+        }
+        return await alert.beginSheetModal(for: window)
+    }
+
     func confirmClose(
         messageText: String,
         informativeText: String,

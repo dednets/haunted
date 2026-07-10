@@ -1,4 +1,5 @@
 import Testing
+import AppKit
 import Foundation
 @testable import Ghostty
 
@@ -185,5 +186,67 @@ struct HauntedManagerLogicTests {
             listing: listing, pollEvery: 0.01, deadline: 5)
         #expect(landed)
         #expect(listing.calls == 2)
+    }
+
+    // MARK: CLOSE-01…03 — ⌘W kills the remote session by default
+
+    /// CLOSE-01. THE BUG: closing a Haunted tab only detached the persistent
+    /// remote session — it kept running on the workstation — while the dialog
+    /// claimed "the process will be killed". The DEFAULT ⌘W action (Enter →
+    /// the first NSAlert button) must map to `.close`, which exits the remote
+    /// session like typing `exit`. "Run in Background" is the second button,
+    /// everything else (Escape, dismissed sheet, or no dialog at all) cancels.
+    @Test("CLOSE-01: the default close action kills the session; second detaches; else cancels")
+    func closeTabChoiceMapping() {
+        #expect(HauntedManager.closeTabChoice(for: .alertFirstButtonReturn) == .close)
+        #expect(HauntedManager.closeTabChoice(for: .alertSecondButtonReturn) == .runInBackground)
+        #expect(HauntedManager.closeTabChoice(for: .alertThirdButtonReturn) == .cancel)
+        // No dialog could be shown (already-open alert, no window) → do nothing:
+        // never silently close-and-kill, never silently detach.
+        #expect(HauntedManager.closeTabChoice(for: nil) == .cancel)
+    }
+
+    /// CLOSE-02. Button order is load-bearing: NSAlert makes the first-added
+    /// button the default (Enter) and lays them out right-to-left, so the
+    /// titles must be [Close, Run in Background, Cancel] to render as
+    /// "Cancel   Run in Background   Close" with Close as the Enter default.
+    @Test("CLOSE-02: Close is the default button; Cancel is present for Escape")
+    func closeTabButtonOrder() {
+        #expect(HauntedManager.closeTabButtonTitles.first == "Close",
+                "the first NSAlert button is the Enter default — it must be Close")
+        #expect(HauntedManager.closeTabButtonTitles == ["Close", "Run in Background", "Cancel"])
+        #expect(HauntedManager.closeTabButtonTitles.contains("Cancel"),
+                "a button titled Cancel is what gives Escape its key equivalent")
+    }
+
+    /// CLOSE-03. `Close` must actually issue a `haunted kill` per session over
+    /// the CLI — one for every split's session, with its own target/name — not
+    /// merely tear down the tab (which is all the old path did). Verified
+    /// through the process seam, so no window or live daemon is needed.
+    @Test("CLOSE-03: killSessionsRemote issues one `haunted kill` per session")
+    func killSessionsRemoteFansOut() async {
+        let runner = FakeProcessRunner()
+        let sessions = [
+            HauntedManager.SessionRef(target: "luiz/ws1/haunted", sessionName: "gui-aaaa"),
+            HauntedManager.SessionRef(target: "luiz/ws1/haunted", sessionName: "gui-bbbb"),
+        ]
+        await HauntedManager.killSessionsRemote(
+            identity: Self.identity, sessions: sessions, runner: runner)
+
+        let kills = runner.invocations.compactMap { $0.command }
+            .filter { $0.contains(" kill ") }
+        #expect(kills.count == 2, "expected one kill per session, got \(kills.count)")
+        #expect(kills.contains { $0.contains("kill 'gui-aaaa'") && $0.contains("--target 'luiz/ws1/haunted'") })
+        #expect(kills.contains { $0.contains("kill 'gui-bbbb'") && $0.contains("--target 'luiz/ws1/haunted'") })
+    }
+
+    /// A tab with no attached session (plain shell / empty state) has nothing
+    /// to kill: an empty list issues no CLI calls at all.
+    @Test("CLOSE-03: no sessions → no kill invocations")
+    func killSessionsRemoteEmptyIsNoOp() async {
+        let runner = FakeProcessRunner()
+        await HauntedManager.killSessionsRemote(
+            identity: Self.identity, sessions: [], runner: runner)
+        #expect(runner.invocations.isEmpty)
     }
 }

@@ -109,6 +109,95 @@ final class HauntedManager {
         siblingTabCount > 1 ? .closeTab : .emptyState
     }
 
+    // MARK: Closing a tab attached to a session (⌘W)
+
+    /// A remote session a tab is attached to. One per split surface.
+    struct SessionRef: Equatable {
+        let target: String
+        let sessionName: String
+    }
+
+    /// What the user chose in the ⌘W confirmation for a Haunted tab.
+    ///
+    /// Closing the tab only tears down the *local* attach client, which
+    /// **detaches** — the session keeps running on the workstation (that is
+    /// what persistence is for). So the old two-button dialog's "the process
+    /// will be killed" was a lie: nothing was killed. The real choice:
+    ///  - `close` (default): exit the remote session, like typing `exit`;
+    ///  - `runInBackground`: leave it running, just close the tab;
+    ///  - `cancel`.
+    enum CloseTabChoice: Equatable {
+        case close
+        case runInBackground
+        case cancel
+    }
+
+    /// Button titles in NSAlert **add order**: the first is the default
+    /// (Enter) and rightmost, and the layout is right-to-left — so this
+    /// renders left-to-right as "Cancel   Run in Background   Close" with
+    /// Close as the default, exactly the requested shape. "Cancel" also gets
+    /// the Escape key equivalent from NSAlert by virtue of its title.
+    static let closeTabButtonTitles = ["Close", "Run in Background", "Cancel"]
+
+    /// Maps an NSAlert response (or nil, when no dialog could be shown) to the
+    /// choice. Pure, so the mapping — and that the DEFAULT action kills the
+    /// session, which is the whole bug — is testable without a window.
+    static func closeTabChoice(for response: NSApplication.ModalResponse?) -> CloseTabChoice {
+        switch response {
+        case .some(.alertFirstButtonReturn): return .close
+        case .some(.alertSecondButtonReturn): return .runInBackground
+        default: return .cancel // third button, Escape, dismissed sheet, or nil
+        }
+    }
+
+    /// The distinct remote sessions a controller's tab is attached to (one per
+    /// split surface), with the client identity. `nil` when the tab holds no
+    /// Haunted session — a plain shell or the "Nothing here" empty state — so
+    /// the caller falls through to the upstream close path.
+    @MainActor
+    func hauntedSessions(
+        in controller: TerminalController
+    ) -> (identity: HauntedClientIdentity, sessions: [SessionRef])? {
+        guard let identity = self.identity(for: controller) else { return nil }
+        var refs: [SessionRef] = []
+        var seen = Set<NSString>()
+        for view in controller.surfaceTree {
+            guard let info = surfaces.object(forKey: view),
+                  let target = info.target, let name = info.sessionName else { continue }
+            if seen.insert(Self.tabKey(target, name)).inserted {
+                refs.append(SessionRef(target: target, sessionName: name))
+            }
+        }
+        return refs.isEmpty ? nil : (identity, refs)
+    }
+
+    /// Kills the given remote sessions over the CLI — no UI teardown (the
+    /// caller has already, or is about to, close the tab). Injectable runner
+    /// so the close-tab kill fan-out is testable without a window. Called
+    /// AFTER the tab is torn down: killing while the surface is still attached
+    /// would, with wait-after-command, strand an exit banner (same reasoning
+    /// as `killSession`).
+    static func killSessionsRemote(
+        identity: HauntedClientIdentity,
+        sessions: [SessionRef],
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared
+    ) async {
+        for session in sessions {
+            do {
+                try await HauntedCLI.killSession(
+                    identity: identity, target: session.target,
+                    sessionName: session.sessionName, runner: runner)
+            } catch {
+                NSLog("[haunted] close-tab kill %@ on %@ failed: %@",
+                      session.sessionName, session.target, "\(error)")
+            }
+        }
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: .hauntedSessionsDidChange, object: nil)
+        }
+    }
+
     /// Kills a session and updates the tab showing it. Tab first: the surface's
     /// attach exits when the session dies, and with wait-after-command that
     /// would strand an exit banner the user has to close by hand.

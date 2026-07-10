@@ -1305,6 +1305,17 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             return
         }
 
+        // Fork: a tab attached to Haunted session(s) always offers the
+        // kill/detach choice — regardless of needsConfirmQuit — because
+        // closing only DETACHES the persistent remote session, it does not
+        // kill it (the reported bug). See confirmCloseHauntedSessions.
+        if confirmCloseHauntedSessions(
+            messageText: "Close Tab?",
+            controllers: [self],
+            closeUI: { [weak self] in self?.closeTabImmediately() }) {
+            return
+        }
+
         guard surfaceTree.contains(where: { $0.needsConfirmQuit }) else {
             closeTabImmediately()
             return
@@ -1316,6 +1327,53 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         ) {
             self.closeTabImmediately()
         }
+    }
+
+    /// Fork: ⌘W confirmation for one or more controllers attached to Haunted
+    /// sessions. Closing a Haunted tab tears down only the *local* attach
+    /// client, which DETACHES — the session keeps running on the workstation,
+    /// so the upstream "the process will be killed" dialog was false. This
+    /// offers the real choice (Cancel / Run in Background / Close, Close
+    /// default), and only Close exits the remote session (like typing `exit`).
+    ///
+    /// Returns true if any controller held a Haunted session and the choice
+    /// was presented; false to fall through to the upstream close path (plain
+    /// shells, the empty state).
+    @MainActor
+    @discardableResult
+    private func confirmCloseHauntedSessions(
+        messageText: String,
+        controllers: [TerminalController],
+        closeUI: @escaping () -> Void
+    ) -> Bool {
+        let attached = controllers.compactMap {
+            HauntedManager.shared.hauntedSessions(in: $0)
+        }
+        guard !attached.isEmpty else { return false }
+
+        let count = attached.reduce(0) { $0 + $1.sessions.count }
+        let noun = count == 1 ? "a session" : "\(count) sessions"
+        let pronoun = count == 1 ? "it" : "them"
+
+        Task { @MainActor in
+            let response = await confirmCloseChoiceAsync(
+                messageText: messageText,
+                informativeText: "Attached to \(noun) running on the workstation. Close \(pronoun) (like typing “exit” — the process ends), or leave \(pronoun) running in the background.",
+                buttonTitles: HauntedManager.closeTabButtonTitles)
+            switch HauntedManager.closeTabChoice(for: response) {
+            case .close:
+                closeUI()
+                for group in attached {
+                    await HauntedManager.killSessionsRemote(
+                        identity: group.identity, sessions: group.sessions)
+                }
+            case .runInBackground:
+                closeUI()
+            case .cancel:
+                break
+            }
+        }
+        return true
     }
 
     @IBAction func closeOtherTabs(_ sender: Any?) {
@@ -1391,8 +1449,20 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // if we're closing the window. If we don't have a tabgroup for any
         // reason we check ourselves.
         let windows: [NSWindow] = window.tabGroup?.windows ?? [window]
-        guard let confirmController = windows
-            .compactMap({ $0.windowController as? TerminalController })
+        let groupControllers = windows.compactMap { $0.windowController as? TerminalController }
+
+        // Fork: if any tab in the window is attached to a Haunted session,
+        // offer the kill/detach choice (closing only detaches — see
+        // confirmCloseHauntedSessions). Single-tab ⌘W routes here, so this is
+        // also the last-tab path. Message reflects tab vs. window.
+        if confirmCloseHauntedSessions(
+            messageText: groupControllers.count > 1 ? "Close Window?" : "Close Tab?",
+            controllers: groupControllers,
+            closeUI: { [weak self] in self?.closeWindowImmediately() }) {
+            return
+        }
+
+        guard let confirmController = groupControllers
             .first(where: { $0.surfaceTree.contains(where: { $0.needsConfirmQuit }) })
         else {
             closeWindowImmediately()
