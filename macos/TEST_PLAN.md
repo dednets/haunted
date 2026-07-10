@@ -374,6 +374,7 @@ else lands on the `.empty` "Nothing here" state (sidebar shown, no shell).
 | CLOSE-01 | `closeTabChoice(for:)` | ⌘W default (`.alertFirstButtonReturn`) → `.close` (kill the remote session); second → `.runInBackground` (detach); third/Escape/nil → `.cancel`. **This is the bug (BUG-14)**: closing a Haunted tab only *detached* — the persistent session kept running on the workstation — while the old dialog claimed "the process will be killed". The default action must now actually exit the session. |
 | CLOSE-02 | `closeTabButtonTitles` | `["Close", "Run in Background", "Cancel"]` — NSAlert add-order makes Close the Enter default (first/rightmost); Cancel carries Escape. Renders L→R as "Cancel   Run in Background   Close". |
 | CLOSE-03 | `killSessionsRemote(identity:sessions:runner:)` | one `haunted kill '<name>' … --target '<target>'` per session through the process seam (verified with `FakeProcessRunner`); empty list is a no-op. The kill the old close path never performed. |
+| CLOSE-01b | `closeTabPrompt(processRunning:attachedToSession:)` | `processRunning == false` → `.closeImmediately` (no dialog), attached or not — the process already exited (the "Press any key to close" banner / clean `[haunted: detached]`), so there is nothing to kill or detach. Running: attached → `.hauntedChoice`, plain shell → `.plainConfirm`. Follow-up to BUG-14: the popup was appearing on an already-exited tab. |
 | NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{16}$`, no collisions. ⚠️ The uniqueness half is a *statistical* claim: P(collision) ≈ 1 − exp(−n(n−1)/2N). At the original 8 hex digits (N = 2³²) that is **1.16% per run** — the Phase 1 test was flaky by construction, ~1 failure in 86 runs. Widened to 16 digits (2.7e-12) in Phase 2; a companion test asserts the entropy width the assertion depends on. Do not narrow the generator without deleting the uniqueness assertion. |
 | CFG-01 | `buildConfiguration` | `waitAfterCommand == true`, `initialInput` ends with `\n` |
 | LAST-01 | `HauntedLastTarget` set, `HauntedLastSession` unset | `lastAttached == nil` |
@@ -901,6 +902,13 @@ split); **Run in Background** keeps the old detach-only behavior; **Cancel** doe
 nothing. Wired into both `closeTab` and `closeWindow` (single-tab ⌘W routes
 through the latter). Tests: CLOSE-01…03. Validated live — opening a fresh tab
 (`gui-c778e790f44047bc`), ⌘W, Enter, and the session was gone from the daemon.
+
+**Follow-up (same commit series):** the popup must *not* appear once the process
+has already exited (the "Process exited. Press any key to close" banner, or a
+clean `[haunted: detached]`) — there is nothing left to kill or detach, so ⌘W
+just closes the tab. Gated by the pure `closeTabPrompt(processRunning:…)`
+(CLOSE-01b): only a *running* session prompts. Verified in the app (exited tab,
+⌘W, closed with no dialog).
 
 ### BUG-13 — the sidebar silently stops refreshing forever — ✅ **confirmed, then fixed**
 

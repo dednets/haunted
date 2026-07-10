@@ -206,6 +206,26 @@ struct HauntedManagerLogicTests {
         #expect(HauntedManager.closeTabChoice(for: nil) == .cancel)
     }
 
+    /// CLOSE-01b. Once the process has exited — the "Process exited. Press any
+    /// key to close" banner, or a clean `[haunted: detached]` — there is
+    /// nothing to kill or detach, so ⌘W closes with **no dialog**, even for a
+    /// tab that was attached to a session. Only a *running* session prompts.
+    /// (Reported follow-up to BUG-14: the popup appeared on an already-exited
+    /// tab.)
+    @Test("CLOSE-01b: an exited tab closes with no prompt; a running one prompts")
+    func closeTabPromptGatesOnProcessRunning() {
+        // Not running → always close immediately, attached or not.
+        #expect(HauntedManager.closeTabPrompt(
+            processRunning: false, attachedToSession: true) == .closeImmediately)
+        #expect(HauntedManager.closeTabPrompt(
+            processRunning: false, attachedToSession: false) == .closeImmediately)
+        // Running → the choice depends on whether it's a Haunted session.
+        #expect(HauntedManager.closeTabPrompt(
+            processRunning: true, attachedToSession: true) == .hauntedChoice)
+        #expect(HauntedManager.closeTabPrompt(
+            processRunning: true, attachedToSession: false) == .plainConfirm)
+    }
+
     /// CLOSE-02. Button order is load-bearing: NSAlert makes the first-added
     /// button the default (Enter) and lays them out right-to-left, so the
     /// titles must be [Close, Run in Background, Cancel] to render as

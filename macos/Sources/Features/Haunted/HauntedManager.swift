@@ -139,6 +139,34 @@ final class HauntedManager {
     /// the Escape key equivalent from NSAlert by virtue of its title.
     static let closeTabButtonTitles = ["Close", "Run in Background", "Cancel"]
 
+    /// Which close path ⌘W takes for a tab.
+    enum CloseTabPrompt: Equatable {
+        /// Nothing is running to lose — close immediately, no dialog.
+        case closeImmediately
+        /// A Haunted session is attached and running — offer kill/detach/cancel.
+        case hauntedChoice
+        /// A plain local shell is running — the upstream two-button confirm.
+        case plainConfirm
+    }
+
+    /// Decides the ⌘W path. Pure so the "already-exited → no popup" rule is
+    /// testable without a live surface.
+    ///
+    /// - `processRunning`: any surface still has a live process (upstream's
+    ///   `needsConfirmQuit`).
+    /// - `attachedToSession`: the tab holds a Haunted session.
+    ///
+    /// When nothing is running there is nothing to kill or detach: the process
+    /// already exited (the "Process exited. Press any key to close" banner, or
+    /// a clean `[haunted: detached]`), so ⌘W just closes — no dialog — even for
+    /// a Haunted tab. Only a *running* session gets the kill/detach choice.
+    static func closeTabPrompt(
+        processRunning: Bool, attachedToSession: Bool
+    ) -> CloseTabPrompt {
+        guard processRunning else { return .closeImmediately }
+        return attachedToSession ? .hauntedChoice : .plainConfirm
+    }
+
     /// Maps an NSAlert response (or nil, when no dialog could be shown) to the
     /// choice. Pure, so the mapping — and that the DEFAULT action kills the
     /// session, which is the whole bug — is testable without a window.
