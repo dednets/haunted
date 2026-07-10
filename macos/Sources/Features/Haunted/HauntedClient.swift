@@ -371,6 +371,22 @@ func isSafeCLIArgument(_ value: String) -> Bool {
     }
 }
 
+/// Join tokens as the console mints them: `dn_` + lowercase hex
+/// (store.newToken). The token is interpolated into a single-quoted string
+/// inside the Lima enroll command, so anything outside this exact grammar is
+/// rejected rather than passed along — a console (or MITM'd `dedmeshctl`)
+/// answer cannot smuggle shell into the VM bootstrap.
+func isValidJoinToken(_ value: String) -> Bool {
+    let bytes = Array(value.utf8)
+    guard bytes.count > 3,
+          bytes[0] == UInt8(ascii: "d"), bytes[1] == UInt8(ascii: "n"),
+          bytes[2] == UInt8(ascii: "_") else { return false }
+    return bytes.dropFirst(3).allSatisfy { byte in
+        (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+            || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+    }
+}
+
 /// Session names as the daemon defines them: `session_name_valid()` in
 /// `apps/haunted-daemon/src/session.c` accepts exactly `[A-Za-z0-9_-]{1,63}`,
 /// so the daemon can never legitimately report a name outside that set — one
@@ -482,6 +498,45 @@ enum HauntedCLI {
         }
         _ = try await runner.run(
             "\(quote(resolve("dedmeshctl", fs: fs))) workstation color \(quote(daemon)) \(quote(value)) -state-dir \(quote(identity.stateDir.path))")
+    }
+
+    /// Mints a single-use daemon join token for `daemon` under this client's
+    /// own account, via `dedmeshctl workstation token -json` (the mesh mint
+    /// path — the Terminal holds no console API token). The reply is
+    /// remote-controlled JSON, so the token is validated against the exact
+    /// `dn_<hex>` grammar before anyone may interpolate it into a command.
+    static func mintWorkstationToken(
+        identity: HauntedClientIdentity,
+        daemon: String,
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) async throws -> String {
+        guard isSafeCLIArgument(daemon) else {
+            throw HauntedCLIError(message: "invalid daemon name")
+        }
+        let data = try await runner.run(
+            "\(quote(resolve("dedmeshctl", fs: fs))) workstation token \(quote(daemon)) -json -state-dir \(quote(identity.stateDir.path))")
+        struct Reply: Decodable { let token: String }
+        guard let token = (try? JSONDecoder().decode(Reply.self, from: data))?.token,
+              isValidJoinToken(token) else {
+            throw HauntedCLIError(message: "console returned a malformed join token")
+        }
+        return token
+    }
+
+    /// Revokes one of this client's own daemons on the console (`dedmeshctl
+    /// workstation rm`) — the cleanup half of deleting a Lima workstation VM.
+    static func revokeWorkstation(
+        identity: HauntedClientIdentity,
+        daemon: String,
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) async throws {
+        guard isSafeCLIArgument(daemon) else {
+            throw HauntedCLIError(message: "invalid daemon name")
+        }
+        _ = try await runner.run(
+            "\(quote(resolve("dedmeshctl", fs: fs))) workstation rm \(quote(daemon)) -state-dir \(quote(identity.stateDir.path))")
     }
 
     /// One-time enrollment: join token → client mTLS certificate (plus the

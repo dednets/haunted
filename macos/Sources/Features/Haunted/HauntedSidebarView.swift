@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// What the sidebar model reads from — and writes to — the mesh. A seam, so
@@ -71,6 +72,68 @@ enum HauntedWorkstationPalette {
     }
 }
 
+/// One sidebar row after joining the console's workstation list with the
+/// host's local Lima VMs: console-only (a remote workstation, or an orphan a
+/// failed revoke left behind), Lima-only (a VM that has not enrolled/come
+/// online yet), or both (a GUI-managed workstation).
+struct HauntedSidebarRow: Identifiable, Equatable {
+    let workstation: HauntedWorkstation?
+    let lima: HauntedLimaInstance?
+    let op: HauntedLimaModel.Op?
+
+    /// True when the console row belongs to the signed-in user (always true
+    /// for Lima-only rows: local VMs are ours by definition). Gates every
+    /// Lima affordance on console rows.
+    let owned: Bool
+
+    var id: String { workstation?.id ?? "lima:\(lima?.name ?? "")" }
+    var daemonName: String { workstation?.daemon ?? lima?.name ?? "" }
+}
+
+/// The Lima operations a sidebar row can request; the view dispatches them to
+/// HauntedLimaModel (with an NSAlert in front of the destructive ones).
+enum HauntedLimaAction {
+    case start
+    case stop
+    case enroll
+    case delete
+    case revokeConsole
+    case dismissError
+}
+
+enum HauntedSidebarMerge {
+    /// Joins console workstations with local Lima VMs by daemon name — but
+    /// only for rows the caller's own username owns: a local VM named like
+    /// ANOTHER user's daemon (targets can be shared in a picker some day)
+    /// must never merge, or its menu would offer to delete someone else's
+    /// machine. `username` comes from the client certificate CN; nil (an
+    /// unreadable cert) merges nothing.
+    static func mergeRows(
+        workstations: [HauntedWorkstation],
+        lima: [HauntedLimaInstance],
+        ops: [String: HauntedLimaModel.Op],
+        username: String?
+    ) -> [HauntedSidebarRow] {
+        var rows: [HauntedSidebarRow] = []
+        var claimed = Set<String>()
+        for workstation in workstations {
+            let owned = username.map { workstation.target.hasPrefix($0 + "/") } ?? false
+            let vm = owned ? lima.first { $0.name == workstation.daemon } : nil
+            if let vm { claimed.insert(vm.name) }
+            // Ops key by VM/daemon name; an unowned row must not pick up an
+            // op that belongs to a same-named LOCAL VM (its own separate row).
+            rows.append(HauntedSidebarRow(
+                workstation: workstation, lima: vm,
+                op: owned ? ops[workstation.daemon] : nil, owned: owned))
+        }
+        for vm in lima where !claimed.contains(vm.name) {
+            rows.append(HauntedSidebarRow(
+                workstation: nil, lima: vm, op: ops[vm.name], owned: true))
+        }
+        return rows.sorted { $0.daemonName < $1.daemonName }
+    }
+}
+
 /// Shared state behind every sidebar instance. Each tab's window hosts its
 /// own HauntedSidebarView, but they all render THIS one model: tab switches
 /// show identical, already-loaded data (no flicker, no reload), and the
@@ -80,7 +143,12 @@ enum HauntedWorkstationPalette {
 /// persistent surface that every tab happens to show.
 @MainActor
 final class HauntedSidebarModel: ObservableObject {
-    static let shared = HauntedSidebarModel()
+    static let shared = HauntedSidebarModel(
+        // Lima VM state rides the same 4s cadence as the workstation list —
+        // one poll loop for the whole sidebar. Only the production singleton
+        // hooks it up: the default (nil) keeps tests hermetic, since
+        // HauntedLimaModel.shared would probe the real filesystem for limactl.
+        limaRefresh: { await HauntedLimaModel.shared.refresh() })
 
     @Published var workstations: [HauntedWorkstation] = []
     @Published var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
@@ -99,6 +167,9 @@ final class HauntedSidebarModel: ObservableObject {
     /// Attach/kill take a moment to land daemon-side, so the change
     /// notification refreshes after a beat rather than racing the daemon.
     private let refreshDelay: TimeInterval
+    /// Piggybacks the Lima manager's refresh on this model's poll loop
+    /// (nil = no Lima integration; see `shared`).
+    private let limaRefresh: (@MainActor () async -> Void)?
 
     private var identity: HauntedClientIdentity?
     private var pollTask: Task<Void, Never>?
@@ -114,13 +185,15 @@ final class HauntedSidebarModel: ObservableObject {
             HauntedManager.shared.closeTabs(forTarget: $0)
         },
         pollInterval: TimeInterval = 4,
-        refreshDelay: TimeInterval = 1.2
+        refreshDelay: TimeInterval = 1.2,
+        limaRefresh: (@MainActor () async -> Void)? = nil
     ) {
         self.client = client
         self.killSession = killSession
         self.closeWorkstation = closeWorkstation
         self.pollInterval = pollInterval
         self.refreshDelay = refreshDelay
+        self.limaRefresh = limaRefresh
         observer = NotificationCenter.default.addObserver(
             forName: .hauntedSessionsDidChange, object: nil, queue: .main
         ) { [weak self] _ in
@@ -260,6 +333,7 @@ final class HauntedSidebarModel: ObservableObject {
     private func poll() async {
         while !Task.isCancelled {
             guard let identity else { return }
+            await limaRefresh?()
             do {
                 let fresh = try await client.workstations(identity: identity)
                 let previous = workstations
@@ -294,6 +368,22 @@ struct HauntedSidebarView: View {
 
     @ObservedObject private var model = HauntedSidebarModel.shared
     @ObservedObject private var layout = HauntedSidebarLayout.shared
+    @ObservedObject private var limaModel = HauntedLimaModel.shared
+    @State private var showCreateSheet = false
+
+    /// The signed-in username from the client certificate CN
+    /// ("username/client-name") — the merge's cross-user guard.
+    private var username: String? {
+        identity.certIdentity?.components(separatedBy: "/").first
+    }
+
+    private var mergedRows: [HauntedSidebarRow] {
+        HauntedSidebarMerge.mergeRows(
+            workstations: model.workstations,
+            lima: limaModel.available ? limaModel.instances : [],
+            ops: limaModel.ops,
+            username: username)
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -377,30 +467,73 @@ struct HauntedSidebarView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
-                    ForEach(model.workstations) { workstation in
-                        WorkstationGroup(
-                            workstation: workstation,
-                            sessions: model.sessionsByTarget[workstation.id] ?? [],
-                            isExpanded: model.expanded.contains(workstation.id),
-                            toggle: { model.toggle(workstation) },
-                            onOpenPrimary: {
-                                model.expanded.insert(workstation.id)
-                                onOpen(workstation, "default")
-                            },
-                            onOpenSession: { onOpen(workstation, $0) },
-                            onNewSession: { onOpen(workstation, nil) },
-                            onKillSession: {
-                                model.kill(workstation: workstation, session: $0)
-                            },
-                            onSetColor: {
-                                model.setColor(workstation: workstation, color: $0)
-                            })
+                    ForEach(mergedRows) { row in
+                        if let workstation = row.workstation {
+                            WorkstationGroup(
+                                workstation: workstation,
+                                sessions: model.sessionsByTarget[workstation.id] ?? [],
+                                isExpanded: model.expanded.contains(workstation.id),
+                                lima: row.lima,
+                                limaOp: row.op,
+                                // A console row with no local VM offers the
+                                // manual revoke only when it is ours and the
+                                // manager exists at all (the orphan a failed
+                                // delete-revoke leaves behind).
+                                offersConsoleRevoke: row.owned && row.lima == nil
+                                    && limaModel.available,
+                                toggle: { model.toggle(workstation) },
+                                onOpenPrimary: {
+                                    model.expanded.insert(workstation.id)
+                                    onOpen(workstation, "default")
+                                },
+                                onOpenSession: { onOpen(workstation, $0) },
+                                onNewSession: { onOpen(workstation, nil) },
+                                onKillSession: {
+                                    model.kill(workstation: workstation, session: $0)
+                                },
+                                onSetColor: {
+                                    model.setColor(workstation: workstation, color: $0)
+                                },
+                                onLimaAction: { handleLima($0, name: row.daemonName) })
+                        } else if let vm = row.lima {
+                            LimaVMRow(
+                                vm: vm, op: row.op,
+                                onAction: { handleLima($0, name: vm.name) })
+                        }
+                    }
+
+                    if limaModel.available {
+                        Button {
+                            showCreateSheet = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "plus.circle")
+                                    .font(.caption)
+                                Text("New workstation…")
+                                    .font(.callout)
+                                Spacer(minLength: 0)
+                            }
+                            .contentShape(Rectangle())
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 4)
+                            .padding(.horizontal, 8)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Create a Lima VM and enroll it as a workstation")
                     }
                 }
                 .padding(.horizontal, 8)
             }
 
             Spacer(minLength: 0)
+
+            if let warning = limaModel.warningMessage {
+                Text(warning)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .padding(.horizontal, 12)
+            }
 
             if let errorMessage = model.errorMessage {
                 Text(errorMessage)
@@ -410,6 +543,63 @@ struct HauntedSidebarView: View {
                     .padding(.horizontal, 12)
             }
         }
+        .sheet(isPresented: $showCreateSheet) {
+            LimaCreateSheet(
+                existingNames: Set(limaModel.instances.map(\.name))
+                    .union(model.workstations.map(\.daemon)),
+                onCreate: { spec in
+                    limaModel.createAndEnroll(spec: spec, identity: identity)
+                })
+        }
+    }
+
+    private func handleLima(_ action: HauntedLimaAction, name: String) {
+        switch action {
+        case .start:
+            limaModel.start(name: name)
+        case .stop:
+            limaModel.stop(name: name)
+        case .enroll:
+            limaModel.enroll(name: name, identity: identity)
+        case .delete:
+            confirm(
+                "Delete workstation “\(name)”?",
+                detail: "The Lima VM and its disk are destroyed and the "
+                    + "workstation is removed from the Console. This cannot "
+                    + "be undone.",
+                button: "Delete"
+            ) {
+                limaModel.delete(name: name, identity: identity)
+            }
+        case .revokeConsole:
+            confirm(
+                "Remove “\(name)” from the Console?",
+                detail: "The daemon and everything it published are deleted; "
+                    + "its certificate stops working. There is no local VM to "
+                    + "remove.",
+                button: "Remove"
+            ) {
+                limaModel.revokeConsole(name: name, identity: identity)
+            }
+        case .dismissError:
+            limaModel.clearFailure(name: name)
+        }
+    }
+
+    /// The one NSAlert shape every destructive Lima action goes through.
+    private func confirm(
+        _ message: String, detail: String, button: String,
+        onConfirm: @escaping () -> Void
+    ) {
+        let alert = NSAlert()
+        alert.messageText = message
+        alert.informativeText = detail
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            onConfirm()
+        }
     }
 }
 
@@ -417,6 +607,12 @@ private struct WorkstationGroup: View {
     let workstation: HauntedWorkstation
     let sessions: [HauntedWorkstationSession]
     let isExpanded: Bool
+    /// The local Lima VM backing this workstation (merged by name), if any.
+    let lima: HauntedLimaInstance?
+    let limaOp: HauntedLimaModel.Op?
+    /// Console-only owned row: offer "Remove from Console…" (the orphan a
+    /// failed delete-revoke leaves behind).
+    let offersConsoleRevoke: Bool
     let toggle: () -> Void
     let onOpenPrimary: () -> Void
     let onOpenSession: (String) -> Void
@@ -424,6 +620,7 @@ private struct WorkstationGroup: View {
     let onKillSession: (String) -> Void
     /// nil = back to the default color.
     let onSetColor: (String?) -> Void
+    let onLimaAction: (HauntedLimaAction) -> Void
 
     @State private var hovering = false
 
@@ -450,6 +647,27 @@ private struct WorkstationGroup: View {
                             .fontWeight(.medium)
                             .lineLimit(1)
                             .foregroundStyle(nameColor)
+                        if let limaOp, limaOp.isInFlight {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.55)
+                                .frame(width: 10, height: 10)
+                            Text(limaOp.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        } else if case .failed(let message) = limaOp {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.yellow)
+                                .help(message)
+                        } else if let lima, lima.isRunning, !workstation.online {
+                            // The VM runs but its daemon has not come online
+                            // (booting, or dedmeshd died inside): distinguish
+                            // this from a plain offline host.
+                            Text("Lima: Running")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                         Spacer(minLength: 0)
                     }
                     .contentShape(Rectangle())
@@ -471,7 +689,10 @@ private struct WorkstationGroup: View {
             .padding(.leading, 2)
             // Attached to the row, NOT inside the .disabled buttons: the color
             // is console state, so an offline workstation's row keeps its menu.
-            .contextMenu { colorMenu }
+            .contextMenu {
+                colorMenu
+                limaMenu
+            }
 
             if isExpanded && workstation.online {
                 ForEach(sessions) { session in
@@ -517,6 +738,33 @@ private struct WorkstationGroup: View {
                 onSetColor(nil)
             } label: {
                 Text(workstation.color == nil ? "✓ Default" : "Default")
+            }
+        }
+    }
+
+    /// The Lima section of the row menu: VM lifecycle for merged rows, the
+    /// orphan console revoke for console-only owned rows. Destructive and
+    /// state-changing actions vanish while an op is in flight.
+    @ViewBuilder private var limaMenu: some View {
+        if let lima {
+            Divider()
+            if limaOp?.isInFlight != true {
+                if lima.isRunning {
+                    Button("Stop VM") { onLimaAction(.stop) }
+                } else {
+                    Button("Start VM") { onLimaAction(.start) }
+                }
+                Button("Delete Workstation…", role: .destructive) {
+                    onLimaAction(.delete)
+                }
+            }
+            if case .failed = limaOp {
+                Button("Dismiss Error") { onLimaAction(.dismissError) }
+            }
+        } else if offersConsoleRevoke, limaOp?.isInFlight != true {
+            Divider()
+            Button("Remove from Console…", role: .destructive) {
+                onLimaAction(.revokeConsole)
             }
         }
     }
@@ -588,5 +836,175 @@ private struct SessionRow: View {
             Divider()
             Button("Kill Session", role: .destructive) { onKill() }
         }
+    }
+}
+
+/// A Lima VM the console does not (yet) list as a workstation: created but
+/// not enrolled, still booting, or enrolled under a name the console has
+/// since revoked. Hollow dot — there is no daemon whose online/error state
+/// the filled dot could report.
+private struct LimaVMRow: View {
+    let vm: HauntedLimaInstance
+    let op: HauntedLimaModel.Op?
+    let onAction: (HauntedLimaAction) -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .strokeBorder(Color.secondary.opacity(0.6), lineWidth: 1.5)
+                .frame(width: 8, height: 8)
+            Text(vm.name)
+                .fontWeight(.medium)
+                .lineLimit(1)
+                .foregroundStyle(.secondary)
+            if let op, op.isInFlight {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.55)
+                    .frame(width: 10, height: 10)
+                Text(op.label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if case .failed(let message) = op {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.yellow)
+                    .help(message)
+            }
+            Spacer(minLength: 0)
+            Text(op?.isInFlight == true ? "" : vm.status)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+        .padding(.leading, 24)
+        .padding(.trailing, 6)
+        .contentShape(Rectangle())
+        .help("Lima VM \(vm.name) (\(vm.status)) — not a workstation yet")
+        .contextMenu {
+            if op?.isInFlight != true {
+                if vm.isRunning {
+                    Button("Stop VM") { onAction(.stop) }
+                    Button("Enroll as Workstation") { onAction(.enroll) }
+                } else {
+                    Button("Start VM") { onAction(.start) }
+                }
+                Divider()
+                Button("Delete VM…", role: .destructive) { onAction(.delete) }
+            }
+            if case .failed = op {
+                Button("Dismiss Error") { onAction(.dismissError) }
+            }
+        }
+    }
+}
+
+/// The "New workstation…" form: a name under the daemon grammar, explicitly
+/// chosen exposed directories (none by default — a workstation exports a
+/// shell over the mesh, so every mount is an explicit decision), and sizing.
+private struct LimaCreateSheet: View {
+    let existingNames: Set<String>
+    let onCreate: (HauntedLimaVMSpec) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var cpus = 2
+    @State private var memoryGiB = 2
+    @State private var mounts: [MountDraft] = []
+
+    struct MountDraft: Identifiable {
+        let id = UUID()
+        let path: String
+        var writable: Bool
+    }
+
+    private var nameError: String? {
+        if name.isEmpty { return nil }
+        if !isValidWorkstationName(name) {
+            return "lowercase letters and digits, inner hyphens, max 32"
+        }
+        if existingNames.contains(name) {
+            return "a VM or workstation with this name already exists"
+        }
+        return nil
+    }
+
+    private var canCreate: Bool { !name.isEmpty && nameError == nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("New workstation")
+                .font(.headline)
+
+            TextField("Name (e.g. ws1)", text: $name)
+                .textFieldStyle(.roundedBorder)
+            if let nameError {
+                Text(nameError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            Stepper("CPUs: \(cpus)", value: $cpus, in: 1...16)
+            Stepper("Memory: \(memoryGiB) GiB", value: $memoryGiB, in: 1...64)
+
+            Divider()
+
+            Text("Exposed directories")
+                .font(.subheadline)
+            Text("The VM sees nothing from this Mac unless you add it here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach($mounts) { $mount in
+                HStack(spacing: 6) {
+                    Text(mount.path)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer(minLength: 4)
+                    Toggle("writable", isOn: $mount.writable)
+                        .font(.caption)
+                        .toggleStyle(.checkbox)
+                    Button {
+                        mounts.removeAll { $0.id == mount.id }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Remove this directory")
+                }
+            }
+            Button("Add directory…") { addMount() }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create") {
+                    onCreate(HauntedLimaVMSpec(
+                        name: name, cpus: cpus, memoryGiB: memoryGiB,
+                        mounts: mounts.map {
+                            HauntedLimaMount(path: $0.path, writable: $0.writable)
+                        }))
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canCreate)
+            }
+        }
+        .padding(16)
+        .frame(width: 380)
+    }
+
+    private func addMount() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Expose"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard !mounts.contains(where: { $0.path == url.path }) else { return }
+        mounts.append(MountDraft(path: url.path, writable: false))
     }
 }
