@@ -86,8 +86,13 @@ struct HauntedSidebarRow: Identifiable, Equatable {
     /// Lima affordance on console rows.
     let owned: Bool
 
+    /// What the sidebar shows and what keys the Lima ops: the console daemon
+    /// name with the caller's own "<username>-" prefix stripped — which is
+    /// also the local VM name. Console names stay prefixed (collision-free
+    /// across accounts); Haunted displays the bare name.
+    let displayName: String
+
     var id: String { workstation?.id ?? "lima:\(lima?.name ?? "")" }
-    var daemonName: String { workstation?.daemon ?? lima?.name ?? "" }
 }
 
 /// The Lima operations a sidebar row can request; the view dispatches them to
@@ -118,19 +123,26 @@ enum HauntedSidebarMerge {
         var claimed = Set<String>()
         for workstation in workstations {
             let owned = username.map { workstation.target.hasPrefix($0 + "/") } ?? false
-            let vm = owned ? lima.first { $0.name == workstation.daemon } : nil
+            // Console daemon names carry the "<username>-" prefix; the local
+            // VM (and the display) use the bare name — join on that.
+            let display = owned
+                ? workstationDisplayName(daemon: workstation.daemon, username: username)
+                : workstation.daemon
+            let vm = owned ? lima.first { $0.name == display } : nil
             if let vm { claimed.insert(vm.name) }
-            // Ops key by VM/daemon name; an unowned row must not pick up an
+            // Ops key by VM/display name; an unowned row must not pick up an
             // op that belongs to a same-named LOCAL VM (its own separate row).
             rows.append(HauntedSidebarRow(
                 workstation: workstation, lima: vm,
-                op: owned ? ops[workstation.daemon] : nil, owned: owned))
+                op: owned ? ops[display] : nil, owned: owned,
+                displayName: display))
         }
         for vm in lima where !claimed.contains(vm.name) {
             rows.append(HauntedSidebarRow(
-                workstation: nil, lima: vm, op: ops[vm.name], owned: true))
+                workstation: nil, lima: vm, op: ops[vm.name], owned: true,
+                displayName: vm.name))
         }
-        return rows.sorted { $0.daemonName < $1.daemonName }
+        return rows.sorted { $0.displayName < $1.displayName }
     }
 }
 
@@ -373,11 +385,9 @@ struct HauntedSidebarView: View {
     @ObservedObject private var limaModel = HauntedLimaModel.shared
     @State private var showCreateSheet = false
 
-    /// The signed-in username from the client certificate CN
-    /// ("username/client-name") — the merge's cross-user guard.
-    private var username: String? {
-        identity.certIdentity?.components(separatedBy: "/").first
-    }
+    /// The signed-in username (certificate CN) — the merge's cross-user guard
+    /// and the display-name prefix stripper.
+    private var username: String? { identity.username }
 
     private var mergedRows: [HauntedSidebarRow] {
         HauntedSidebarMerge.mergeRows(
@@ -477,6 +487,7 @@ struct HauntedSidebarView: View {
                         if let workstation = row.workstation {
                             WorkstationGroup(
                                 workstation: workstation,
+                                displayName: row.displayName,
                                 sessions: model.sessionsByTarget[workstation.id] ?? [],
                                 isExpanded: model.expanded.contains(workstation.id),
                                 lima: row.lima,
@@ -500,11 +511,11 @@ struct HauntedSidebarView: View {
                                 onSetColor: {
                                     model.setColor(workstation: workstation, color: $0)
                                 },
-                                onLimaAction: { handleLima($0, name: row.daemonName) })
+                                onLimaAction: { handleLima($0, row: row) })
                         } else if let vm = row.lima {
                             LimaVMRow(
                                 vm: vm, op: row.op,
-                                onAction: { handleLima($0, name: vm.name) })
+                                onAction: { handleLima($0, row: row) })
                         }
                     }
 
@@ -551,15 +562,23 @@ struct HauntedSidebarView: View {
         }
         .sheet(isPresented: $showCreateSheet) {
             LimaCreateSheet(
+                // Uniqueness is checked against the BARE names the sheet
+                // deals in: local VM names plus console daemons with the
+                // user's prefix stripped.
                 existingNames: Set(limaModel.instances.map(\.name))
-                    .union(model.workstations.map(\.daemon)),
+                    .union(model.workstations.map {
+                        workstationDisplayName(daemon: $0.daemon, username: username)
+                    }),
                 onCreate: { spec in
                     limaModel.createAndEnroll(spec: spec, identity: identity)
                 })
         }
     }
 
-    private func handleLima(_ action: HauntedLimaAction, name: String) {
+    private func handleLima(_ action: HauntedLimaAction, row: HauntedSidebarRow) {
+        // Lima ops key by the local VM / display name; the console revoke
+        // needs the FULL stored daemon name from the console ref.
+        let name = row.displayName
         switch action {
         case .start:
             limaModel.start(name: name)
@@ -575,9 +594,12 @@ struct HauntedSidebarView: View {
                     + "be undone.",
                 button: "Delete"
             ) {
-                limaModel.delete(name: name, identity: identity)
+                limaModel.delete(name: name,
+                                 consoleDaemon: row.workstation?.daemon,
+                                 identity: identity)
             }
         case .revokeConsole:
+            guard let daemon = row.workstation?.daemon else { return }
             confirm(
                 "Remove “\(name)” from the Console?",
                 detail: "The daemon and everything it published are deleted; "
@@ -585,7 +607,7 @@ struct HauntedSidebarView: View {
                     + "remove.",
                 button: "Remove"
             ) {
-                limaModel.revokeConsole(name: name, identity: identity)
+                limaModel.revokeConsole(name: name, daemon: daemon, identity: identity)
             }
         case .dismissError:
             limaModel.clearFailure(name: name)
@@ -611,6 +633,9 @@ struct HauntedSidebarView: View {
 
 private struct WorkstationGroup: View {
     let workstation: HauntedWorkstation
+    /// The name the row shows: the console daemon name with the user's own
+    /// "<username>-" prefix stripped (console names stay prefixed).
+    let displayName: String
     let sessions: [HauntedWorkstationSession]
     let isExpanded: Bool
     /// The local Lima VM backing this workstation (merged by name), if any.
@@ -649,7 +674,7 @@ private struct WorkstationGroup: View {
                         Circle()
                             .fill(statusColor)
                             .frame(width: 8, height: 8)
-                        Text(workstation.daemon)
+                        Text(displayName)
                             .fontWeight(.medium)
                             .lineLimit(1)
                             .foregroundStyle(nameColor)
@@ -687,7 +712,7 @@ private struct WorkstationGroup: View {
                 .buttonStyle(.plain)
                 .onHover { hovering = $0 }
                 .help(workstation.online
-                      ? "Open a terminal on \(workstation.daemon) (its persistent default session)"
+                      ? "Open a terminal on \(displayName) (its persistent default session)"
                       : workstation.error ?? "\(workstation.target) (\(workstation.status))")
                 .disabled(!workstation.online)
             }
@@ -965,7 +990,7 @@ private struct LimaCreateSheet: View {
     private var nameError: String? {
         if name.isEmpty { return nil }
         if !isValidWorkstationName(name) {
-            return "lowercase letters and digits, inner hyphens, max 32"
+            return "a-z, 0-9, - and _, starting with a letter or digit, max 32"
         }
         if existingNames.contains(name) {
             return "a VM or workstation with this name already exists"

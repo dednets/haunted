@@ -649,8 +649,8 @@ token + the pinned CA's fingerprint), delete (VM + console revoke). No
 | ID | Case | Expect |
 |---|---|---|
 | LIMA-01 | `decodeInstances` array + JSONL shapes | both decode; garbage lines skipped, hostile names dropped, missing status → "Unknown" |
-| LIMA-02 | workstation-name + join-token grammars | byte-strict mirrors of `names.ValidateName` / `store.newToken` |
-| LIMA-03/04 | command builders | exact strings, every operand quoted; the enroll command mirrors `deploy/lima/workstation-setup.sh` verbatim and refuses every non-grammar operand before spawning |
+| LIMA-02 | workstation-name + join-token grammars | byte-strict mirrors of `names.ValidateHostName` (`[a-z0-9][a-z0-9_-]*`, max 32) / `store.newToken`; daemon grammar (`isValidDaemonName`) takes the username-prefixed form and `workstationDisplayName` strips only the caller's own prefix |
+| LIMA-03/04 | command builders | exact strings, every operand quoted; the enroll command mirrors `deploy/lima/workstation-setup.sh` verbatim (`limactl shell <vm>` with `--name <user>-<vm>` from the mint reply — the console owns the derivation; the enrolled-probe globs `*.toml`, so no local derivation) and refuses every non-grammar operand before spawning |
 | LIMA-05 | `vmYAML` | sizing, `mounts: []` when empty, per-mount `writable`, the keep-in-sync pointer to deploy/lima/workstation.yaml, hostile mount paths refused |
 | LIMA-06 | `caFingerprint` | sha256 over the FIRST PEM block's DER (what `--ca-fingerprint` verifies); chains pin the leaf; garbage → nil |
 | LIMA-07/08 | `detectLimactl` / `installBase` | PATH-fallback reads as not-installed; login-flow URL wins, else https on the control host |
@@ -658,10 +658,10 @@ token + the pinned CA's fingerprint), delete (VM + console revoke). No
 | LIMOD-01 | `createAndEnroll` | create → start → probe → mint → enroll, in order (one FakeProcessRunner timeline); yaml written under Application Support |
 | LIMOD-02 | already-enrolled VM | probe short-circuits: no token minted, no install run |
 | LIMOD-03 | a stage throws | `.failed(message)`, later stages never run, badge dismissible |
-| LIMOD-04 | delete | stop → `delete --force` → console revoke in order; revoke failure downgraded to a warning (the orphan row offers manual revoke); VM-delete failure is real and skips the revoke |
+| LIMOD-04 | delete | stop → `delete --force` (bare VM name) → console revoke of the FULL stored daemon name from the console ref, in order; revoke failure downgraded to a warning (the orphan row offers manual revoke); VM-delete failure is real and skips the revoke; a never-enrolled VM skips the revoke entirely |
 | LIMOD-05 | refresh | `available` tracks limactl presence; instances survive a failed list |
 | LIMOD-06 | busy guard | one op per VM at a time |
-| MERGE-01…07 | `HauntedSidebarMerge.mergeRows` | merged / console-only / Lima-only rows; ops ride the owning row; cross-user and nil-username never merge; the VM claims only the OWNED console row; sorted by daemon name |
+| MERGE-01…07 | `HauntedSidebarMerge.mergeRows` | merged / console-only / Lima-only rows joined on the DISPLAY name (console daemons are username-prefixed, the sidebar strips the caller's own prefix; legacy unprefixed names pass through); ops ride the owning row; cross-user and nil-username never merge (and a foreign prefix is never stripped); the VM claims only the OWNED console row; sorted by display name |
 
 ## 5. Refactors required (the actual blocker)
 

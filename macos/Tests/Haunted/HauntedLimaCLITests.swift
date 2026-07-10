@@ -61,16 +61,19 @@ struct HauntedLimaCLITests {
 
     // MARK: LIMA-02 — the name grammar (mirror of names.ValidateName)
 
-    @Test("LIMA-02: workstation-name grammar", arguments: [
+    @Test("LIMA-02: workstation-name grammar (a-z, 0-9, - and _; leading alnum)", arguments: [
         ("ws1", true),
         ("a", true),
         ("my-box-2", true),
+        ("ws_9", true),
+        ("dev_box-2", true),
+        ("a_", true),
+        ("ws-", true),
         (String(repeating: "a", count: 32), true),
         ("", false),
         ("-ws", false),
-        ("ws-", false),
+        ("_ws", false),
         ("WS1", false),
-        ("ws_1", false),
         ("ws.1", false),
         ("ws 1", false),
         (String(repeating: "a", count: 33), false),
@@ -78,6 +81,24 @@ struct HauntedLimaCLITests {
     ])
     func nameGrammar(name: String, valid: Bool) {
         #expect(isValidWorkstationName(name) == valid)
+    }
+
+    @Test("LIMA-02c: daemon-name grammar takes the prefixed form; display strips it")
+    func daemonNamesAndDisplay() {
+        #expect(isValidDaemonName("luiz-ws_9"))
+        #expect(isValidDaemonName("homelab"))
+        #expect(isValidDaemonName(String(repeating: "a", count: 65)))
+        #expect(!isValidDaemonName(String(repeating: "a", count: 66)))
+        #expect(!isValidDaemonName("-x"))
+        #expect(!isValidDaemonName("Luiz-ws"))
+
+        // Own prefix strips; legacy and foreign names pass through.
+        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: "luiz") == "ws_9")
+        #expect(workstationDisplayName(daemon: "homelab", username: "luiz") == "homelab")
+        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: "bob") == "luiz-ws_9")
+        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: nil) == "luiz-ws_9")
+        // A pathological bare "<username>-" never strips to empty.
+        #expect(workstationDisplayName(daemon: "luiz-", username: "luiz") == "luiz-")
     }
 
     @Test("LIMA-02b: join-token grammar", arguments: [
@@ -108,29 +129,36 @@ struct HauntedLimaCLITests {
             == "'/opt/homebrew/bin/limactl' stop 'ws9'")
         #expect(HauntedLimaCLI.deleteCommand(limactl: limactl, name: "ws9")
             == "'/opt/homebrew/bin/limactl' delete --force 'ws9'")
-        // $HOME must survive to the VM shell — escaped, not host-expanded.
-        #expect(HauntedLimaCLI.enrolledProbeCommand(limactl: limactl, name: "ws9")
-            == "'/opt/homebrew/bin/limactl' shell 'ws9' -- sh -c 'test -f \"$HOME/.config/dedmesh/ws9.toml\"'")
+        // $HOME must survive to the VM shell — escaped, not host-expanded. A
+        // glob, because the config file is named after the console-derived
+        // daemon name (or a legacy bare name) and ANY config means enrolled.
+        #expect(HauntedLimaCLI.enrolledProbeCommand(limactl: limactl, vm: "ws9")
+            == "'/opt/homebrew/bin/limactl' shell 'ws9' -- sh -c 'ls \"$HOME/.config/dedmesh/\"*.toml >/dev/null 2>&1'")
     }
 
     @Test("LIMA-04: the enroll command mirrors workstation-setup.sh exactly")
     func enrollCommand() throws {
         let fingerprint = String(repeating: "ab", count: 32)
+        // The VM keeps the bare name; --name is the console-derived
+        // username-prefixed daemon name from the mint reply.
         let command = try HauntedLimaCLI.enrollCommand(
-            limactl: "/opt/homebrew/bin/limactl", name: "ws9",
-            installBase: "https://console.example.com",
-            control: "console.example.com:9443",
-            token: "dn_0123abcd", fingerprint: fingerprint)
+            limactl: "/opt/homebrew/bin/limactl",
+            spec: HauntedLimaCLI.EnrollSpec(
+                vm: "ws9", daemon: "luiz-ws9",
+                installBase: "https://console.example.com",
+                control: "console.example.com:9443",
+                token: "dn_0123abcd", fingerprint: fingerprint))
         #expect(command == "'/opt/homebrew/bin/limactl' shell 'ws9' -- sh -c "
             + "'curl -fsSL '\\''https://console.example.com/install.sh'\\'' | sh -s -- "
             + "--console '\\''console.example.com:9443'\\'' --token '\\''dn_0123abcd'\\'' "
-            + "--name '\\''ws9'\\'' --ca-fingerprint '\\''sha256:\(fingerprint)'\\'' --workstation'")
+            + "--name '\\''luiz-ws9'\\'' --ca-fingerprint '\\''sha256:\(fingerprint)'\\'' --workstation'")
     }
 
     /// One bad operand per case; everything else stays valid so the refusal
     /// is attributable.
     struct EnrollOperands: Sendable {
-        var name = "ws9"
+        var vm = "ws9"
+        var daemon = "luiz-ws9"
         var base = "https://c.example.com"
         var control = "c.example.com:9443"
         var token = "dn_01"
@@ -139,7 +167,9 @@ struct HauntedLimaCLITests {
 
     @Test("LIMA-04b: the enroll builder refuses every non-grammar operand", arguments: [
         EnrollOperands(token: "bad-token"),
-        EnrollOperands(name: "WS9"),
+        EnrollOperands(vm: "WS9"),
+        EnrollOperands(daemon: "Luiz-ws9"),
+        EnrollOperands(daemon: "-evil"),
         EnrollOperands(base: "https://c'.example.com"),
         EnrollOperands(control: "c.example.com:9443 --evil"),
         EnrollOperands(fingerprint: "zz"),
@@ -147,9 +177,11 @@ struct HauntedLimaCLITests {
     func enrollCommandRejects(operands: EnrollOperands) {
         #expect(throws: HauntedCLIError.self) {
             _ = try HauntedLimaCLI.enrollCommand(
-                limactl: "/x/limactl", name: operands.name,
-                installBase: operands.base, control: operands.control,
-                token: operands.token, fingerprint: operands.fingerprint)
+                limactl: "/x/limactl",
+                spec: HauntedLimaCLI.EnrollSpec(
+                    vm: operands.vm, daemon: operands.daemon,
+                    installBase: operands.base, control: operands.control,
+                    token: operands.token, fingerprint: operands.fingerprint))
         }
     }
 
@@ -258,18 +290,28 @@ struct HauntedLimaCLITests {
         let ctl = fs.homeDirectory.path + "/.local/bin/dedmeshctl"
         fs.executables = [ctl]
 
-        let good = FakeProcessRunner { _ in Data(#"{"token":"dn_00ff"}"#.utf8) }
-        let token = try await HauntedCLI.mintWorkstationToken(
-            identity: Self.identity, daemon: "ws9", runner: good, fs: fs)
-        #expect(token == "dn_00ff")
+        let good = FakeProcessRunner { _ in
+            Data(#"{"token":"dn_00ff","daemon":"luiz-ws9"}"#.utf8)
+        }
+        let minted = try await HauntedCLI.mintWorkstationToken(
+            identity: Self.identity, workstation: "ws9", runner: good, fs: fs)
+        #expect(minted.token == "dn_00ff")
+        #expect(minted.daemon == "luiz-ws9")
         #expect(good.invocations.compactMap(\.command)
             == ["'\(ctl)' workstation token 'ws9' -json -state-dir '/state'"])
 
-        // A malformed token from the (remote-controlled) reply never escapes.
-        let evil = FakeProcessRunner { _ in Data(#"{"token":"dn_x'; rm -rf ~"}"#.utf8) }
-        await #expect(throws: HauntedCLIError.self) {
-            _ = try await HauntedCLI.mintWorkstationToken(
-                identity: Self.identity, daemon: "ws9", runner: evil, fs: fs)
+        // A malformed token or daemon name in the (remote-controlled) reply
+        // never escapes into an argv.
+        for reply in [
+            #"{"token":"dn_x'; rm -rf ~","daemon":"luiz-ws9"}"#,
+            #"{"token":"dn_00ff","daemon":"luiz-ws9'; rm -rf ~"}"#,
+            #"{"token":"dn_00ff"}"#,
+        ] {
+            let evil = FakeProcessRunner { _ in Data(reply.utf8) }
+            await #expect(throws: HauntedCLIError.self, "\(reply) must be refused") {
+                _ = try await HauntedCLI.mintWorkstationToken(
+                    identity: Self.identity, workstation: "ws9", runner: evil, fs: fs)
+            }
         }
     }
 

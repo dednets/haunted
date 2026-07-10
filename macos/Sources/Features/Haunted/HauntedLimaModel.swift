@@ -127,10 +127,12 @@ final class HauntedLimaModel: ObservableObject {
     }
 
     /// Delete = stop (best effort — the VM may already be stopped) → `limactl
-    /// delete --force` → console revoke. A failed revoke is downgraded to a
+    /// delete --force` → console revoke of `consoleDaemon` (the FULL stored
+    /// daemon name from the merged console ref; nil = the VM never enrolled,
+    /// so there is nothing to revoke). A failed revoke is downgraded to a
     /// warning rather than failing the delete: the VM is gone either way, and
     /// the orphaned console row offers manual revoke from its own menu.
-    func delete(name: String, identity: HauntedClientIdentity) {
+    func delete(name: String, consoleDaemon: String?, identity: HauntedClientIdentity) {
         guard let limactl, !isBusy(name) else { return }
         ops[name] = .deleting
         Task { [weak self] in
@@ -138,15 +140,17 @@ final class HauntedLimaModel: ObservableObject {
             do {
                 try? await HauntedLimaCLI.stop(env: self.env, limactl: limactl, name: name)
                 try await HauntedLimaCLI.delete(env: self.env, limactl: limactl, name: name)
-                do {
-                    try await HauntedCLI.revokeWorkstation(
-                        identity: identity, daemon: name,
-                        runner: self.env.runner, fs: self.env.fs)
-                } catch {
-                    self.warningMessage =
-                        "\(name): VM deleted, but the console revoke failed "
-                        + "(\(error.localizedDescription)) — remove it from the "
-                        + "console via the row's menu"
+                if let consoleDaemon {
+                    do {
+                        try await HauntedCLI.revokeWorkstation(
+                            identity: identity, daemon: consoleDaemon,
+                            runner: self.env.runner, fs: self.env.fs)
+                    } catch {
+                        self.warningMessage =
+                            "\(name): VM deleted, but the console revoke failed "
+                            + "(\(error.localizedDescription)) — remove it from the "
+                            + "console via the row's menu"
+                    }
                 }
                 self.ops[name] = nil
             } catch {
@@ -157,15 +161,16 @@ final class HauntedLimaModel: ObservableObject {
     }
 
     /// Manual console revoke for an orphan row (console knows the daemon, no
-    /// local VM backs it).
-    func revokeConsole(name: String, identity: HauntedClientIdentity) {
+    /// local VM backs it). `name` keys the op (the row's display name);
+    /// `daemon` is the full stored daemon name.
+    func revokeConsole(name: String, daemon: String, identity: HauntedClientIdentity) {
         guard !isBusy(name) else { return }
         ops[name] = .deleting
         Task { [weak self] in
             guard let self else { return }
             do {
                 try await HauntedCLI.revokeWorkstation(
-                    identity: identity, daemon: name,
+                    identity: identity, daemon: daemon,
                     runner: self.env.runner, fs: self.env.fs)
                 self.ops[name] = nil
             } catch {
@@ -184,12 +189,14 @@ final class HauntedLimaModel: ObservableObject {
     private func enrollIfNeeded(
         limactl: String, name: String, identity: HauntedClientIdentity
     ) async throws {
-        if await HauntedLimaCLI.isEnrolled(env: env, limactl: limactl, name: name) {
+        if await HauntedLimaCLI.isEnrolled(env: env, limactl: limactl, vm: name) {
             return // already bootstrapped; a re-enroll would burn a token
         }
         ops[name] = .enrolling
+        // The console derives the daemon name ("<username>-<vm>") at mint time
+        // and the enroll passes it straight through — no local derivation.
         try await HauntedLimaCLI.enroll(
-            env: env, limactl: limactl, name: name,
+            env: env, limactl: limactl, vm: name,
             identity: identity, defaults: defaults)
     }
 

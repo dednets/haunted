@@ -32,20 +32,46 @@ struct HauntedLimaVMSpec: Equatable {
     var mounts: [HauntedLimaMount] = []
 }
 
-/// Workstation (daemon) names as the console defines them — the Swift port of
-/// `names.ValidateName` (`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`). Used to drop
-/// hostile `limactl list` entries at the decode boundary and as the create
-/// sheet's live validator: a VM named outside this grammar could never enroll
-/// as a daemon anyway.
+private func isWorkstationNameByte(_ byte: UInt8, leading: Bool) -> Bool {
+    let alnum = (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
+        || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+    if leading { return alnum }
+    return alnum || byte == UInt8(ascii: "-") || byte == UInt8(ascii: "_")
+}
+
+/// Workstation names as the user types them — the Swift port of
+/// `names.ValidateWorkstationName` (`^[a-z0-9][a-z0-9_-]{0,31}$`; a leading
+/// `-` would read as a CLI flag). Used to drop hostile `limactl list` entries
+/// at the decode boundary and as the create sheet's live validator; the
+/// console enforces the identical grammar at mint time.
 func isValidWorkstationName(_ value: String) -> Bool {
     let bytes = Array(value.utf8)
     guard !bytes.isEmpty, bytes.count <= 32 else { return false }
-    func isAlnum(_ byte: UInt8) -> Bool {
-        (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
-            || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+    return bytes.enumerated().allSatisfy {
+        isWorkstationNameByte($0.element, leading: $0.offset == 0)
     }
-    guard isAlnum(bytes[0]), isAlnum(bytes[bytes.count - 1]) else { return false }
-    return bytes.allSatisfy { isAlnum($0) || $0 == UInt8(ascii: "-") }
+}
+
+/// Console daemon names — the Swift port of `names.ValidateDaemonName`
+/// (`^[a-z0-9][a-z0-9_-]{0,64}$`): wide enough for the username-prefixed
+/// workstation form. The mint reply's daemon name is remote JSON headed into
+/// an argv, so it is re-checked against this before use.
+func isValidDaemonName(_ value: String) -> Bool {
+    let bytes = Array(value.utf8)
+    guard !bytes.isEmpty, bytes.count <= 65 else { return false }
+    return bytes.enumerated().allSatisfy {
+        isWorkstationNameByte($0.element, leading: $0.offset == 0)
+    }
+}
+
+/// The sidebar-facing name of a console daemon: the caller's own
+/// "<username>-" prefix stripped; legacy unprefixed names (and other users'
+/// daemons) pass through unchanged. Usernames contain no hyphens, so the
+/// prefix is unambiguous.
+func workstationDisplayName(daemon: String, username: String?) -> String {
+    guard let username, daemon.hasPrefix(username + "-") else { return daemon }
+    let stripped = String(daemon.dropFirst(username.count + 1))
+    return stripped.isEmpty ? daemon : stripped
 }
 
 /// Shells out to `limactl` to manage local workstation VMs. Same posture as
@@ -132,12 +158,15 @@ enum HauntedLimaCLI {
         "\(HauntedCLI.quote(limactl)) delete --force \(HauntedCLI.quote(name))"
     }
 
-    /// The "is dedmeshd already set up in this VM" probe, mirroring
-    /// deploy/lima/workstation-setup.sh: the config file `dedmeshd setup`
-    /// writes. $HOME is escaped so it expands inside the VM, not on the host.
-    static func enrolledProbeCommand(limactl: String, name: String) -> String {
-        let inner = "test -f \"$HOME/.config/dedmesh/\(name).toml\""
-        return "\(HauntedCLI.quote(limactl)) shell \(HauntedCLI.quote(name)) -- sh -c \(HauntedCLI.quote(inner))"
+    /// The "is dedmeshd already set up in this VM" probe: ANY dedmesh config
+    /// file means enrolled — one VM hosts exactly one daemon by design, and
+    /// the file is named after the daemon name (username-prefixed for new
+    /// enrolls, bare on legacy VMs), which only the console knows
+    /// authoritatively. A glob sidesteps deriving it locally. $HOME is
+    /// escaped so it expands inside the VM, not on the host.
+    static func enrolledProbeCommand(limactl: String, vm: String) -> String {
+        let inner = "ls \"$HOME/.config/dedmesh/\"*.toml >/dev/null 2>&1"
+        return "\(HauntedCLI.quote(limactl)) shell \(HauntedCLI.quote(vm)) -- sh -c \(HauntedCLI.quote(inner))"
     }
 
     /// A value that is about to be interpolated into a single-quoted region of
@@ -148,36 +177,48 @@ enum HauntedLimaCLI {
         return !value.contains(where: \.isWhitespace)
     }
 
+    /// Everything the in-VM enrollment interpolates. `vm` is the local Lima
+    /// name (bare); `daemon` is the console-derived username-prefixed name
+    /// the host enrolls as (--name).
+    struct EnrollSpec {
+        let vm: String
+        let daemon: String
+        let installBase: String
+        let control: String
+        let token: String
+        let fingerprint: String
+    }
+
     /// The in-VM enrollment, mirroring deploy/lima/workstation-setup.sh: pipe
     /// the console's install.sh into sh with the join token, so the VM ends up
     /// with its own dedmeshd + haunted-daemon and `[workstation] managed`.
     /// Every interpolated value is validated against the exact grammar the
     /// other side defines; the fingerprint pins the CA this client already
     /// trusts, so the VM can only enroll against OUR console.
-    static func enrollCommand(
-        limactl: String, name: String,
-        installBase: String, control: String,
-        token: String, fingerprint: String
-    ) throws -> String {
-        guard isValidWorkstationName(name) else {
+    static func enrollCommand(limactl: String, spec: EnrollSpec) throws -> String {
+        guard isValidWorkstationName(spec.vm) else {
             throw HauntedCLIError(message: "invalid workstation name")
         }
-        guard isValidJoinToken(token) else {
+        guard isValidDaemonName(spec.daemon) else {
+            throw HauntedCLIError(message: "invalid daemon name")
+        }
+        guard isValidJoinToken(spec.token) else {
             throw HauntedCLIError(message: "malformed join token")
         }
-        guard isSafeSingleQuotedValue(installBase), isSafeSingleQuotedValue(control) else {
+        guard isSafeSingleQuotedValue(spec.installBase),
+              isSafeSingleQuotedValue(spec.control) else {
             throw HauntedCLIError(message: "invalid console address")
         }
-        guard fingerprint.utf8.count == 64, fingerprint.utf8.allSatisfy({ byte in
+        guard spec.fingerprint.utf8.count == 64, spec.fingerprint.utf8.allSatisfy({ byte in
             (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
                 || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
         }) else {
             throw HauntedCLIError(message: "invalid CA fingerprint")
         }
-        let inner = "curl -fsSL '\(installBase)/install.sh' | sh -s -- "
-            + "--console '\(control)' --token '\(token)' --name '\(name)' "
-            + "--ca-fingerprint 'sha256:\(fingerprint)' --workstation"
-        return "\(HauntedCLI.quote(limactl)) shell \(HauntedCLI.quote(name)) -- sh -c \(HauntedCLI.quote(inner))"
+        let inner = "curl -fsSL '\(spec.installBase)/install.sh' | sh -s -- "
+            + "--console '\(spec.control)' --token '\(spec.token)' --name '\(spec.daemon)' "
+            + "--ca-fingerprint 'sha256:\(spec.fingerprint)' --workstation"
+        return "\(HauntedCLI.quote(limactl)) shell \(HauntedCLI.quote(spec.vm)) -- sh -c \(HauntedCLI.quote(inner))"
     }
 
     // MARK: VM definition
@@ -313,13 +354,13 @@ enum HauntedLimaCLI {
         decodeInstances(try await env.runner.run(listCommand(limactl: limactl)))
     }
 
-    /// True when the VM already holds a dedmeshd config for its own name (the
+    /// True when the VM already holds a dedmeshd config (the
     /// workstation-setup.sh idempotence probe): enrolling again would burn a
     /// token and re-run installs for nothing.
-    static func isEnrolled(env: Environment, limactl: String, name: String) async -> Bool {
-        guard isValidWorkstationName(name) else { return false }
+    static func isEnrolled(env: Environment, limactl: String, vm: String) async -> Bool {
+        guard isValidWorkstationName(vm) else { return false }
         return (try? await env.runner.run(
-            enrolledProbeCommand(limactl: limactl, name: name))) != nil
+            enrolledProbeCommand(limactl: limactl, vm: vm))) != nil
     }
 
     /// Writes the VM definition under Application Support (the attach-loop.sh
@@ -360,11 +401,12 @@ enum HauntedLimaCLI {
     }
 
     /// Enrolls the VM as a workstation: mint a join token over the mesh (the
-    /// client identity is the credential), pin the CA we already trust, and
-    /// run the console's install.sh inside the VM — the exact flow of
+    /// client identity is the credential; the console derives and returns the
+    /// username-prefixed daemon name), pin the CA we already trust, and run
+    /// the console's install.sh inside the VM — the exact flow of
     /// deploy/lima/workstation-setup.sh, minus the admin API.
     static func enroll(
-        env: Environment, limactl: String, name: String,
+        env: Environment, limactl: String, vm: String,
         identity: HauntedClientIdentity, defaults: UserDefaults = .standard
     ) async throws {
         guard let control = identity.console else {
@@ -378,11 +420,11 @@ enum HauntedLimaCLI {
               let fingerprint = caFingerprint(pem: pem) else {
             throw HauntedCLIError(message: "cannot fingerprint the pinned console CA")
         }
-        let token = try await HauntedCLI.mintWorkstationToken(
-            identity: identity, daemon: name, runner: env.runner, fs: env.fs)
-        let command = try enrollCommand(
-            limactl: limactl, name: name, installBase: base,
-            control: control, token: token, fingerprint: fingerprint)
+        let minted = try await HauntedCLI.mintWorkstationToken(
+            identity: identity, workstation: vm, runner: env.runner, fs: env.fs)
+        let command = try enrollCommand(limactl: limactl, spec: EnrollSpec(
+            vm: vm, daemon: minted.daemon, installBase: base,
+            control: control, token: minted.token, fingerprint: fingerprint))
         _ = try await env.longRunner.run(command)
     }
 }

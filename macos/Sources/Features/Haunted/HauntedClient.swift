@@ -207,6 +207,12 @@ extension HauntedClientIdentity {
     /// the result yields either the leaf alone (when its DER length happens to
     /// be a multiple of 3) or, more often, invalid DER — and the sidebar
     /// silently drops the identity line. The leaf is always first.
+    /// The signed-in username: the certificate CN's first component
+    /// ("username/client-name"). Nil when the cert is unreadable.
+    var username: String? {
+        certIdentity?.components(separatedBy: "/").first
+    }
+
     var certIdentity: String? {
         let certFile = stateDir.appendingPathComponent("cert.pem")
         guard let pem = try? String(contentsOf: certFile, encoding: .utf8) else {
@@ -500,28 +506,33 @@ enum HauntedCLI {
             "\(quote(resolve("dedmeshctl", fs: fs))) workstation color \(quote(daemon)) \(quote(value)) -state-dir \(quote(identity.stateDir.path))")
     }
 
-    /// Mints a single-use daemon join token for `daemon` under this client's
-    /// own account, via `dedmeshctl workstation token -json` (the mesh mint
-    /// path — the Terminal holds no console API token). The reply is
-    /// remote-controlled JSON, so the token is validated against the exact
-    /// `dn_<hex>` grammar before anyone may interpolate it into a command.
+    /// Mints a single-use daemon join token for a workstation under this
+    /// client's own account, via `dedmeshctl workstation token -json` (the
+    /// mesh mint path — the Terminal holds no console API token). The console
+    /// derives and returns the username-prefixed daemon name the VM must
+    /// enroll as. The reply is remote-controlled JSON, so the token is
+    /// validated against the exact `dn_<hex>` grammar and the daemon name
+    /// against the daemon grammar before either may reach an argv.
     static func mintWorkstationToken(
         identity: HauntedClientIdentity,
-        daemon: String,
+        workstation: String,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
         fs: HauntedFileSystem = .real
-    ) async throws -> String {
-        guard isSafeCLIArgument(daemon) else {
-            throw HauntedCLIError(message: "invalid daemon name")
+    ) async throws -> (token: String, daemon: String) {
+        guard isValidWorkstationName(workstation) else {
+            throw HauntedCLIError(message: "invalid workstation name")
         }
         let data = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstation token \(quote(daemon)) -json -state-dir \(quote(identity.stateDir.path))")
-        struct Reply: Decodable { let token: String }
-        guard let token = (try? JSONDecoder().decode(Reply.self, from: data))?.token,
-              isValidJoinToken(token) else {
-            throw HauntedCLIError(message: "console returned a malformed join token")
+            "\(quote(resolve("dedmeshctl", fs: fs))) workstation token \(quote(workstation)) -json -state-dir \(quote(identity.stateDir.path))")
+        struct Reply: Decodable {
+            let token: String
+            let daemon: String
         }
-        return token
+        guard let reply = try? JSONDecoder().decode(Reply.self, from: data),
+              isValidJoinToken(reply.token), isValidDaemonName(reply.daemon) else {
+            throw HauntedCLIError(message: "console returned a malformed join token reply")
+        }
+        return (token: reply.token, daemon: reply.daemon)
     }
 
     /// Revokes one of this client's own daemons on the console (`dedmeshctl

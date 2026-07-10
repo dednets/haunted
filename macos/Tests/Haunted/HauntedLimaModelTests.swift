@@ -77,11 +77,11 @@ struct HauntedLimaModelTests {
     @Test("LIMOD-01: createAndEnroll runs create → start → probe → mint → enroll, in order")
     func createPipelineOrdering() async throws {
         let harness = try makeHarness { command in
-            if command.contains("test -f") {
+            if command.contains(".config/dedmesh") {
                 throw HauntedCLIError(message: "not enrolled") // probe: exit 1
             }
             if command.contains("workstation token") {
-                return Data(#"{"token":"dn_00ff"}"#.utf8)
+                return Data(#"{"token":"dn_00ff","daemon":"tester-ws9"}"#.utf8)
             }
             if command.contains(" list --json") { return Data("[]".utf8) }
             return Data()
@@ -92,7 +92,7 @@ struct HauntedLimaModelTests {
             spec: HauntedLimaVMSpec(name: "ws9"), identity: harness.identity)
         try await waitUntil({ harness.model.ops["ws9"] == nil }, "the pipeline finishes")
 
-        let markers = ["create --name='ws9'", "start 'ws9'", "test -f",
+        let markers = ["create --name='ws9'", "start 'ws9'", ".config/dedmesh",
                        "workstation token 'ws9'", "install.sh"]
         let indices = markers.map { indexOf($0, in: harness.runner) }
         for (marker, index) in zip(markers, indices) {
@@ -108,6 +108,10 @@ struct HauntedLimaModelTests {
         #expect(enroll.contains("--ca-fingerprint"))
         #expect(enroll.contains("dn_00ff"))
         #expect(enroll.contains("--workstation"))
+        // The VM keeps the bare name; --name is the console-derived
+        // username-prefixed daemon name from the mint reply.
+        #expect(enroll.contains("shell 'ws9'"))
+        #expect(enroll.contains("tester-ws9"))
 
         // The VM definition was written under Application Support.
         let yaml = harness.fs.applicationSupportDirectory
@@ -130,7 +134,7 @@ struct HauntedLimaModelTests {
         try await waitUntil({ harness.model.ops["ws9"] == nil })
 
         let commands = harness.runner.invocations.compactMap(\.command)
-        #expect(commands.contains { $0.contains("test -f") })
+        #expect(commands.contains { $0.contains(".config/dedmesh") })
         #expect(!commands.contains { $0.contains("workstation token") },
                 "a token was minted for an enrolled VM — burned for nothing")
         #expect(!commands.contains { $0.contains("install.sh") })
@@ -158,7 +162,7 @@ struct HauntedLimaModelTests {
 
         #expect(harness.model.ops["ws9"] == .failed("vz says no"))
         let commands = harness.runner.invocations.compactMap(\.command)
-        #expect(!commands.contains { $0.contains("test -f") }, "no stage after the failure")
+        #expect(!commands.contains { $0.contains(".config/dedmesh") }, "no stage after the failure")
         #expect(!commands.contains { $0.contains("install.sh") })
 
         // The failed badge is dismissible, and clears exactly that state.
@@ -176,10 +180,13 @@ struct HauntedLimaModelTests {
         }
         defer { harness.tearDown() }
 
-        harness.model.delete(name: "ws9", identity: harness.identity)
+        harness.model.delete(name: "ws9", consoleDaemon: "tester-ws9",
+                             identity: harness.identity)
         try await waitUntil({ harness.model.ops["ws9"] == nil })
 
-        let markers = ["stop 'ws9'", "delete --force 'ws9'", "workstation rm 'ws9'"]
+        // The VM operations use the bare name; the console revoke uses the
+        // FULL stored daemon name from the merged console ref.
+        let markers = ["stop 'ws9'", "delete --force 'ws9'", "workstation rm 'tester-ws9'"]
         let indices = markers.compactMap { indexOf($0, in: harness.runner) }
         #expect(indices.count == 3, "delete steps missing: \(harness.runner.invocations.compactMap(\.command))")
         #expect(indices == indices.sorted(), "delete steps out of order")
@@ -197,7 +204,8 @@ struct HauntedLimaModelTests {
         }
         defer { harness.tearDown() }
 
-        harness.model.delete(name: "ws9", identity: harness.identity)
+        harness.model.delete(name: "ws9", consoleDaemon: "tester-ws9",
+                             identity: harness.identity)
         try await waitUntil({ harness.model.warningMessage != nil }, "the warning lands")
 
         #expect(harness.model.ops["ws9"] == nil, "the delete itself succeeded")
@@ -216,7 +224,8 @@ struct HauntedLimaModelTests {
         }
         defer { harness.tearDown() }
 
-        harness.model.delete(name: "ws9", identity: harness.identity)
+        harness.model.delete(name: "ws9", consoleDaemon: "tester-ws9",
+                             identity: harness.identity)
         try await waitUntil({
             if case .failed = harness.model.ops["ws9"] { return true }
             return false
