@@ -248,6 +248,40 @@ struct HauntedForkInvariantTests {
             """)
     }
 
+    // MARK: BUG-15 — the surface resolver must not resurrect a torn-down view
+
+    /// A `SurfaceView`'s libghostty userdata is an *unretained* self-pointer,
+    /// and the C surface outlives the view (the view frees synchronously;
+    /// `Ghostty.Surface.deinit` frees the surface later on a detached task). An
+    /// action arriving in that gap made `Ghostty.App.surfaceView(from:)`
+    /// resurrect freed memory — the BUG-15 use-after-free that aborts in
+    /// `scrollbar` (the empty-state startup crash, and the kill-last-session
+    /// crash BUG-12 only half-closed). The registry guard is three touch-points
+    /// across two upstream-owned files; a rebase that drops any of them silently
+    /// reopens the crash, so grep for all three.
+    @Test("BUG-15: surfaceView(from:) is registry-guarded, and views register/unregister")
+    func surfaceResolverChecksLiveRegistry() throws {
+        let app = try String(
+            contentsOf: Self.sourcesDirectory
+                .appendingPathComponent("Ghostty/Ghostty.App.swift"),
+            encoding: .utf8)
+        #expect(app.contains("HauntedSurfaceRegistry.shared.isLive"), """
+            Ghostty.App.surfaceView(from:) no longer checks HauntedSurfaceRegistry \
+            before Unmanaged.takeUnretainedValue(). An action for a surface whose \
+            SurfaceView was torn down (empty-state teardown / closed split) will \
+            resurrect freed memory — the BUG-15 use-after-free that aborts in scrollbar.
+            """)
+
+        let view = try String(
+            contentsOf: Self.sourcesDirectory
+                .appendingPathComponent("Ghostty/Surface View/SurfaceView_AppKit.swift"),
+            encoding: .utf8)
+        #expect(view.contains("HauntedSurfaceRegistry.shared.register"),
+                "SurfaceView.init no longer registers with HauntedSurfaceRegistry — the resolver will treat every live view as dead and drop all actions.")
+        #expect(view.contains("HauntedSurfaceRegistry.shared.unregister"),
+                "SurfaceView.deinit no longer unregisters — a freed view stays 'live' and its dangling userdata is resurrected (BUG-15 returns).")
+    }
+
     // MARK: Helpers
 
     /// `macos/Sources`, located relative to this test file so the check needs

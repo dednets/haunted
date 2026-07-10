@@ -576,6 +576,7 @@ The chain, as implemented:
 | ID | Case | Expect | Status |
 |---|---|---|---|
 | EXIT-01 | `Ghostty.App.swift` still posts `.hauntedSessionsDidChange` on child exit | grep guard passes | ✅ `HauntedForkInvariantTests` |
+| REG-01 | `HauntedSurfaceRegistry`: a never-registered / unregistered pointer reads **not live** | resolver drops the action instead of resurrecting freed memory (BUG-15) | ✅ `HauntedSurfaceRegistryTests` + grep guard `surfaceResolverChecksLiveRegistry` |
 | EXIT-02 | An attached surface sets `waitAfterCommand` | exit banner, tab survives | ✅ `HauntedForkInvariantTests` |
 | EXIT-03 | Daemon stops listing a session → refresh | its sidebar row disappears; the last one leaves an empty list | ✅ `HauntedSidebarModelTests` |
 | EXIT-04 | `attach-remote` exits 0 | the loop stops, exactly one invocation | ✅ SH-01 |
@@ -876,9 +877,41 @@ LOG-04), BUG-5 (`certIdentity` chains, was ID-11), BUG-6 (`generateSessionName`
 entropy); and in Phase 3 — BUG-8 (the short read below) and BUG-9 (LAY-07's
 stranded reversal); and in Phase 4 — BUG-11 (startup auto-creates a session) and
 BUG-12 (killing the last session crashes the app); and after Phase 4 —
-BUG-13 (the sidebar poll loop freezes forever in `waitUntilExit`) and
-BUG-14 (⌘W detaches instead of killing the remote session). Each has a
+BUG-13 (the sidebar poll loop freezes forever in `waitUntilExit`),
+BUG-14 (⌘W detaches instead of killing the remote session), and BUG-15 (the
+empty-state use-after-free that resurrects a torn-down SurfaceView). Each has a
 regression test named for its ID. §4 marks them ✅.
+
+### BUG-15 — use-after-free resurrecting a torn-down SurfaceView — ✅ **confirmed, then fixed**
+
+**Symptom:** the Terminal crashes (~2 launches in 3) when it opens straight into
+the "Nothing here" empty state — startup with nothing to resume, and the
+kill-last-session path BUG-12 only half-closed.
+
+**Root cause (from the Sentry `.run/*.envelope` minidump, arm64):** `SIGABRT`
+in `Ghostty.App.scrollbar` → `Ghostty.App.swift:2062`. A `SurfaceView`'s
+libghostty `userdata` is an **unretained** self-pointer. When the view is torn
+down — the fork's `surfaceTree = .init()` (`openEmptyWindow` throwaway surface,
+or `enterEmptyState`), or a closed split — ARC frees the view *synchronously*,
+but `Ghostty.Surface.deinit` frees the C surface *later*, on a detached
+main-actor task. In that gap libghostty delivers a scrollbar action whose target
+surface still carries the dangling userdata, and
+`Ghostty.App.surfaceView(from:)` does `Unmanaged.takeUnretainedValue()` on it —
+resurrecting freed memory. BUG-12 moved the trigger from `window.close()` to the
+empty-state teardown but left the underlying resolver unguarded.
+
+**Fix:** `HauntedSurfaceRegistry` tracks live view userdata pointers (register
+in `SurfaceView.init`, unregister first thing in `deinit`);
+`surfaceView(from:)` returns nil for a pointer that is no longer live, so the
+action is dropped instead of dereferenced. Action delivery (`appTick`, main
+queue) and NSView deinit are both main-thread, so the check is race-free in
+practice; the set is locked for the one off-main exception
+(`Ghostty.Surface.deinit`). Tests: REG-01 (`HauntedSurfaceRegistryTests`) pins
+the invariant (a torn-down pointer reads dead); the grep guard
+(`surfaceResolverChecksLiveRegistry`) protects the three rebase-fragile
+touch-points. The race itself is not unit-reproducible (needs a live
+`ghostty_app_t`); validated live — 12/12 empty-state launches survived (was
+~2/3 crashing).
 
 ### BUG-14 — ⌘W claims to kill the process but only detaches — ✅ **confirmed, then fixed**
 

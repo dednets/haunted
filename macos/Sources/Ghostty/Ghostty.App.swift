@@ -473,6 +473,12 @@ extension Ghostty {
 
         static private func surfaceView(from surface: ghostty_surface_t) -> SurfaceView? {
             guard let surface_ud = ghostty_surface_userdata(surface) else { return nil }
+            // Haunted fork: the C surface can outlive its SurfaceView (the view
+            // frees synchronously; Ghostty.Surface.deinit frees the surface
+            // later on a detached task). Resurrecting a dead view's userdata is
+            // a use-after-free (BUG-12/BUG-15, aborts in scrollbar). Drop the
+            // action if the view is no longer registered as live.
+            guard HauntedSurfaceRegistry.shared.isLive(surface_ud) else { return nil }
             return Unmanaged<SurfaceView>.fromOpaque(surface_ud).takeUnretainedValue()
         }
 

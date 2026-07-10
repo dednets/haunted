@@ -376,6 +376,12 @@ extension Ghostty {
             }
             self.surfaceModel = Ghostty.Surface(cSurface: surface)
 
+            // Haunted fork: mark this view live so libghostty actions can
+            // resolve to it. Its userdata is its own address (see withCValue).
+            // Balanced by unregister in deinit — this is the guard against the
+            // deferred-surface-free use-after-free (BUG-15, HauntedSurfaceRegistry).
+            HauntedSurfaceRegistry.shared.register(Unmanaged.passUnretained(self).toOpaque())
+
             // Setup our tracking area so we get mouse moved events
             updateTrackingAreas()
 
@@ -388,6 +394,14 @@ extension Ghostty {
         }
 
         deinit {
+            // Haunted fork: stop libghostty actions from resolving to this
+            // view before anything else — the C surface it owns is freed later
+            // (Ghostty.Surface.deinit, detached), so an action arriving in the
+            // gap must find us gone rather than resurrect freed memory (BUG-15,
+            // HauntedSurfaceRegistry). First statement, so the window between
+            // dealloc and unregister is empty.
+            HauntedSurfaceRegistry.shared.unregister(Unmanaged.passUnretained(self).toOpaque())
+
             // Remove all of our notificationcenter subscriptions
             let center = NotificationCenter.default
             center.removeObserver(self)
