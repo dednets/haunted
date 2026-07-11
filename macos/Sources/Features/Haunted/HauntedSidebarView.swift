@@ -641,8 +641,11 @@ struct HauntedSidebarView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 4) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Haunted")
-                        .font(.headline)
+                    HStack(spacing: 5) {
+                        Text("Haunted")
+                            .font(.headline)
+                        HauntedAlphaBadge()
+                    }
                     Text(identity.consoleHost)
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -1374,5 +1377,24 @@ private struct LimaCreateSheet: View {
         guard panel.runModal() == .OK, let url = panel.url else { return }
         guard !mounts.contains(where: { $0.path == url.path }) else { return }
         mounts.append(MountDraft(path: url.path, writable: false))
+    }
+}
+
+/// The "ALPHA" pre-release pill shown beside the Haunted title — the same
+/// amber marker the Console and the landing page carry, so the product reads
+/// as Alpha wherever a user meets it.
+struct HauntedAlphaBadge: View {
+    private static let amber = Color(red: 0.96, green: 0.71, blue: 0.27)
+
+    var body: some View {
+        Text("ALPHA")
+            .font(.system(size: 8.5, weight: .bold))
+            .tracking(0.6)
+            .foregroundStyle(Self.amber)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Self.amber.opacity(0.15), in: Capsule())
+            .overlay(Capsule().strokeBorder(Self.amber.opacity(0.35), lineWidth: 1))
+            .accessibilityLabel("Alpha release")
     }
 }
