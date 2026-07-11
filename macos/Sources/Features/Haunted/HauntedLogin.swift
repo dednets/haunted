@@ -161,10 +161,23 @@ final class HauntedLoginController: NSWindowController {
 }
 
 struct HauntedLoginView: View {
-    // Production is the default a shipped build must carry (the DMG on
-    // releases.dednets.com talks to the prod console); staging/dev are the
-    // opt-in, via this field or the HauntedConsoleURL default.
+    // The console a fresh install signs in to. A SHIPPED build (the DMG on
+    // releases.dednets.com) must default to production; every dev build —
+    // Xcode Debug, `make haunted-run` — defaults to staging so local work
+    // never enrolls a Terminal against the production console by accident.
+    //
+    // The discriminator is HAUNTED_RELEASE, a compilation condition that ONLY
+    // scripts/build-app-dist.sh injects (via SWIFT_ACTIVE_COMPILATION_CONDITIONS).
+    // Keying on it — not `#if DEBUG` — is deliberate: `make haunted-run` builds
+    // the ReleaseLocal config, identical to an ad-hoc release, so a config check
+    // can't tell dev from shipped. Guarded by HauntedLoginDefaultTests (staging
+    // in every non-release build) and the strings gate in build-app-dist.sh
+    // (production in the shipped bundle, never staging).
+    #if HAUNTED_RELEASE
     static let defaultConsoleURL = "https://console.dednets.com"
+    #else
+    static let defaultConsoleURL = "https://console.staging.dednets.com"
+    #endif
 
     @State private var consoleURL = UserDefaults.standard.string(
         forKey: "HauntedConsoleURL") ?? HauntedLoginView.defaultConsoleURL

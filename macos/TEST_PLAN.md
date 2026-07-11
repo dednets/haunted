@@ -709,6 +709,25 @@ ingest host.
 | CRSH-05 | queue discipline | `.ghosttycrash` only, oldest first, capped at 5/launch, >20 MB skipped, missing dir = empty |
 | CRSH-06 | submit | POST body is the file verbatim (X-Sentry-Auth + envelope content type); 2xx deletes, non-2xx keeps for next launch |
 
+### 4.10 Console login default — production only when shipped
+
+`HauntedLoginView.defaultConsoleURL`: a shipped build signs in to production;
+every dev build (Xcode Debug, `make haunted-run`) defaults to staging, so
+local work never enrolls a Terminal against the production console. The
+discriminator is `HAUNTED_RELEASE`, a compilation condition injected **only**
+by `scripts/build-app-dist.sh` — `#if DEBUG` won't do, because `make
+haunted-run` builds the same ReleaseLocal config as an ad-hoc release.
+
+| ID | Case | Expect |
+|---|---|---|
+| LGDF-01 | default in a non-release build | `https://console.staging.dednets.com` (red-verified: reverting to unconditional production fails exactly this). With `HAUNTED_RELEASE` injected the same test asserts production — both configs run |
+| LGDF-02 | default well-formed | whichever host, it is an allowed console scheme and a `dednets.com` host |
+
+The shipped-build half is enforced at the artifact tier: `build-app-dist.sh`
+requires `console.dednets.com` in the app binary and refuses
+`console.staging.dednets.com` (the staging branch compiles out under
+`HAUNTED_RELEASE`).
+
 ## 5. Refactors required (the actual blocker)
 
 Almost nothing above L0 is reachable today. `HauntedCLI`,
