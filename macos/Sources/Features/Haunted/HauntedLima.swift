@@ -268,6 +268,15 @@ enum HauntedLimaCLI {
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y --no-install-recommends ca-certificates curl
+            # Rootful Docker CE, so a workstation shell can build and run
+            # containers. NOTE: this VM exports a shell over the mesh, and
+            # membership in the docker group (below) is root-equivalent — anyone
+            # who reaches this workstation's shell can escalate via the Docker
+            # socket. A deliberate trade for a dev workstation.
+            if ! command -v docker >/dev/null; then
+              curl -fsSL https://get.docker.com | sh
+            fi
+            usermod -aG docker "{{.User}}"
         - mode: user
           script: |
             #!/bin/bash
@@ -279,11 +288,12 @@ enum HauntedLimaCLI {
             mkdir -p "$HOME/.local/bin"
 
         probes:
-        - description: "curl + user lingering ready"
+        - description: "curl + user lingering + rootful docker ready"
           script: |
             #!/bin/bash
-            timeout 120 bash -c 'until command -v curl >/dev/null && \\
-              loginctl show-user "$USER" -p Linger --value | grep -q yes; do sleep 2; done'
+            timeout 180 bash -c 'until command -v curl >/dev/null && \\
+              loginctl show-user "$USER" -p Linger --value | grep -q yes && \\
+              sudo docker info >/dev/null 2>&1; do sleep 2; done'
 
         images:
         # Ubuntu 26.04 "Resolute" — arm64 for Apple Silicon (VZ).

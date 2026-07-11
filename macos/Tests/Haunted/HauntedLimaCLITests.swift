@@ -197,6 +197,8 @@ struct HauntedLimaCLITests {
         #expect(yaml.contains("mounts: []"), "no default mounts, ever")
         #expect(yaml.contains("deploy/lima/workstation.yaml"), "the keep-in-sync pointer")
         #expect(yaml.contains("enable-linger"), "daemons must survive the SSH session")
+        #expect(yaml.contains("get.docker.com"), "rootful Docker for the workstation shell")
+        #expect(yaml.contains("usermod -aG docker"), "the shell user reaches the Docker socket")
         #expect(yaml.contains("ubuntu-26.04-server-cloudimg-arm64.img"))
     }
 
