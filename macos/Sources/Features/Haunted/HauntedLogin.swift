@@ -112,7 +112,7 @@ final class HauntedLoginController: NSWindowController {
     }
 
     private init() {
-        let window = NSWindow(
+        let window = HauntedEditableWindow(
             contentRect: .zero,
             styleMask: [.titled, .closable],
             backing: .buffered,
@@ -157,6 +157,42 @@ final class HauntedLoginController: NSWindowController {
             Self.connect(identity: identity)
             self.window?.close()
         }
+    }
+}
+
+/// A standalone window that handles the standard editing shortcuts itself.
+///
+/// The Terminal's main menu binds ⌘V/⌘C/⌘X to Ghostty's *terminal* paste/copy
+/// actions. When this login window is key there is no terminal surface in the
+/// responder chain, so those menu items are disabled — and a disabled menu
+/// item with a key equivalent SWALLOWS the shortcut, so ⌘V never reaches the
+/// login text field's editor (the reason the code field could not be pasted
+/// into). `performKeyEquivalent` runs before the main menu gets the event, so
+/// routing the standard editing selectors to the first responder here wins.
+final class HauntedEditableWindow: NSWindow {
+    /// The editing selector a ⌘-<key> chord should send to the first responder,
+    /// or nil if it is not an editing shortcut. Pure, so it is unit-tested
+    /// (LGED-01) without a live window.
+    static func editingSelector(forCommandKey key: String) -> Selector? {
+        switch key {
+        case "x": return #selector(NSText.cut(_:))
+        case "c": return #selector(NSText.copy(_:))
+        case "v": return #selector(NSText.paste(_:))
+        case "a": return #selector(NSResponder.selectAll(_:))
+        case "z": return Selector(("undo:"))
+        default: return nil
+        }
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags == .command,
+           let key = event.charactersIgnoringModifiers,
+           let selector = Self.editingSelector(forCommandKey: key),
+           NSApp.sendAction(selector, to: nil, from: self) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 }
 

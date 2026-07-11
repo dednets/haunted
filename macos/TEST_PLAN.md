@@ -728,6 +728,22 @@ requires `console.dednets.com` in the app binary and refuses
 `console.staging.dednets.com` (the staging branch compiles out under
 `HAUNTED_RELEASE`).
 
+### 4.11 Login window editing shortcuts
+
+`HauntedEditableWindow`: the Terminal's menu binds ⌘V/⌘C/⌘X to Ghostty's
+*terminal* paste/copy, which are disabled (and so swallow the shortcut) when
+the standalone login window is key — the code field could not be pasted into.
+The window handles the standard editing chords itself in
+`performKeyEquivalent`, before the menu sees them.
+
+| ID | Case | Expect |
+|---|---|---|
+| LGED-01 | ⌘V/⌘C/⌘X/⌘A/⌘Z → selector | `paste:`/`copy:`/`cut:`/`selectAll:`/`undo:` (red-verified: mapping ⌘V→nil fails LGED-01) |
+| LGED-02 | ⌘W/⌘N/⌘Q/… | not intercepted (nil) — still reach the menu |
+
+The responder-chain dispatch (`NSApp.sendAction`) is AppKit plumbing, verified
+by pasting into the running app, not a unit test.
+
 ## 5. Refactors required (the actual blocker)
 
 Almost nothing above L0 is reachable today. `HauntedCLI`,
