@@ -91,6 +91,19 @@ final class HauntedManager {
         return controller.window != nil
     }
 
+    /// The workstation behind a surface, for features that must cross the
+    /// wire on the surface's behalf (Ctrl+V image paste uploads there). Nil
+    /// for local "This computer" tabs and unattached surfaces — callers
+    /// treat that as "behave like plain Ghostty".
+    @MainActor
+    func uploadTarget(
+        for view: Ghostty.SurfaceView
+    ) -> (identity: HauntedClientIdentity, target: String)? {
+        guard let info = surfaces.object(forKey: view),
+              let target = info.target else { return nil }
+        return (info.identity, target)
+    }
+
     /// What to do with the tab showing a session we are about to kill.
     enum SessionTabClose: Equatable {
         /// The window has sibling tabs; close just this one.

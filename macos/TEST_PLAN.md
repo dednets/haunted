@@ -744,6 +744,27 @@ The window handles the standard editing chords itself in
 The responder-chain dispatch (`NSApp.sendAction`) is AppKit plumbing, verified
 by pasting into the running app, not a unit test.
 
+### 4.12 Ctrl+V image paste into a remote session — `HauntedImagePaste`
+
+In a native terminal, an app like Claude Code answers Ctrl+V by reading the
+LOCAL clipboard itself. In a Haunted tab the app runs on the workstation, so
+the image must cross the wire: the hook in `SurfaceView.keyDown` uploads the
+pasteboard image (`haunted upload`, `MSG_UPLOAD_*`) and types the returned
+REMOTE path — the same text a dropped image file produces. Two trust
+boundaries: the keystroke router (must never steal ordinary keys) and the
+daemon's reply (remote bytes about to be typed into a terminal). The wire
+half lives in the monorepo's `tests/haunted/test_upload.c`.
+
+Suite: `HauntedImagePasteTests`.
+
+| ID | Case | Expect |
+|---|---|---|
+| PASTE-01 | grep guard: `SurfaceView.keyDown` still calls `HauntedImagePaste.intercept` | present (red-verified: deleting the hook fails PASTE-01) — an upstream rebase dropping it regresses image paste to silently broken |
+| PASTE-02 | key routing | only a plain ctrl+V (capsLock tolerated) matches; ⌘V, ctrl+shift+V, ctrl+⌘+V, other keys, nil characters all pass through |
+| PASTE-03 | remote-path grammar | absolute, `[A-Za-z0-9._/-]` only, no `..`, ≤1024, trimmed; rejects relative paths, whitespace, shell metacharacters, escape bytes, second lines |
+| PASTE-04 | pasteboard reading | PNG flavor used as-is; TIFF transcoded to PNG (verified by magic); text-only and empty boards → nil (keystroke passes through) |
+| PASTE-05 | upload flow | exact `haunted upload` argv; malformed daemon reply throws instead of typing; unsafe target never reaches an argv; success types `path + " "` exactly once; failure types nothing (beeps) |
+
 ## 5. Refactors required (the actual blocker)
 
 Almost nothing above L0 is reachable today. `HauntedCLI`,

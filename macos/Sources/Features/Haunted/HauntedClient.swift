@@ -649,6 +649,34 @@ enum HauntedCLI {
             "\(quote(resolve("dedmeshctl", fs: fs))) workstation rm \(quote(daemon)) -state-dir \(quote(identity.stateDir.path))")
     }
 
+    /// Pushes a local file onto a workstation (`haunted upload`, the
+    /// MSG_UPLOAD_* wire path) and returns the file's remote path — the
+    /// transport underneath Ctrl+V image paste (HauntedImagePaste). The path
+    /// comes back from a remote daemon and is destined for sendText, so it
+    /// passes the strict grammar in sanitizedRemotePath or the call throws.
+    static func upload(
+        identity: HauntedClientIdentity,
+        target: String,
+        name: String,
+        filePath: String,
+        runner: HauntedProcessRunning = HauntedProcessRunner.shared,
+        fs: HauntedFileSystem = .real
+    ) async throws -> String {
+        guard isSafeCLIArgument(target) else {
+            throw HauntedCLIError(message: "invalid target")
+        }
+        let data = try await runner.run(
+            "\(quote(resolve("haunted", fs: fs))) upload \(quote(filePath)) "
+                + "--state-dir \(quote(identity.stateDir.path)) "
+                + "--target \(quote(target)) --name \(quote(name))")
+        guard let reply = String(bytes: data, encoding: .utf8),
+              let path = HauntedImagePaste.sanitizedRemotePath(reply) else {
+            throw HauntedCLIError(
+                message: "daemon returned a malformed upload path")
+        }
+        return path
+    }
+
     /// One-time enrollment: join token → client mTLS certificate (plus the
     /// persisted console settings) in the default state dir.
     static func enroll(
