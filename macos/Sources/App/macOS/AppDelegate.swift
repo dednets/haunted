@@ -226,6 +226,10 @@ class AppDelegate: NSObject,
         // Haunted fork: add the Console login entry point to the File menu.
         HauntedLoginController.install()
 
+        // Haunted fork: drain locally-persisted crash envelopes to Sentry
+        // (upstream only ever writes them to disk).
+        HauntedCrashReporter.submitPending()
+
         // Register our service provider. This must happen after everything is initialized.
         NSApp.servicesProvider = ServiceProvider()
 

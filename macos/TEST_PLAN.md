@@ -690,6 +690,25 @@ token + the pinned CA's fingerprint), delete (VM + console revoke). No
 | LIMOD-06 | busy guard | one op per VM at a time |
 | MERGE-01…07 | `HauntedSidebarMerge.mergeRows` | merged / console-only / Lima-only rows joined on the DISPLAY name (console daemons are username-prefixed, the sidebar strips the caller's own prefix; legacy unprefixed names pass through); ops ride the owning row; cross-user and nil-username never merge (and a foreign prefix is never stripped); the VM claims only the OWNED console row; sorted by display name |
 
+### 4.9 Crash reporting — the Sentry envelope uploader
+
+`HauntedCrashReporter.swift`: upstream's Sentry transport only ever persists
+crash envelopes to disk (`~/.local/state/ghostty/crash/*.ghosttycrash`); the
+fork drains that queue to the DedNets Sentry project at launch (bounded,
+delete-on-2xx, keep-on-failure). The DSN is pinned the same way the Sparkle
+feed is — a rebase must not point crash data anywhere else — and
+`scripts/build-app-dist.sh` refuses a bundle whose app binary lacks the
+ingest host.
+
+| ID | Case | Expect |
+|---|---|---|
+| CRSH-01 | production DSN → endpoint | exactly `https://o…ingest.de.sentry.io/api/<project>/envelope/` + auth header carrying the key |
+| CRSH-02 | fork invariant | DSN pinned to the DedNets org host, https, never a ghostty DSN (red-verified: breaking the org host fails CRSH-01/02/06 and nothing else) |
+| CRSH-03 | malformed DSNs | refused (no key / http / no project / non-numeric project), never guessed |
+| CRSH-04 | crash dir | mirrors src/crash/dir.zig: `XDG_STATE_HOME` wins, else `~/.local/state/ghostty/crash` |
+| CRSH-05 | queue discipline | `.ghosttycrash` only, oldest first, capped at 5/launch, >20 MB skipped, missing dir = empty |
+| CRSH-06 | submit | POST body is the file verbatim (X-Sentry-Auth + envelope content type); 2xx deletes, non-2xx keeps for next launch |
+
 ## 5. Refactors required (the actual blocker)
 
 Almost nothing above L0 is reachable today. `HauntedCLI`,
