@@ -33,6 +33,34 @@ struct HauntedImagePasteTests {
             characters: nil, modifiers: .control))
     }
 
+    /// The regression guard for a *live* event, not a hardcoded "v": AppKit
+    /// delivers Ctrl+V with BOTH `characters` and `charactersIgnoringModifiers`
+    /// equal to the control character 0x16 — the old code read the latter,
+    /// never saw "v", and so every image paste fell through to the session as
+    /// a literal ^V. keyCode 9 is the physical "v" key, from which
+    /// `characters(byApplyingModifiers: [])` recovers "v".
+    @Test("PASTE-02: a live Ctrl+V event (0x16, not \"v\") is the image-paste key")
+    func imagePasteKeyFromLiveEvent() throws {
+        let event = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .control,
+            timestamp: 0, windowNumber: 0, context: nil,
+            characters: "\u{16}", charactersIgnoringModifiers: "\u{16}",
+            isARepeat: false, keyCode: 9))
+        #expect(HauntedImagePaste.isImagePasteKey(event: event))
+    }
+
+    /// The mirror: a live Cmd+V (text paste) stays Ghostty's, so the event
+    /// overload must not steal it.
+    @Test("PASTE-02: a live Cmd+V event is not the image-paste key")
+    func textPasteEventIgnored() throws {
+        let event = try #require(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command,
+            timestamp: 0, windowNumber: 0, context: nil,
+            characters: "v", charactersIgnoringModifiers: "v",
+            isARepeat: false, keyCode: 9))
+        #expect(!HauntedImagePaste.isImagePasteKey(event: event))
+    }
+
     // MARK: PASTE-03 — the remote path grammar (a trust boundary)
 
     @Test("PASTE-03: a well-formed daemon reply is accepted, trimmed")

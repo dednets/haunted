@@ -21,8 +21,7 @@ enum HauntedImagePaste {
     /// means the event was consumed and an upload is in flight.
     @MainActor
     static func intercept(event: NSEvent, surfaceView: Ghostty.SurfaceView) -> Bool {
-        guard isImagePasteKey(characters: event.charactersIgnoringModifiers,
-                              modifiers: event.modifierFlags),
+        guard isImagePasteKey(event: event),
               let (identity, target) =
                 HauntedManager.shared.uploadTarget(for: surfaceView),
               let png = pngData(from: .general)
@@ -32,6 +31,19 @@ enum HauntedImagePaste {
                                  surfaceView: surfaceView)
         }
         return true
+    }
+
+    /// Whether a live keyDown is the image-paste chord. Split from the pure
+    /// string check below so the one macOS subtlety lives in exactly one
+    /// place: under Control, `charactersIgnoringModifiers` reports the control
+    /// character (Ctrl+V → 0x16, never "v"), so reading it made the chord
+    /// never match and every paste fell through to the terminal as a literal
+    /// ^V. `characters(byApplyingModifiers: [])` recovers the base key ("v")
+    /// the same way Ghostty derives its unshifted_codepoint — see the note in
+    /// NSEvent+Extension.ghosttyKeyEvent.
+    static func isImagePasteKey(event: NSEvent) -> Bool {
+        isImagePasteKey(characters: event.characters(byApplyingModifiers: []),
+                        modifiers: event.modifierFlags)
     }
 
     /// A plain Ctrl+V and nothing else: any other modifier combination has
