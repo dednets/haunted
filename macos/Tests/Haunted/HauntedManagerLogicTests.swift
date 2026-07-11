@@ -282,4 +282,27 @@ struct HauntedManagerLogicTests {
             identity: Self.identity, sessions: [], runner: runner)
         #expect(runner.invocations.isEmpty)
     }
+
+    /// CLOSE-04. THE CRASH (HAUNTED-TERMINAL-PROD-1, `EXC_BAD_ACCESS`): the ⌘W
+    /// teardown must obey the same last-tab rule as `killSession` (KILL-01).
+    /// BUG-14's close path tore the tab down with a raw `closeWindowImmediately()`,
+    /// which for the *only* tab calls `window.close()` — freeing the attached
+    /// `SurfaceView` while libghostty is still delivering a surface action into
+    /// it, the use-after-free documented on `SessionTabClose`. Both `.close` and
+    /// `.runInBackground` tear the tab down, so both must drop the last tab to
+    /// the "Nothing here" empty state instead of closing it; only a tab with
+    /// real siblings closes normally. `.cancel` tears nothing down.
+    @Test("CLOSE-04: ⌘W teardown empties the last tab, never window.close() (the crash)")
+    func closeTabTeardownAvoidsLastTabClose() {
+        // The only tab: empty state for both teardown choices — a window.close()
+        // here is the reported use-after-free.
+        #expect(HauntedManager.closeTabTeardown(choice: .close, siblingTabCount: 1) == .emptyState)
+        #expect(HauntedManager.closeTabTeardown(choice: .runInBackground, siblingTabCount: 1) == .emptyState)
+        // With real siblings, closing just this tab is safe (the window survives).
+        #expect(HauntedManager.closeTabTeardown(choice: .close, siblingTabCount: 3) == .closeTab)
+        #expect(HauntedManager.closeTabTeardown(choice: .runInBackground, siblingTabCount: 2) == .closeTab)
+        // Cancel keeps the tab: no teardown at all.
+        #expect(HauntedManager.closeTabTeardown(choice: .cancel, siblingTabCount: 1) == nil)
+        #expect(HauntedManager.closeTabTeardown(choice: .cancel, siblingTabCount: 3) == nil)
+    }
 }

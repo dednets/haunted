@@ -1318,8 +1318,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         case .hauntedChoice:
             confirmCloseHauntedSessions(
                 messageText: "Close Tab?",
-                controllers: [self],
-                closeUI: { [weak self] in self?.closeTabImmediately() })
+                controllers: [self])
         case .plainConfirm:
             confirmClose(
                 messageText: "Close Tab?",
@@ -1343,8 +1342,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     @MainActor
     private func confirmCloseHauntedSessions(
         messageText: String,
-        controllers: [TerminalController],
-        closeUI: @escaping () -> Void
+        controllers: [TerminalController]
     ) {
         let attached = controllers.compactMap {
             HauntedManager.shared.hauntedSessions(in: $0)
@@ -1360,17 +1358,16 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 messageText: messageText,
                 informativeText: "Attached to \(noun) running on the workstation. Close \(pronoun) (like typing “exit” — the process ends), or leave \(pronoun) running in the background.",
                 buttonTitles: HauntedManager.closeTabButtonTitles)
-            switch HauntedManager.closeTabChoice(for: response) {
-            case .close:
-                closeUI()
+            let choice = HauntedManager.closeTabChoice(for: response)
+            // Tear the tab(s) down through the last-tab empty-state rule — a
+            // raw window.close() on the only tab frees the attached SurfaceView
+            // mid-action (HAUNTED-TERMINAL-PROD-1). Nothing happens on .cancel.
+            HauntedManager.shared.closeAttachedTabs(controllers, choice: choice)
+            if choice == .close {
                 for group in attached {
                     await HauntedManager.killSessionsRemote(
                         identity: group.identity, sessions: group.sessions)
                 }
-            case .runInBackground:
-                closeUI()
-            case .cancel:
-                break
             }
         }
     }
@@ -1467,8 +1464,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
             // choice, since closing only detaches it (BUG-14).
             confirmCloseHauntedSessions(
                 messageText: groupControllers.count > 1 ? "Close Window?" : "Close Tab?",
-                controllers: groupControllers,
-                closeUI: { [weak self] in self?.closeWindowImmediately() })
+                controllers: groupControllers)
         case .plainConfirm:
             // We call confirmClose on the proper controller so the alert is
             // attached to the window that needs confirmation.

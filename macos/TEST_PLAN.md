@@ -378,6 +378,7 @@ else lands on the `.empty` "Nothing here" state (sidebar shown, no shell).
 | CLOSE-02 | `closeTabButtonTitles` | `["Close", "Run in Background", "Cancel"]` — NSAlert add-order makes Close the Enter default (first/rightmost); Cancel carries Escape. Renders L→R as "Cancel   Run in Background   Close". |
 | CLOSE-03 | `killSessionsRemote(identity:sessions:runner:)` | one `haunted kill '<name>' … --target '<target>'` per session through the process seam (verified with `FakeProcessRunner`); empty list is a no-op. The kill the old close path never performed. |
 | CLOSE-01b | `closeTabPrompt(processRunning:attachedToSession:)` | `processRunning == false` → `.closeImmediately` (no dialog), attached or not — the process already exited (the "Press any key to close" banner / clean `[haunted: detached]`), so there is nothing to kill or detach. Running: attached → `.hauntedChoice`, plain shell → `.plainConfirm`. Follow-up to BUG-14: the popup was appearing on an already-exited tab. |
+| CLOSE-04 | `closeTabTeardown(choice:siblingTabCount:)` | the ⌘W teardown obeys the same last-tab rule as KILL-01: `.close`/`.runInBackground` on the *only* tab → `.emptyState` (never `window.close()`), with siblings → `.closeTab`; `.cancel` → `nil` (nothing torn down). **This is HAUNTED-TERMINAL-PROD-1** (`EXC_BAD_ACCESS`): BUG-14's close path tore the last tab down with a raw `closeWindowImmediately()`, reintroducing the `SessionTabClose` use-after-free (libghostty delivers a surface action into the freed `SurfaceView`). `confirmCloseHauntedSessions` now routes teardown through `HauntedManager.closeAttachedTabs(_:choice:)`, which drives this decision. |
 | NAME-01 | `generateSessionName()` × 10 000 | all match `^gui-[0-9a-f]{16}$`, no collisions. ⚠️ The uniqueness half is a *statistical* claim: P(collision) ≈ 1 − exp(−n(n−1)/2N). At the original 8 hex digits (N = 2³²) that is **1.16% per run** — the Phase 1 test was flaky by construction, ~1 failure in 86 runs. Widened to 16 digits (2.7e-12) in Phase 2; a companion test asserts the entropy width the assertion depends on. Do not narrow the generator without deleting the uniqueness assertion. |
 | CFG-01 | `buildConfiguration` | `waitAfterCommand == true`, `initialInput` ends with `\n` |
 | LAST-01 | `HauntedLastTarget` set, `HauntedLastSession` unset | `lastAttached == nil` |
@@ -1099,6 +1100,18 @@ clean `[haunted: detached]`) — there is nothing left to kill or detach, so ⌘
 just closes the tab. Gated by the pure `closeTabPrompt(processRunning:…)`
 (CLOSE-01b): only a *running* session prompts. Verified in the app (exited tab,
 ⌘W, closed with no dialog).
+
+**Regression (HAUNTED-TERMINAL-PROD-1) — the ⌘W fix crashed on the last tab —
+✅ fixed:** the BUG-14 close path tore the tab down with a raw
+`closeWindowImmediately()`. For a single-tab window (the common ⌘W → Enter case)
+that calls `window.close()` on a still-attached surface — the exact
+use-after-free KILL-01 exists to prevent: libghostty keeps delivering a surface
+action into the freed `SurfaceView` (`EXC_BAD_ACCESS`, four crashes from live
+⌘W testing). `confirmCloseHauntedSessions` no longer takes a caller-supplied
+teardown closure; it routes through `HauntedManager.closeAttachedTabs(_:choice:)`,
+which obeys `closeTabTeardown` → `sessionTabClosePlan` per controller: the last
+tab drops to the empty state, siblings close normally, `.cancel` tears nothing
+down. Test: CLOSE-04 (pure decision, like KILL-01).
 
 ### BUG-13 — the sidebar silently stops refreshing forever — ✅ **confirmed, then fixed**
 

@@ -191,6 +191,26 @@ final class HauntedManager {
         }
     }
 
+    /// How ⌘W tears the tab down for a given choice — `nil` for `.cancel`
+    /// (nothing is torn down). Both `.close` and `.runInBackground` close the
+    /// tab (they differ only in whether the *remote* session is also killed),
+    /// so both MUST obey `sessionTabClosePlan`: the last tab drops to the empty
+    /// state, never `window.close()`. Tearing a Haunted window down while its
+    /// `SurfaceView` is still attached is the use-after-free on `SessionTabClose`
+    /// (HAUNTED-TERMINAL-PROD-1) — the BUG-14 close path reintroduced it by
+    /// tearing down with a raw `closeWindowImmediately()`. Pure, so the rule is
+    /// tested without a live window (CLOSE-04), exactly like KILL-01.
+    static func closeTabTeardown(
+        choice: CloseTabChoice, siblingTabCount: Int
+    ) -> SessionTabClose? {
+        switch choice {
+        case .close, .runInBackground:
+            return sessionTabClosePlan(siblingTabCount: siblingTabCount)
+        case .cancel:
+            return nil
+        }
+    }
+
     /// The distinct remote sessions a controller's tab is attached to (one per
     /// split surface), with the client identity. `nil` when the tab holds no
     /// Haunted session — a plain shell or the "Nothing here" empty state — so
@@ -236,6 +256,30 @@ final class HauntedManager {
         await MainActor.run {
             NotificationCenter.default.post(
                 name: .hauntedSessionsDidChange, object: nil)
+        }
+    }
+
+    /// Tears the ⌘W tab(s) down for `choice`, mirroring `killSession`'s
+    /// crash avoidance via `closeTabTeardown`: a tab with siblings closes
+    /// normally, but the *last* tab of a window drops to the "Nothing here"
+    /// empty state rather than `window.close()`, which would free the attached
+    /// `SurfaceView` while libghostty is still delivering a surface action into
+    /// it (the HAUNTED-TERMINAL-PROD-1 use-after-free). `.cancel` tears nothing
+    /// down. Per-controller and re-reading the tab count each step, so a
+    /// multi-tab window closes its tabs and the last one empties — the same
+    /// shape as `closeTabs(forTarget:)`.
+    @MainActor
+    func closeAttachedTabs(_ controllers: [TerminalController], choice: CloseTabChoice) {
+        for controller in controllers {
+            let tabs = controller.window?.tabGroup?.windows.count ?? 1
+            switch Self.closeTabTeardown(choice: choice, siblingTabCount: tabs) {
+            case .closeTab:
+                controller.closeTabImmediately()
+            case .emptyState:
+                enterEmptyState(controller)
+            case nil:
+                break
+            }
         }
     }
 
