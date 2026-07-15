@@ -96,7 +96,7 @@ code consumes from `haunted` / `dedmeshctl`.
 
 **Out of scope:** upstream Ghostty behavior (its own suites cover it);
 libghostty-vt; the C daemon internals (`tests/haunted/` covers those);
-DedMesh transport (Go tests).
+DedNets transport (Go tests).
 
 ---
 
@@ -261,7 +261,7 @@ lone surrogate scalar. Harmless, but do not write a test that pretends to cover 
 | ID-05 | Both complete | default preferred |
 | ID-06 | `settings.json` is malformed | identity loads, `console == nil` (no throw) |
 | ID-07 | `consoleHost` of `"console.example.com:9443"` | `"console.example.com"` |
-| ID-08 | `consoleHost` of `nil` | `"DedMesh"` |
+| ID-08 | `consoleHost` of `nil` | `"DedNets"` |
 | ID-09 | `consoleHost` of `"[::1]:9443"` | ✅ **fixed** — was `"["` (split on `":"` took the first component). Now `URLComponents`-parsed → `"[::1]"`. Note `URLComponents.host` keeps brackets, `URL.host` strips them (SCHEME-05); do not unify. |
 | ID-10 | `certIdentity` from a fixture cert with `CN=alice/term` | `"alice/term"` |
 | ID-11 | `certIdentity` from a **chain** PEM (leaf + intermediate) | ✅ **fixed** — parses the first PEM block only. The plan's "→ nil" was right for ~1/3 of leaves (padded DER → invalid base64) but for the rest the joined blob decoded and Security.framework *silently ignored the stapled second cert*, returning the right CN for the wrong reason. Both fixtures (ID-11a padded, ID-11b unpadded) are pinned. |
@@ -526,7 +526,7 @@ prefer folding; do not add a dependency for four assertions):
 | WAIT-02 | `justStarted == true`, never online | 6 attempts, returns the last (offline) list, ~3s |
 | WAIT-03 | `justStarted == true`, `workstations` throws on attempt 1 | propagates immediately — no retry. Confirm this is intended. |
 | WAIT-04 | `justStarted == false` | exactly one `workstations` call |
-| MENU-01 | `install()` | "Log in with DedMesh Console…" at File index 0, separator below, ⌘⇧L |
+| MENU-01 | `install()` | "Log in with DedNets Console…" at File index 0, separator below, ⌘⇧L |
 | MENU-02 | `install()` called twice | ⚠️ two items, two separators — no idempotency guard. **Expected to fail.** Cheap to fix, cheap to regress on a rebase. |
 | MENU-03 | Main menu localized (no item titled "File") | falls back to `items[1]`; assert it does not crash or target the wrong menu |
 | MENU-04 | `NSApp.mainMenu == nil` | no-op |

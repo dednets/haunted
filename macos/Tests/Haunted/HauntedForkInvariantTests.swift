@@ -338,7 +338,7 @@ struct HauntedForkInvariantTests {
         #expect(plist.contains("<key>SUPublicEDKey</key>"),
                 "Ghostty-Info.plist lost SUPublicEDKey — Sparkle will refuse every update for lack of a trusted key")
         #expect(plist.contains("Bgqf3WsSqHaemD8aHJ3CKImpYu1PnvhjUUsfLdWJRqg="),
-                "SUPublicEDKey is neither Ghostty's nor DedNets' release key — updates signed by the DedNets private key will be rejected")
+                "SUPublicEDKey is neither Ghostty's nor DedNets' release key: updates signed by the DedNets private key will be rejected")
     }
 
     // MARK: Helpers

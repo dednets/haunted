@@ -3,7 +3,7 @@ import Combine
 import SwiftUI
 import GhosttyKit
 
-/// Associates Ghostty windows and surfaces with the enrolled DedMesh client
+/// Associates Ghostty windows and surfaces with the enrolled DedNets client
 /// identity so the workstation sidebar can open attached tabs and splits
 /// inherit the workstation of the surface they were created from.
 ///

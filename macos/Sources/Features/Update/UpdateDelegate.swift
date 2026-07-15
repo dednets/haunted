@@ -11,7 +11,7 @@ extension UpdateDriver: SPUUpdaterDelegate {
         // you share a single appcast file. We don't want to do that so we
         // do this instead.
         //
-        // HAUNTED: these MUST point at DedNets, never at ghostty.org — the
+        // HAUNTED: these MUST point at DedNets, never at ghostty.org: the
         // upstream feed serves stock Ghostty, and accepting one of its updates
         // would replace Haunted.app wholesale (docs/terminal-updates.md; the
         // UPD-01 fork-invariant guard pins this).

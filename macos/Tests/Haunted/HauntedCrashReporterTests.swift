@@ -16,7 +16,7 @@ struct HauntedCrashReporterTests {
         #expect(endpoint.authHeader.contains("sentry_version=7"))
     }
 
-    // CRSH-02: fork invariant — crash reports go to the DedNets org and
+    // CRSH-02: fork invariant: crash reports go to the DedNets org and
     // nowhere else. The same class of guard as UPD-01 (Sparkle feed): a
     // rebase or careless edit must not point crash data at another project.
     @Test func dsnIsPinnedToDedNets() {

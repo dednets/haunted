@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-/// The enrolled DedMesh client identity on disk. Enrollment (`haunted enroll`)
+/// The enrolled DedNets client identity on disk. Enrollment (`haunted enroll`)
 /// stores an mTLS key + certificate plus the console address and a CA copy in
 /// the state dir, so holding a state dir with a certificate is the entire
 /// "logged in" state — there are no passwords or tokens in the GUI.
@@ -193,7 +193,7 @@ extension HauntedClientIdentity {
     /// loopback set matches against). The two APIs disagree; the bracketed form
     /// is the right one to show a human, so do not "unify" them.
     var consoleHost: String {
-        guard let console else { return "DedMesh" }
+        guard let console else { return "DedNets" }
         return URLComponents(string: "//\(console)")?.host ?? console
     }
 

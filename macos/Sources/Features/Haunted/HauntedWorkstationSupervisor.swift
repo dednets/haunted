@@ -1,6 +1,6 @@
 import Foundation
 
-/// Ensures this Mac's own DedMesh workstation stack — `dedmeshd` (mesh
+/// Ensures this Mac's own DedNets workstation stack: `dedmeshd` (mesh
 /// transport, workstation role) plus `haunted-daemon` (the session backend it
 /// fronts) — is running, so a machine configured to host sessions shows up
 /// online in the sidebar without the user starting anything by hand. Only

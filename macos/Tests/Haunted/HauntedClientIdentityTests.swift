@@ -52,7 +52,7 @@ struct HauntedClientIdentityTests {
         -----END CERTIFICATE-----
         """
 
-    /// A second, unrelated self-signed cert (`CN=DedNets Test CA`) — stands in
+    /// A second, unrelated self-signed cert (`CN=DedNets Test CA`): stands in
     /// for the intermediate a chain-issuing console would append.
     private static let issuerPEM = """
         -----BEGIN CERTIFICATE-----
@@ -199,12 +199,12 @@ struct HauntedClientIdentityTests {
         #expect(identity.consoleHost == "console.example.com")
     }
 
-    @Test("ID-08: consoleHost of nil console → \"DedMesh\"")
+    @Test("ID-08: consoleHost of nil console → \"DedNets\"")
     func consoleHostFallsBackWhenUnset() {
         let identity = HauntedClientIdentity(
             stateDir: URL(fileURLWithPath: "/nonexistent"),
             console: nil)
-        #expect(identity.consoleHost == "DedMesh")
+        #expect(identity.consoleHost == "DedNets")
     }
 
     /// ID-09 — regression test for the fixed BUG-2. `consoleHost` used to be

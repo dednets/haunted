@@ -2,12 +2,12 @@ import AppKit
 import SwiftUI
 import GhosttyKit
 
-/// DedMesh Console integration: startup refuses to open a terminal until the
+/// DedNets Console integration: startup refuses to open a terminal until the
 /// app has an enrolled client identity in ~/.config/haunted.
 final class HauntedLoginController: NSWindowController {
     static let shared = HauntedLoginController()
 
-    /// Installs the "Log in with DedMesh Console…" item in the File menu.
+    /// Installs the "Log in with DedNets Console…" item in the File menu.
     /// Called once from applicationDidFinishLaunching. The startup window
     /// itself is opened by `startup()` from applicationDidBecomeActive.
     static func install() {
@@ -102,7 +102,7 @@ final class HauntedLoginController: NSWindowController {
         guard let fileMenu else { return }
 
         let item = NSMenuItem(
-            title: "Log in with DedMesh Console…",
+            title: "Log in with DedNets Console…",
             action: #selector(showLogin(_:)),
             keyEquivalent: "L")
         item.keyEquivalentModifierMask = [.command, .shift]
@@ -117,7 +117,7 @@ final class HauntedLoginController: NSWindowController {
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false)
-        window.title = "Log in with DedMesh Console"
+        window.title = "Log in with DedNets Console"
         window.isReleasedWhenClosed = false
         super.init(window: window)
 
@@ -241,7 +241,7 @@ struct HauntedLoginView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("DedMesh Console")
+            Text("DedNets Console")
                 .font(.headline)
             Text("Log in once. Haunted stores the Terminal certificate in ~/.config/haunted and connects automatically after that.")
                 .font(.callout)
