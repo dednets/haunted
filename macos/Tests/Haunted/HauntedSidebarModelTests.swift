@@ -29,14 +29,14 @@ struct HauntedSidebarModelTests {
         private var _liveArgs: [[String]] = []
 
         /// Answers for successive `list` calls; the last repeats.
-        var workstationResults: [Result<[HauntedWorkstation], any Error>] = [.success([])]
+        var nodeResults: [Result<[HauntedNode], any Error>] = [.success([])]
         /// Per-target LIVE answers. A requested target missing here gets a
         /// per-row liveError instead.
-        var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
+        var sessionsByTarget: [String: [HauntedNodeSession]] = [:]
         /// Per-target console snapshot summaries (never titled in production;
         /// these fakes don't enforce that).
-        var summariesByTarget: [String: [HauntedWorkstationSession]] = [:]
-        /// What `setWorkstationColor` answers; recorded calls in `colorCalls`.
+        var summariesByTarget: [String: [HauntedNodeSession]] = [:]
+        /// What `setNodeColor` answers; recorded calls in `colorCalls`.
         var setColorResult: Result<Void, any Error> = .success(())
         private var _colorCalls: [(daemon: String, color: String?)] = []
 
@@ -66,12 +66,12 @@ struct HauntedSidebarModelTests {
 
         func list(
             identity: HauntedClientIdentity, live: [String]
-        ) async throws -> [HauntedWorkstationListing] {
+        ) async throws -> [HauntedNodeListing] {
             lock.lock()
-            let index = min(_listCalls, workstationResults.count - 1)
+            let index = min(_listCalls, nodeResults.count - 1)
             _listCalls += 1
             _liveArgs.append(live)
-            let result = workstationResults[index]
+            let result = nodeResults[index]
             lock.unlock()
             while listHold { await Task.yield() }
             let wanted = Set(live)
@@ -79,24 +79,24 @@ struct HauntedSidebarModelTests {
             let liveMap = sessionsByTarget
             let summaries = summariesByTarget
             lock.unlock()
-            return try result.get().map { workstation in
-                var liveOut: [HauntedWorkstationSession]?
+            return try result.get().map { node in
+                var liveOut: [HauntedNodeSession]?
                 var liveError: String?
-                if workstation.online, wanted.contains(workstation.target) {
-                    if let sessions = liveMap[workstation.target] {
+                if node.online, wanted.contains(node.target) {
+                    if let sessions = liveMap[node.target] {
                         liveOut = sessions
                     } else {
                         liveError = "unreachable"
                     }
                 }
-                return HauntedWorkstationListing(
-                    workstation: workstation,
-                    sessions: summaries[workstation.target] ?? [],
+                return HauntedNodeListing(
+                    node: node,
+                    sessions: summaries[node.target] ?? [],
                     live: liveOut, liveError: liveError)
             }
         }
 
-        func setWorkstationColor(
+        func setNodeColor(
             identity: HauntedClientIdentity, daemon: String, color: String?
         ) async throws {
             lock.lock()
@@ -112,14 +112,14 @@ struct HauntedSidebarModelTests {
     private static let otherIdentity = HauntedClientIdentity(
         stateDir: URL(fileURLWithPath: "/elsewhere"), console: "c.example.com:9443")
 
-    private static func workstation(_ target: String, online: Bool) -> HauntedWorkstation {
-        HauntedWorkstation(
+    private static func node(_ target: String, online: Bool) -> HauntedNode {
+        HauntedNode(
             target: target, daemon: String(target.split(separator: "/")[1]),
             app: "haunted", online: online, state: nil, error: nil)
     }
 
-    private static func session(_ name: String) -> HauntedWorkstationSession {
-        HauntedWorkstationSession(
+    private static func session(_ name: String) -> HauntedNodeSession {
+        HauntedNodeSession(
             name: name, pid: 1, clients: 0, cols: 80, rows: 24, created: 0, title: nil)
     }
 
@@ -130,13 +130,13 @@ struct HauntedSidebarModelTests {
         pollInterval: TimeInterval = 3600,
         refreshDelay: TimeInterval = 0.05,
         killed: @escaping @MainActor (String, String) -> Void = { _, _ in },
-        closedWorkstation: @escaping @MainActor (String) -> Void = { _ in },
+        closedNode: @escaping @MainActor (String) -> Void = { _ in },
         localTabsProvider: @escaping @MainActor () -> [HauntedLocalTab] = { [] }
     ) -> HauntedSidebarModel {
         HauntedSidebarModel(
             client: client,
             killSession: { _, target, name in killed(target, name) },
-            closeWorkstation: closedWorkstation,
+            closeNode: closedNode,
             pollInterval: pollInterval,
             refreshDelay: refreshDelay,
             localTabsProvider: localTabsProvider)
@@ -163,7 +163,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-01: start twice with the same identity runs one poll loop")
     func startIsIdempotent() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: false)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: false)])]
         // Cross-test isolation: other suites post .hauntedSessionsDidChange;
         // a huge refreshDelay keeps those from inflating this test's counts.
         let model = makeModel(client, refreshDelay: 3600)
@@ -181,7 +181,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-02: start with a different identity restarts the poll")
     func startWithNewIdentityRestarts() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: false)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: false)])]
         let model = makeModel(client)
         defer { model.stop() }
 
@@ -198,7 +198,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-11: a stopped poll resumes on the next start, keeping its data")
     func stoppedPollResumes() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: false)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: false)])]
         let model = makeModel(client)
         defer { model.stop() }
 
@@ -208,7 +208,7 @@ struct HauntedSidebarModelTests {
 
         model.stop()
         try await Task.sleep(nanoseconds: 50_000_000)
-        #expect(model.workstations.count == 1, "stopping must not discard data")
+        #expect(model.nodes.count == 1, "stopping must not discard data")
 
         model.start(identity: Self.identity)
         try await waitUntil({ client.listCalls > after }, "poll resumes")
@@ -219,11 +219,11 @@ struct HauntedSidebarModelTests {
     /// MOD-03. The sidebar must not blink to empty because one `dedmeshctl`
     /// invocation failed; the user is looking at a list of machines, not a
     /// liveness indicator.
-    @Test("MOD-03: a failing poll sets errorMessage and retains the workstations")
+    @Test("MOD-03: a failing poll sets errorMessage and retains the nodes")
     func failingPollRetainsData() async throws {
         let client = FakeListing()
-        client.workstationResults = [
-            .success([Self.workstation("a/b/haunted", online: false)]),
+        client.nodeResults = [
+            .success([Self.node("a/b/haunted", online: false)]),
             .failure(HauntedCLIError(message: "mesh down")),
         ]
         let model = makeModel(client, pollInterval: 0.05)
@@ -233,32 +233,32 @@ struct HauntedSidebarModelTests {
         try await waitUntil({ model.errorMessage != nil }, "the failure lands")
 
         #expect(model.errorMessage == "mesh down")
-        #expect(model.workstations.map(\.target) == ["a/b/haunted"], "data must survive")
+        #expect(model.nodes.map(\.target) == ["a/b/haunted"], "data must survive")
     }
 
     @Test("MOD-04: a recovering poll clears errorMessage")
     func recoveringPollClearsError() async throws {
         let client = FakeListing()
-        client.workstationResults = [
+        client.nodeResults = [
             .failure(HauntedCLIError(message: "mesh down")),
-            .success([Self.workstation("a/b/haunted", online: false)]),
+            .success([Self.node("a/b/haunted", online: false)]),
         ]
         let model = makeModel(client, pollInterval: 0.05)
         defer { model.stop() }
 
         model.start(identity: Self.identity)
-        try await waitUntil({ model.errorMessage == nil && !model.workstations.isEmpty },
+        try await waitUntil({ model.errorMessage == nil && !model.nodes.isEmpty },
                             "recovery")
     }
 
     // MARK: MOD-05/06 — expansion state
 
-    @Test("MOD-05: the first load auto-expands online workstations only")
+    @Test("MOD-05: the first load auto-expands online nodes only")
     func firstLoadExpandsOnline() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([
-            Self.workstation("a/on/haunted", online: true),
-            Self.workstation("a/off/haunted", online: false),
+        client.nodeResults = [.success([
+            Self.node("a/on/haunted", online: true),
+            Self.node("a/off/haunted", online: false),
         ])]
         client.sessionsByTarget = ["a/on/haunted": []]
         let model = makeModel(client)
@@ -274,7 +274,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-06: a later poll does not re-derive expansion, so a collapse survives")
     func laterPollKeepsUserCollapse() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/on/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/on/haunted", online: true)])]
         client.sessionsByTarget = ["a/on/haunted": []]
         let model = makeModel(client, pollInterval: 0.05)
         defer { model.stop() }
@@ -283,12 +283,12 @@ struct HauntedSidebarModelTests {
         try await waitUntil({ model.loaded })
         try #require(model.expanded == ["a/on/haunted"])
 
-        model.toggle(Self.workstation("a/on/haunted", online: true))
+        model.toggle(Self.node("a/on/haunted", online: true))
         #expect(model.expanded.isEmpty)
 
         let calls = client.listCalls
         try await waitUntil({ client.listCalls > calls + 1 }, "two more polls")
-        #expect(model.expanded.isEmpty, "the poll must not reopen a collapsed workstation")
+        #expect(model.expanded.isEmpty, "the poll must not reopen a collapsed node")
     }
 
     // MARK: MOD-07 — kill
@@ -296,8 +296,8 @@ struct HauntedSidebarModelTests {
     @Test("MOD-07: kill removes the session optimistically and delegates")
     func killIsOptimistic() async throws {
         let client = FakeListing()
-        let workstation = Self.workstation("a/b/haunted", online: true)
-        client.workstationResults = [.success([workstation])]
+        let node = Self.node("a/b/haunted", online: true)
+        client.nodeResults = [.success([node])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("one"), Self.session("two")]]
 
         var killedWith: (String, String)?
@@ -307,7 +307,7 @@ struct HauntedSidebarModelTests {
         model.start(identity: Self.identity)
         try await waitUntil({ model.sessionsByTarget["a/b/haunted"]?.count == 2 })
 
-        model.kill(workstation: workstation, session: "one")
+        model.kill(node: node, session: "one")
         #expect(model.sessionsByTarget["a/b/haunted"]?.map(\.name) == ["two"],
                 "the row disappears before the daemon has answered")
         #expect(killedWith?.0 == "a/b/haunted")
@@ -318,7 +318,7 @@ struct HauntedSidebarModelTests {
     func killWithoutIdentity() {
         var killCount = 0
         let model = makeModel(FakeListing(), killed: { _, _ in killCount += 1 })
-        model.kill(workstation: Self.workstation("a/b/haunted", online: true), session: "one")
+        model.kill(node: Self.node("a/b/haunted", online: true), session: "one")
         #expect(killCount == 0)
     }
 
@@ -327,7 +327,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-08: hauntedSessionsDidChange refreshes sessions after the delay")
     func notificationTriggersRefresh() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("one")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -350,7 +350,7 @@ struct HauntedSidebarModelTests {
     @Test("EXIT-03: a session reaped by the daemon disappears on the next refresh")
     func endedSessionLeavesTheSidebar() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work"), Self.session("other")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -368,10 +368,10 @@ struct HauntedSidebarModelTests {
     }
 
     /// The last session ending leaves an empty list, not a stale one.
-    @Test("EXIT-03: the last session ending empties the workstation's list")
+    @Test("EXIT-03: the last session ending empties the node's list")
     func lastSessionEndingEmptiesList() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -386,12 +386,12 @@ struct HauntedSidebarModelTests {
 
     // MARK: MOD-09/10 — ordering and partial failure
 
-    @Test("MOD-09: workstations sort by target, sessions by name")
+    @Test("MOD-09: nodes sort by target, sessions by name")
     func ordering() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([
-            Self.workstation("a/z/haunted", online: true),
-            Self.workstation("a/a/haunted", online: true),
+        client.nodeResults = [.success([
+            Self.node("a/z/haunted", online: true),
+            Self.node("a/a/haunted", online: true),
         ])]
         client.sessionsByTarget = [
             "a/z/haunted": [Self.session("zeta"), Self.session("alpha")],
@@ -403,18 +403,18 @@ struct HauntedSidebarModelTests {
         model.start(identity: Self.identity)
         try await waitUntil({ model.sessionsByTarget["a/z/haunted"] != nil })
 
-        #expect(model.workstations.map(\.target) == ["a/a/haunted", "a/z/haunted"])
+        #expect(model.nodes.map(\.target) == ["a/a/haunted", "a/z/haunted"])
         #expect(model.sessionsByTarget["a/z/haunted"]?.map(\.name) == ["alpha", "zeta"])
     }
 
     /// MOD-10. A mesh blip on one daemon must not empty the whole sidebar:
     /// its row answers `live_error` and keeps whatever it last showed.
-    @Test("MOD-10: one workstation's live listing failing leaves the others intact")
+    @Test("MOD-10: one node's live listing failing leaves the others intact")
     func partialSessionFailure() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([
-            Self.workstation("a/good/haunted", online: true),
-            Self.workstation("a/bad/haunted", online: true),
+        client.nodeResults = [.success([
+            Self.node("a/good/haunted", online: true),
+            Self.node("a/bad/haunted", online: true),
         ])]
         // "a/bad/haunted" is absent, so the fake answers its row with a
         // liveError instead of a live list.
@@ -428,7 +428,7 @@ struct HauntedSidebarModelTests {
         #expect(model.sessionsByTarget["a/good/haunted"]?.map(\.name) == ["one"])
         #expect(model.sessionsByTarget["a/bad/haunted"]?.isEmpty != false,
                 "the failed row shows nothing, not garbage")
-        #expect(model.workstations.count == 2, "both rows still show")
+        #expect(model.nodes.count == 2, "both rows still show")
     }
 
     /// MOD-10. A row that HAD sessions keeps them across a live failure —
@@ -436,7 +436,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-10: a live failure keeps the sessions the row last showed")
     func liveFailureKeepsPreviousSessions() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -451,12 +451,12 @@ struct HauntedSidebarModelTests {
                 "the last-known sessions survive a live failure")
     }
 
-    /// Offline workstations are never queried live — an offline daemon has no
+    /// Offline nodes are never queried live — an offline daemon has no
     /// sessions to report and the attempt would just fail slowly.
-    @Test("MOD-10: offline workstations are not queried for sessions")
-    func offlineWorkstationsNotQueried() async throws {
+    @Test("MOD-10: offline nodes are not queried for sessions")
+    func offlineNodesNotQueried() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/off/haunted", online: false)])]
+        client.nodeResults = [.success([Self.node("a/off/haunted", online: false)])]
         let model = makeModel(client)
         defer { model.stop() }
 
@@ -474,7 +474,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-14: applyLocalTitle retitles a known session without a poll")
     func localTitleAppliesImmediately() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
         let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
@@ -497,7 +497,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-14: applyLocalTitle for an unknown session or target is a no-op")
     func localTitleUnknownIsNoOp() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.sessionsByTarget = ["a/b/haunted": [Self.session("work")]]
         let model = makeModel(client)
         defer { model.stop() }
@@ -520,22 +520,22 @@ struct HauntedSidebarModelTests {
     /// row is not enough: its open tabs would otherwise reconnect-loop for
     /// minutes and then strand a dead banner, and its sessions would linger in
     /// the model. The removal has to close those tabs and prune the sessions.
-    @Test("MOD-12: a workstation removed from the poll closes its tabs and drops its sessions")
-    func removedWorkstationClosesTabs() async throws {
+    @Test("MOD-12: a node removed from the poll closes its tabs and drops its sessions")
+    func removedNodeClosesTabs() async throws {
         let client = FakeListing()
-        let a = Self.workstation("u/a/haunted", online: true)
-        let b = Self.workstation("u/b/haunted", online: true)
+        let a = Self.node("u/a/haunted", online: true)
+        let b = Self.node("u/b/haunted", online: true)
         // The first cycle consumes TWO answers (the auto-expand follow-up
         // pass re-lists to fetch the new hosts' titles); b is gone from the
         // next cycle — the admin removed it on the console.
-        client.workstationResults = [.success([a, b]), .success([a, b]), .success([a])]
+        client.nodeResults = [.success([a, b]), .success([a, b]), .success([a])]
         client.sessionsByTarget = [
             "u/a/haunted": [Self.session("s1")],
             "u/b/haunted": [Self.session("s2")],
         ]
         var closed: [String] = []
         let model = makeModel(client, pollInterval: 0.05, refreshDelay: 3600,
-                              closedWorkstation: { closed.append($0) })
+                              closedNode: { closed.append($0) })
         defer { model.stop() }
 
         model.start(identity: Self.identity)
@@ -543,7 +543,7 @@ struct HauntedSidebarModelTests {
                             "b's sessions loaded on the first poll")
 
         try await waitUntil(
-            { !model.workstations.contains { $0.id == "u/b/haunted" } },
+            { !model.nodes.contains { $0.id == "u/b/haunted" } },
             "b drops off on the second poll")
 
         #expect(closed == ["u/b/haunted"],
@@ -559,13 +559,13 @@ struct HauntedSidebarModelTests {
     /// *expanded* so its sessions are visible — the first-load auto-expand
     /// (MOD-05) otherwise never fires for a host that shows up later, and the
     /// user sees a bare collapsed row that reads as "add didn't work".
-    @Test("MOD-13: a workstation appearing on a later poll is auto-expanded, and a collapse survives")
-    func addedWorkstationAutoExpands() async throws {
+    @Test("MOD-13: a node appearing on a later poll is auto-expanded, and a collapse survives")
+    func addedNodeAutoExpands() async throws {
         let client = FakeListing()
-        let a = Self.workstation("u/a/haunted", online: true)
-        let b = Self.workstation("u/b/haunted", online: true)
+        let a = Self.node("u/a/haunted", online: true)
+        let b = Self.node("u/b/haunted", online: true)
         // First cycle = two answers (follow-up pass); b appears after that.
-        client.workstationResults = [.success([a]), .success([a]), .success([a, b])]
+        client.nodeResults = [.success([a]), .success([a]), .success([a, b])]
         client.sessionsByTarget = ["u/a/haunted": [], "u/b/haunted": []]
         let model = makeModel(client, pollInterval: 0.05, refreshDelay: 3600)
         defer { model.stop() }
@@ -575,7 +575,7 @@ struct HauntedSidebarModelTests {
         model.toggle(a) // the user collapses the one host they can see
         try #require(!model.expanded.contains("u/a/haunted"))
 
-        try await waitUntil({ model.workstations.contains { $0.id == "u/b/haunted" } },
+        try await waitUntil({ model.nodes.contains { $0.id == "u/b/haunted" } },
                             "b appears on a later poll")
 
         #expect(model.expanded.contains("u/b/haunted"),
@@ -605,7 +605,7 @@ struct HauntedSidebarModelTests {
         box.tabs = [HauntedLocalTab(id: ObjectIdentifier(anchor1), title: "zsh")]
 
         let client = FakeListing()
-        client.workstationResults = [.success([])]
+        client.nodeResults = [.success([])]
         let model = makeModel(client, localTabsProvider: { box.tabs })
         defer { model.stop() }
 
@@ -633,8 +633,8 @@ struct HauntedSidebarModelTests {
     @Test("MOD-16: live queries exactly the expanded set; expanding fetches immediately")
     func expandedOnlyQuerying() async throws {
         let client = FakeListing()
-        let ws = Self.workstation("a/x/haunted", online: true)
-        client.workstationResults = [.success([ws])]
+        let ws = Self.node("a/x/haunted", online: true)
+        client.nodeResults = [.success([ws])]
         client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
         let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
@@ -643,7 +643,7 @@ struct HauntedSidebarModelTests {
         try await waitUntil({ model.loaded })
         try #require(model.expanded.contains("a/x/haunted"), "online host auto-expands")
         #expect(client.liveArgs.last == ["a/x/haunted"],
-                "the auto-expanded workstation is queried live on load")
+                "the auto-expanded node is queried live on load")
         let afterLoad = client.liveRequests.count
 
         // Collapse → the next refresh still runs, but queries nothing live.
@@ -651,7 +651,7 @@ struct HauntedSidebarModelTests {
         try #require(!model.expanded.contains("a/x/haunted"))
         await model.refreshSessions()
         #expect(client.liveArgs.last == [],
-                "a collapsed workstation is not queried live")
+                "a collapsed node is not queried live")
         #expect(client.liveRequests.count == afterLoad)
 
         // Re-expand → fetched at once, not left to the next poll.
@@ -661,16 +661,16 @@ struct HauntedSidebarModelTests {
         #expect(client.liveArgs.last == ["a/x/haunted"])
     }
 
-    /// An inactive app polls on the slow interval — the workstation list is
+    /// An inactive app polls on the slow interval — the node list is
     /// not re-fetched on the active cadence while nobody is watching.
     @Test("MOD-17: an inactive app backs off to the slow poll interval")
     func inactiveBackoff() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([])]
+        client.nodeResults = [.success([])]
         let model = HauntedSidebarModel(
             client: client,
             killSession: { _, _, _ in },
-            closeWorkstation: { _ in },
+            closeNode: { _ in },
             pollInterval: 0.05,
             inactivePollInterval: 3600,
             isAppActive: { false },
@@ -693,8 +693,8 @@ struct HauntedSidebarModelTests {
     @Test("MOD-18: overlapping refreshes coalesce into one re-run")
     func refreshCoalesces() async throws {
         let client = FakeListing()
-        let ws = Self.workstation("a/x/haunted", online: true)
-        client.workstationResults = [.success([ws])]
+        let ws = Self.node("a/x/haunted", online: true)
+        client.nodeResults = [.success([ws])]
         client.sessionsByTarget = ["a/x/haunted": [Self.session("one")]]
         let model = makeModel(client, refreshDelay: 3600) // notification cross-talk isolation
         defer { model.stop() }
@@ -732,7 +732,7 @@ struct HauntedSidebarModelTests {
     @Test("MOD-19: summaries seed a row whose live list never loaded")
     func summariesSeedUnloadedRows() async throws {
         let client = FakeListing()
-        client.workstationResults = [.success([Self.workstation("a/b/haunted", online: true)])]
+        client.nodeResults = [.success([Self.node("a/b/haunted", online: true)])]
         client.summariesByTarget = ["a/b/haunted": [Self.session("main")]]
         // No sessionsByTarget entry: every live query answers liveError.
         let model = makeModel(client)
@@ -749,10 +749,10 @@ struct HauntedSidebarModelTests {
     @Test("MOD-19: summaries never overwrite an already-loaded live list")
     func summariesDoNotOverwriteLive() async throws {
         let client = FakeListing()
-        let ws = Self.workstation("a/b/haunted", online: true)
-        client.workstationResults = [.success([ws])]
+        let ws = Self.node("a/b/haunted", online: true)
+        client.nodeResults = [.success([ws])]
         client.sessionsByTarget = ["a/b/haunted": [
-            HauntedWorkstationSession(
+            HauntedNodeSession(
                 name: "work", pid: 1, clients: 0, cols: 80, rows: 24,
                 created: 0, title: "vim"),
         ]]
@@ -781,7 +781,7 @@ struct HauntedSidebarModelTests {
                 throw HauntedCLIError(
                     message: "flag provided but not defined: -sessions")
             }
-            if command.contains(" workstations -json ") {
+            if command.contains(" haunted -json ") {
                 return Data(#"""
                 [{"target":"a/b/haunted","daemon":"b","app":"haunted","online":true,"state":"active"}]
                 """#.utf8)
@@ -800,7 +800,7 @@ struct HauntedSidebarModelTests {
 
         let rows = try await listing.list(identity: Self.identity, live: ["a/b/haunted"])
         #expect(rows.count == 1)
-        #expect(rows[0].workstation.target == "a/b/haunted")
+        #expect(rows[0].node.target == "a/b/haunted")
         #expect(rows[0].live?.map(\.name) == ["work"],
                 "the legacy path still delivers live sessions")
         #expect(listing.legacyCLI, "the failed probe latched")

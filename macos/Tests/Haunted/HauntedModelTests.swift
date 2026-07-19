@@ -49,15 +49,15 @@ struct HauntedModelTests {
         #expect(sessions[0].title == "vim")
     }
 
-    @Test("DEC-04: workstation without error/state decodes")
-    func decodeWorkstationSparse() throws {
+    @Test("DEC-04: node without error/state decodes")
+    func decodeNodeSparse() throws {
         let json = Data("""
         [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true}]
         """.utf8)
-        let workstations = try HauntedCLI.decodeWorkstations(json)
-        #expect(workstations.count == 1)
-        #expect(workstations[0].state == nil)
-        #expect(workstations[0].error == nil)
+        let nodes = try HauntedCLI.decodeNodes(json)
+        #expect(nodes.count == 1)
+        #expect(nodes[0].state == nil)
+        #expect(nodes[0].error == nil)
     }
 
     @Test("DEC-05: pid at UInt32.max decodes")
@@ -73,18 +73,18 @@ struct HauntedModelTests {
     func decodeMalformed() {
         let json = Data("{not json".utf8)
         #expect(throws: (any Error).self) { try HauntedCLI.decodeSessions(json) }
-        #expect(throws: (any Error).self) { try HauntedCLI.decodeWorkstations(json) }
-        #expect(throws: (any Error).self) { try HauntedCLI.decodeWorkstationListings(json) }
+        #expect(throws: (any Error).self) { try HauntedCLI.decodeNodes(json) }
+        #expect(throws: (any Error).self) { try HauntedCLI.decodeNodeListings(json) }
     }
 
-    /// DEC-07. The combined `workstations -json -sessions` row: flat ref keys
+    /// DEC-07. The combined `haunted -json -sessions` row: flat ref keys
     /// (the same object shape as the plain list — pinned by a golden test on
     /// the Go side), `sessions` summaries, and the three live states — titled
     /// list, `live: []` (queried, none), and `live_error`. The same decode
     /// boundary rules apply: hostile session names are dropped from BOTH
     /// lists, colors are normalized, unsafe targets are dropped.
     @Test("DEC-07: combined listing decodes flat ref + sessions + live/live_error")
-    func decodeWorkstationListings() throws {
+    func decodeNodeListings() throws {
         let json = Data("""
         [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true,
           "state":"active","color":"#E5484D",
@@ -98,12 +98,12 @@ struct HauntedModelTests {
           "state":"active","live_error":"stream refused"},
          {"target":"-hostile","daemon":"x","app":"haunted","online":true}]
         """.utf8)
-        let rows = try HauntedCLI.decodeWorkstationListings(json)
+        let rows = try HauntedCLI.decodeNodeListings(json)
         #expect(rows.count == 3, "the unsafe target is dropped at the boundary")
 
         let box = rows[0]
-        #expect(box.workstation.target == "alice/box/haunted")
-        #expect(box.workstation.color == "#e5484d", "color normalized like the plain list")
+        #expect(box.node.target == "alice/box/haunted")
+        #expect(box.node.color == "#e5484d", "color normalized like the plain list")
         #expect(box.sessions.map(\.name) == ["main"], "hostile summary names dropped")
         #expect(box.live?.map(\.name) == ["main"])
         #expect(box.live?.first?.title == "vim")
@@ -118,14 +118,14 @@ struct HauntedModelTests {
         #expect(rows[2].sessions.isEmpty)
     }
 
-    /// DEC-07b. Plain `workstations -json` output (no -sessions run) decodes
+    /// DEC-07b. Plain `haunted -json` output (no -sessions run) decodes
     /// through the same type: every listing field simply absent.
-    @Test("DEC-07b: a plain workstations row decodes as an unqueried listing")
+    @Test("DEC-07b: a plain nodes row decodes as an unqueried listing")
     func decodePlainRowAsListing() throws {
         let json = Data("""
         [{"target":"alice/box/haunted","daemon":"box","app":"haunted","online":true}]
         """.utf8)
-        let rows = try HauntedCLI.decodeWorkstationListings(json)
+        let rows = try HauntedCLI.decodeNodeListings(json)
         #expect(rows.count == 1)
         #expect(rows[0].sessions.isEmpty)
         #expect(rows[0].live == nil)
@@ -134,18 +134,18 @@ struct HauntedModelTests {
 
     // MARK: STAT-01…05
 
-    @Test("STAT: workstation status", arguments: [
+    @Test("STAT: node status", arguments: [
         (true, String?.none, "online"),      // STAT-01
         (true, "error", "online"),           // STAT-02 online wins
         (false, "active", "offline"),        // STAT-03 the != "active" guard falls through
         (false, "error", "error"),           // STAT-04
         (false, String?.none, "offline"),    // STAT-05
     ])
-    func workstationStatus(online: Bool, state: String?, expected: String) {
-        let workstation = HauntedWorkstation(
+    func nodeStatus(online: Bool, state: String?, expected: String) {
+        let node = HauntedNode(
             target: "alice/box/haunted", daemon: "box", app: "haunted",
             online: online, state: state, error: nil)
-        #expect(workstation.status == expected)
+        #expect(node.status == expected)
     }
 
     // MARK: TITLE-01…07
@@ -162,7 +162,7 @@ struct HauntedModelTests {
         ("a\u{1B}[31mred", "a[31mred"),          // ESC stripped, literal text kept
     ])
     func displayTitle(title: String?, expected: String) {
-        let session = HauntedWorkstationSession(
+        let session = HauntedNodeSession(
             name: "gui-1a2b3c4d", pid: 1, clients: 0, cols: 80, rows: 24,
             created: 0, title: title)
         #expect(session.displayTitle == expected)
@@ -178,7 +178,7 @@ struct HauntedModelTests {
         let hostile = "gui-\u{07}x"
 
         // Displayed raw if it ever got this far...
-        let session = HauntedWorkstationSession(
+        let session = HauntedNodeSession(
             name: hostile, pid: 1, clients: 0, cols: 80, rows: 24,
             created: 0, title: nil)
         #expect(session.displayTitle == hostile)

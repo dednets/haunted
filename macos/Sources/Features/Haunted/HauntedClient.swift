@@ -240,9 +240,9 @@ extension HauntedClientIdentity {
     }
 }
 
-/// A workstation this client may reach, as listed by
-/// `dedmeshctl workstations -json`.
-struct HauntedWorkstation: Decodable, Identifiable, Equatable {
+/// A node this client may reach, as listed by
+/// `dedmeshctl haunted -json`.
+struct HauntedNode: Decodable, Identifiable, Equatable {
     let target: String // username/daemon/app — pass to attach
     let daemon: String // display name
     let app: String
@@ -298,24 +298,24 @@ struct HauntedWorkstation: Decodable, Identifiable, Equatable {
 
     /// A copy whose color survived normalization (nil otherwise). Applied at
     /// the decode boundary so nothing downstream ever sees a raw color.
-    func normalizingColor() -> HauntedWorkstation {
-        HauntedWorkstation(
+    func normalizingColor() -> HauntedNode {
+        HauntedNode(
             target: target, daemon: daemon, app: app, online: online,
             state: state, error: error, color: Self.normalizedColor(color))
     }
 
     /// A copy carrying `color` verbatim — the optimistic local recolor (the
     /// caller passes an already-normalized palette value or nil).
-    func withColor(_ color: String?) -> HauntedWorkstation {
-        HauntedWorkstation(
+    func withColor(_ color: String?) -> HauntedNode {
+        HauntedNode(
             target: target, daemon: daemon, app: app, online: online,
             state: state, error: error, color: color)
     }
 }
 
-/// A session running on a workstation's Haunted daemon, as listed by
+/// A session running on a node's Haunted daemon, as listed by
 /// `haunted list --target … --json`.
-struct HauntedWorkstationSession: Decodable, Identifiable, Equatable {
+struct HauntedNodeSession: Decodable, Identifiable, Equatable {
     let name: String
     let pid: UInt32
     let clients: Int
@@ -347,18 +347,18 @@ struct HauntedWorkstationSession: Decodable, Identifiable, Equatable {
     }
 }
 
-/// One row of `dedmeshctl workstations -json -sessions`: the flat workstation
-/// ref plus the console's snapshot session summaries and — for workstations
+/// One row of `dedmeshctl haunted -json -sessions`: the flat node
+/// ref plus the console's snapshot session summaries and — for nodes
 /// the call queried live — the fresh titled list. Exactly one of `live` /
-/// `liveError` is present for a queried workstation; both absent means "not
+/// `liveError` is present for a queried node; both absent means "not
 /// queried this round" (a collapsed row), and `live: []` means "queried, zero
 /// sessions" — the caller must clear its cache, not keep stale rows.
-struct HauntedWorkstationListing: Decodable, Equatable {
-    let workstation: HauntedWorkstation
+struct HauntedNodeListing: Decodable, Equatable {
+    let node: HauntedNode
     /// The console's last-snapshot summaries (≤30s stale, never titled).
-    let sessions: [HauntedWorkstationSession]
+    let sessions: [HauntedNodeSession]
     /// The fresh end-to-end list (titles included), when queried.
-    let live: [HauntedWorkstationSession]?
+    let live: [HauntedNodeSession]?
     let liveError: String?
 
     enum CodingKeys: String, CodingKey {
@@ -368,12 +368,12 @@ struct HauntedWorkstationListing: Decodable, Equatable {
     }
 
     init(
-        workstation: HauntedWorkstation,
-        sessions: [HauntedWorkstationSession] = [],
-        live: [HauntedWorkstationSession]? = nil,
+        node: HauntedNode,
+        sessions: [HauntedNodeSession] = [],
+        live: [HauntedNodeSession]? = nil,
         liveError: String? = nil
     ) {
-        self.workstation = workstation
+        self.node = node
         self.sessions = sessions
         self.live = live
         self.liveError = liveError
@@ -381,22 +381,22 @@ struct HauntedWorkstationListing: Decodable, Equatable {
 
     init(from decoder: Decoder) throws {
         // The ref keys are flat on the same object (pinned by a golden test
-        // on the Go side), so the workstation decodes from the same decoder.
-        workstation = try HauntedWorkstation(from: decoder)
+        // on the Go side), so the node decodes from the same decoder.
+        node = try HauntedNode(from: decoder)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         sessions = try container.decodeIfPresent(
-            [HauntedWorkstationSession].self, forKey: .sessions) ?? []
+            [HauntedNodeSession].self, forKey: .sessions) ?? []
         live = try container.decodeIfPresent(
-            [HauntedWorkstationSession].self, forKey: .live)
+            [HauntedNodeSession].self, forKey: .live)
         liveError = try container.decodeIfPresent(String.self, forKey: .liveError)
     }
 
     /// A copy that survived the decode boundary: color normalized, session
     /// records with names outside the daemon grammar dropped (both lists are
     /// remote-controlled JSON, same rules as decodeSessions).
-    func sanitized() -> HauntedWorkstationListing {
-        HauntedWorkstationListing(
-            workstation: workstation.normalizingColor(),
+    func sanitized() -> HauntedNodeListing {
+        HauntedNodeListing(
+            node: node.normalizingColor(),
             sessions: sessions.filter { isValidSessionName($0.name) },
             live: live.map { $0.filter { isValidSessionName($0.name) } },
             liveError: liveError)
@@ -414,7 +414,7 @@ struct HauntedCLIError: LocalizedError {
 /// risks being misread as one of the CLI's own flags rather than the
 /// positional it's meant to be (e.g. a compromised console returning a
 /// crafted session name). Both values come from remote-controlled JSON
-/// (`dedmeshctl workstations -json`, `haunted list --json`), so reject them
+/// (`dedmeshctl haunted -json`, `haunted list --json`), so reject them
 /// at that decode boundary rather than at each call site.
 ///
 /// Control and format scalars are rejected too: `name` is interpolated into
@@ -506,53 +506,53 @@ enum HauntedCLI {
         return tool
     }
 
-    /// The decode boundary for `dedmeshctl workstations -json`. Split out from
+    /// The decode boundary for `dedmeshctl haunted -json`. Split out from
     /// the process call so the JSON contract is testable without a subprocess.
-    static func decodeWorkstations(_ data: Data) throws -> [HauntedWorkstation] {
-        try JSONDecoder().decode([HauntedWorkstation].self, from: data)
+    static func decodeNodes(_ data: Data) throws -> [HauntedNode] {
+        try JSONDecoder().decode([HauntedNode].self, from: data)
             .filter { isSafeCLIArgument($0.target) }
             .map { $0.normalizingColor() }
     }
 
     /// The decode boundary for `haunted list --json`.
-    static func decodeSessions(_ data: Data) throws -> [HauntedWorkstationSession] {
-        try JSONDecoder().decode([HauntedWorkstationSession].self, from: data)
+    static func decodeSessions(_ data: Data) throws -> [HauntedNodeSession] {
+        try JSONDecoder().decode([HauntedNodeSession].self, from: data)
             .filter { isValidSessionName($0.name) }
     }
 
-    /// The decode boundary for `dedmeshctl workstations -json -sessions`.
-    static func decodeWorkstationListings(_ data: Data) throws -> [HauntedWorkstationListing] {
-        try JSONDecoder().decode([HauntedWorkstationListing].self, from: data)
-            .filter { isSafeCLIArgument($0.workstation.target) }
+    /// The decode boundary for `dedmeshctl haunted -json -sessions`.
+    static func decodeNodeListings(_ data: Data) throws -> [HauntedNodeListing] {
+        try JSONDecoder().decode([HauntedNodeListing].self, from: data)
+            .filter { isSafeCLIArgument($0.node.target) }
             .map { $0.sanitized() }
     }
 
-    static func workstations(
+    static func nodes(
         identity: HauntedClientIdentity,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
         fs: HauntedFileSystem = .real
-    ) async throws -> [HauntedWorkstation] {
+    ) async throws -> [HauntedNode] {
         let data = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstations -json -state-dir \(quote(identity.stateDir.path))")
-        return try decodeWorkstations(data)
+            "\(quote(resolve("dedmeshctl", fs: fs))) haunted -json -state-dir \(quote(identity.stateDir.path))")
+        return try decodeNodes(data)
     }
 
     /// The multiplexed sidebar poll: ONE `dedmeshctl` invocation (one Console
-    /// mTLS session) returns every workstation with summaries, fanning out
+    /// mTLS session) returns every node with summaries, fanning out
     /// live titled session lists for `live` targets only. `live` values came
     /// out of remote-controlled JSON, so they are re-checked at this argv
     /// boundary; a comma would smuggle a second target into the flag.
-    static func workstationSessions(
+    static func nodeSessions(
         identity: HauntedClientIdentity,
         live: [String],
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
         fs: HauntedFileSystem = .real
-    ) async throws -> [HauntedWorkstationListing] {
+    ) async throws -> [HauntedNodeListing] {
         let safe = live.filter { isSafeCLIArgument($0) && !$0.contains(",") }
         let liveArg = safe.isEmpty ? "none" : safe.joined(separator: ",")
         let data = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstations -json -sessions -live \(quote(liveArg)) -state-dir \(quote(identity.stateDir.path))")
-        return try decodeWorkstationListings(data)
+            "\(quote(resolve("dedmeshctl", fs: fs))) haunted -json -sessions -live \(quote(liveArg)) -state-dir \(quote(identity.stateDir.path))")
+        return try decodeNodeListings(data)
     }
 
     static func sessions(
@@ -560,7 +560,7 @@ enum HauntedCLI {
         target: String,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
         fs: HauntedFileSystem = .real
-    ) async throws -> [HauntedWorkstationSession] {
+    ) async throws -> [HauntedNodeSession] {
         let data = try await runner.run(
             "\(quote(resolve("haunted", fs: fs))) list --json --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
         return try decodeSessions(data)
@@ -577,12 +577,12 @@ enum HauntedCLI {
             "\(quote(resolve("haunted", fs: fs))) kill \(quote(sessionName)) --state-dir \(quote(identity.stateDir.path)) --target \(quote(target))")
     }
 
-    /// Sets (or, with nil, clears) a workstation daemon's display color on the
-    /// console, via `dedmeshctl workstation color`. `daemon` came out of the
-    /// workstation list (remote JSON), so it is re-checked at this call
+    /// Sets (or, with nil, clears) a node daemon's display color on the
+    /// console, via `dedmeshctl haunted color`. `daemon` came out of the
+    /// node list (remote JSON), so it is re-checked at this call
     /// boundary; `color` must be an already-normalized "#rrggbb" — anything
     /// else is refused rather than interpolated into an argv.
-    static func setWorkstationColor(
+    static func setNodeColor(
         identity: HauntedClientIdentity,
         daemon: String,
         color: String?,
@@ -594,7 +594,7 @@ enum HauntedCLI {
         }
         let value: String
         if let color {
-            guard HauntedWorkstation.normalizedColor(color) == color else {
+            guard HauntedNode.normalizedColor(color) == color else {
                 throw HauntedCLIError(message: "invalid color")
             }
             value = color
@@ -602,27 +602,27 @@ enum HauntedCLI {
             value = "default"
         }
         _ = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstation color \(quote(daemon)) \(quote(value)) -state-dir \(quote(identity.stateDir.path))")
+            "\(quote(resolve("dedmeshctl", fs: fs))) haunted color \(quote(daemon)) \(quote(value)) -state-dir \(quote(identity.stateDir.path))")
     }
 
-    /// Mints a single-use daemon join token for a workstation under this
-    /// client's own account, via `dedmeshctl workstation token -json` (the
+    /// Mints a single-use daemon join token for a node under this
+    /// client's own account, via `dedmeshctl haunted token -json` (the
     /// mesh mint path — the Terminal holds no console API token). The console
     /// derives and returns the username-prefixed daemon name the VM must
     /// enroll as. The reply is remote-controlled JSON, so the token is
     /// validated against the exact `dn_<hex>` grammar and the daemon name
     /// against the daemon grammar before either may reach an argv.
-    static func mintWorkstationToken(
+    static func mintNodeToken(
         identity: HauntedClientIdentity,
-        workstation: String,
+        node: String,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
         fs: HauntedFileSystem = .real
     ) async throws -> (token: String, daemon: String) {
-        guard isValidWorkstationName(workstation) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(node) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         let data = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstation token \(quote(workstation)) -json -state-dir \(quote(identity.stateDir.path))")
+            "\(quote(resolve("dedmeshctl", fs: fs))) haunted token \(quote(node)) -json -state-dir \(quote(identity.stateDir.path))")
         struct Reply: Decodable {
             let token: String
             let daemon: String
@@ -635,8 +635,8 @@ enum HauntedCLI {
     }
 
     /// Revokes one of this client's own daemons on the console (`dedmeshctl
-    /// workstation rm`) — the cleanup half of deleting a Lima workstation VM.
-    static func revokeWorkstation(
+    /// haunted rm`) — the cleanup half of deleting a Lima node VM.
+    static func revokeNode(
         identity: HauntedClientIdentity,
         daemon: String,
         runner: HauntedProcessRunning = HauntedProcessRunner.shared,
@@ -646,10 +646,10 @@ enum HauntedCLI {
             throw HauntedCLIError(message: "invalid daemon name")
         }
         _ = try await runner.run(
-            "\(quote(resolve("dedmeshctl", fs: fs))) workstation rm \(quote(daemon)) -state-dir \(quote(identity.stateDir.path))")
+            "\(quote(resolve("dedmeshctl", fs: fs))) haunted rm \(quote(daemon)) -state-dir \(quote(identity.stateDir.path))")
     }
 
-    /// Pushes a local file onto a workstation (`haunted upload`, the
+    /// Pushes a local file onto a node (`haunted upload`, the
     /// MSG_UPLOAD_* wire path) and returns the file's remote path — the
     /// transport underneath Ctrl+V image paste (HauntedImagePaste). The path
     /// comes back from a remote daemon and is destined for sendText, so it
@@ -728,7 +728,7 @@ enum HauntedCLI {
             fs: fs)
     }
 
-    /// The command a terminal tab runs to attach to a workstation session.
+    /// The command a terminal tab runs to attach to a node session.
     /// create=true for fresh session names (the daemon does not create on
     /// raw attach).
     ///
@@ -758,9 +758,9 @@ enum HauntedCLI {
     /// Writes (once per launch) and returns the attach-loop helper: a bounded
     /// reconnect loop, because a console restart or network blip drops the
     /// transport while the session it fronts is still alive on the
-    /// workstation — quietly reattaching beats stranding the user on an exit
+    /// node — quietly reattaching beats stranding the user on an exit
     /// banner. Growing backoff capped at 10s, 20 attempts ≈ 3 minutes of
-    /// riding out mesh re-convergence (the workstation daemon reconnects on
+    /// riding out mesh re-convergence (the node daemon reconnects on
     /// its own backoff; attach attempts during its gap fail instantly).
     /// A clean exit (detach / session killed) breaks the loop; ctrl-c during
     /// the backoff cancels it; spent retries exit nonzero so

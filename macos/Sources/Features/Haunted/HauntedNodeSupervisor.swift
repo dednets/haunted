@@ -1,13 +1,13 @@
 import Foundation
 
-/// Ensures this Mac's own DedNets workstation stack: `dedmeshd` (mesh
-/// transport, workstation role) plus `haunted-daemon` (the session backend it
+/// Ensures this Mac's own DedNets node stack: `dedmeshd` (mesh
+/// transport, node role) plus `haunted-daemon` (the session backend it
 /// fronts) — is running, so a machine configured to host sessions shows up
 /// online in the sidebar without the user starting anything by hand. Only
 /// acts where a local `~/.config/dedmesh/*.toml` exists (this Mac is itself
-/// enrolled as a workstation, not just a client); a pure client install does
+/// enrolled as a node, not just a client); a pure client install does
 /// nothing here.
-enum HauntedWorkstationSupervisor {
+enum HauntedNodeSupervisor {
     /// The two dependencies travel as one value: every entry point needs both,
     /// and threading them as separate defaulted parameters through the private
     /// helpers would double the noise for no extra reach.
@@ -40,7 +40,7 @@ enum HauntedWorkstationSupervisor {
             return false
         }
 
-        // dedmeshd only probes its workstation socket at startup and every
+        // dedmeshd only probes its node socket at startup and every
         // 30s after — haunted-daemon must already be listening before a
         // freshly spawned dedmeshd starts, or the console won't see it online
         // for up to 30s.

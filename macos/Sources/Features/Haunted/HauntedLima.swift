@@ -16,14 +16,14 @@ struct HauntedLimaInstance: Identifiable, Equatable {
 
 /// One exposed directory in the create sheet: an absolute host path plus the
 /// user's explicit writable choice. There are NO default mounts — a
-/// workstation exports a shell over the mesh, so every exposed directory is
-/// an explicit decision (deploy/lima/workstation.yaml has the full argument).
+/// node exports a shell over the mesh, so every exposed directory is
+/// an explicit decision (deploy/lima/node.yaml has the full argument).
 struct HauntedLimaMount: Equatable {
     let path: String
     let writable: Bool
 }
 
-/// What the "New workstation…" sheet produces.
+/// What the "New node…" sheet produces.
 struct HauntedLimaVMSpec: Equatable {
     let name: String
     var cpus: Int = 2
@@ -32,35 +32,35 @@ struct HauntedLimaVMSpec: Equatable {
     var mounts: [HauntedLimaMount] = []
 }
 
-private func isWorkstationNameByte(_ byte: UInt8, leading: Bool) -> Bool {
+private func isNodeNameByte(_ byte: UInt8, leading: Bool) -> Bool {
     let alnum = (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "z"))
         || (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
     if leading { return alnum }
     return alnum || byte == UInt8(ascii: "-") || byte == UInt8(ascii: "_")
 }
 
-/// Workstation names as the user types them — the Swift port of
-/// `names.ValidateWorkstationName` (`^[a-z0-9][a-z0-9_-]{0,31}$`; a leading
+/// Node names as the user types them - the Swift port of
+/// `names.ValidateHostName` (`^[a-z0-9][a-z0-9_-]{0,31}$`; a leading
 /// `-` would read as a CLI flag). Used to drop hostile `limactl list` entries
 /// at the decode boundary and as the create sheet's live validator; the
 /// console enforces the identical grammar at mint time.
-func isValidWorkstationName(_ value: String) -> Bool {
+func isValidNodeName(_ value: String) -> Bool {
     let bytes = Array(value.utf8)
     guard !bytes.isEmpty, bytes.count <= 32 else { return false }
     return bytes.enumerated().allSatisfy {
-        isWorkstationNameByte($0.element, leading: $0.offset == 0)
+        isNodeNameByte($0.element, leading: $0.offset == 0)
     }
 }
 
 /// Console daemon names — the Swift port of `names.ValidateDaemonName`
 /// (`^[a-z0-9][a-z0-9_-]{0,64}$`): wide enough for the username-prefixed
-/// workstation form. The mint reply's daemon name is remote JSON headed into
+/// node form. The mint reply's daemon name is remote JSON headed into
 /// an argv, so it is re-checked against this before use.
 func isValidDaemonName(_ value: String) -> Bool {
     let bytes = Array(value.utf8)
     guard !bytes.isEmpty, bytes.count <= 65 else { return false }
     return bytes.enumerated().allSatisfy {
-        isWorkstationNameByte($0.element, leading: $0.offset == 0)
+        isNodeNameByte($0.element, leading: $0.offset == 0)
     }
 }
 
@@ -68,13 +68,13 @@ func isValidDaemonName(_ value: String) -> Bool {
 /// "<username>-" prefix stripped; legacy unprefixed names (and other users'
 /// daemons) pass through unchanged. Usernames contain no hyphens, so the
 /// prefix is unambiguous.
-func workstationDisplayName(daemon: String, username: String?) -> String {
+func nodeDisplayName(daemon: String, username: String?) -> String {
     guard let username, daemon.hasPrefix(username + "-") else { return daemon }
     let stripped = String(daemon.dropFirst(username.count + 1))
     return stripped.isEmpty ? daemon : stripped
 }
 
-/// Shells out to `limactl` to manage local workstation VMs. Same posture as
+/// Shells out to `limactl` to manage local node VMs. Same posture as
 /// HauntedCLI: every argv is built from validated parts, and every command
 /// string is exposed as a pure builder so tests compare it verbatim.
 enum HauntedLimaCLI {
@@ -100,7 +100,7 @@ enum HauntedLimaCLI {
     }
 
     /// The absolute `limactl` path, or nil — in which case the Terminal shows
-    /// zero Lima affordances (no manager rows, no "New workstation…"). Reuses
+    /// zero Lima affordances (no manager rows, no "New node…"). Reuses
     /// HauntedCLI.resolve's well-known locations; resolve's bare-name PATH
     /// fallback is deliberately treated as "not installed", because a name
     /// that only might resolve at spawn time cannot gate UI.
@@ -132,7 +132,7 @@ enum HauntedLimaCLI {
             }
         }
         return raws
-            .filter { isValidWorkstationName($0.name) }
+            .filter { isValidNodeName($0.name) }
             .map { HauntedLimaInstance(name: $0.name, status: $0.status ?? "Unknown") }
     }
 
@@ -189,15 +189,15 @@ enum HauntedLimaCLI {
         let fingerprint: String
     }
 
-    /// The in-VM enrollment, mirroring deploy/lima/workstation-setup.sh: pipe
+    /// The in-VM enrollment, mirroring deploy/lima/node-setup.sh: pipe
     /// the console's install.sh into sh with the join token, so the VM ends up
-    /// with its own dedmeshd + haunted-daemon and `[workstation] managed`.
+    /// with its own dedmeshd + haunted-daemon and `[node] managed`.
     /// Every interpolated value is validated against the exact grammar the
     /// other side defines; the fingerprint pins the CA this client already
     /// trusts, so the VM can only enroll against OUR console.
     static func enrollCommand(limactl: String, spec: EnrollSpec) throws -> String {
-        guard isValidWorkstationName(spec.vm) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(spec.vm) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         guard isValidDaemonName(spec.daemon) else {
             throw HauntedCLIError(message: "invalid daemon name")
@@ -217,15 +217,15 @@ enum HauntedLimaCLI {
         }
         let inner = "curl -fsSL '\(spec.installBase)/install.sh' | sh -s -- "
             + "--console '\(spec.control)' --token '\(spec.token)' --name '\(spec.daemon)' "
-            + "--ca-fingerprint 'sha256:\(spec.fingerprint)' --workstation"
+            + "--ca-fingerprint 'sha256:\(spec.fingerprint)' --haunted"
         return "\(HauntedCLI.quote(limactl)) shell \(HauntedCLI.quote(spec.vm)) -- sh -c \(HauntedCLI.quote(inner))"
     }
 
     // MARK: VM definition
 
-    /// The Lima template for a GUI-created workstation VM.
+    /// The Lima template for a GUI-created node VM.
     ///
-    /// KEEP IN SYNC with deploy/lima/workstation.yaml (the canonical scripted
+    /// KEEP IN SYNC with deploy/lima/node.yaml (the canonical scripted
     /// template in the parent repo): vz backend, curl + user lingering
     /// provisioning, and the pinned Ubuntu images. There is no cross-repo test
     /// that can enforce this from the submodule — when the deploy template
@@ -246,8 +246,8 @@ enum HauntedLimaCLI {
             }
         }
         return """
-        # Generated by Haunted Terminal (New workstation…); edits are overwritten.
-        # Derived from deploy/lima/workstation.yaml — keep the backend,
+        # Generated by Haunted Terminal (New node…); edits are overwritten.
+        # Derived from deploy/lima/node.yaml — keep the backend,
         # provisioning, and image pins in sync with it.
 
         vmType: vz
@@ -256,7 +256,7 @@ enum HauntedLimaCLI {
         disk: "\(spec.diskGiB)GiB"
 
         # Only the directories the user explicitly exposed in the create sheet.
-        # A workstation exports a shell over the mesh; every mount widens what
+        # A node exports a shell over the mesh; every mount widens what
         # that shell can reach.
         \(mounts)
 
@@ -268,11 +268,11 @@ enum HauntedLimaCLI {
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y --no-install-recommends ca-certificates curl
-            # Rootful Docker CE, so a workstation shell can build and run
+            # Rootful Docker CE, so a node shell can build and run
             # containers. NOTE: this VM exports a shell over the mesh, and
             # membership in the docker group (below) is root-equivalent — anyone
-            # who reaches this workstation's shell can escalate via the Docker
-            # socket. A deliberate trade for a dev workstation.
+            # who reaches this node's shell can escalate via the Docker
+            # socket. A deliberate trade for a dev node.
             if ! command -v docker >/dev/null; then
               curl -fsSL https://get.docker.com | sh
             fi
@@ -365,10 +365,10 @@ enum HauntedLimaCLI {
     }
 
     /// True when the VM already holds a dedmeshd config (the
-    /// workstation-setup.sh idempotence probe): enrolling again would burn a
+    /// node-setup.sh idempotence probe): enrolling again would burn a
     /// token and re-run installs for nothing.
     static func isEnrolled(env: Environment, limactl: String, vm: String) async -> Bool {
-        guard isValidWorkstationName(vm) else { return false }
+        guard isValidNodeName(vm) else { return false }
         return (try? await env.runner.run(
             enrolledProbeCommand(limactl: limactl, vm: vm))) != nil
     }
@@ -377,8 +377,8 @@ enum HauntedLimaCLI {
     /// precedent: generated artifacts live there, not in the user's dotfiles)
     /// and creates the VM.
     static func create(env: Environment, limactl: String, spec: HauntedLimaVMSpec) async throws {
-        guard isValidWorkstationName(spec.name) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(spec.name) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         let dir = env.fs.applicationSupportDirectory
             .appendingPathComponent("HauntedTerminal/lima", isDirectory: true)
@@ -390,31 +390,31 @@ enum HauntedLimaCLI {
     }
 
     static func start(env: Environment, limactl: String, name: String) async throws {
-        guard isValidWorkstationName(name) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(name) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         _ = try await env.longRunner.run(startCommand(limactl: limactl, name: name))
     }
 
     static func stop(env: Environment, limactl: String, name: String) async throws {
-        guard isValidWorkstationName(name) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(name) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         _ = try await env.longRunner.run(stopCommand(limactl: limactl, name: name))
     }
 
     static func delete(env: Environment, limactl: String, name: String) async throws {
-        guard isValidWorkstationName(name) else {
-            throw HauntedCLIError(message: "invalid workstation name")
+        guard isValidNodeName(name) else {
+            throw HauntedCLIError(message: "invalid node name")
         }
         _ = try await env.longRunner.run(deleteCommand(limactl: limactl, name: name))
     }
 
-    /// Enrolls the VM as a workstation: mint a join token over the mesh (the
+    /// Enrolls the VM as a node: mint a join token over the mesh (the
     /// client identity is the credential; the console derives and returns the
     /// username-prefixed daemon name), pin the CA we already trust, and run
     /// the console's install.sh inside the VM — the exact flow of
-    /// deploy/lima/workstation-setup.sh, minus the admin API.
+    /// deploy/lima/node-setup.sh, minus the admin API.
     static func enroll(
         env: Environment, limactl: String, vm: String,
         identity: HauntedClientIdentity, defaults: UserDefaults = .standard
@@ -430,8 +430,8 @@ enum HauntedLimaCLI {
               let fingerprint = caFingerprint(pem: pem) else {
             throw HauntedCLIError(message: "cannot fingerprint the pinned console CA")
         }
-        let minted = try await HauntedCLI.mintWorkstationToken(
-            identity: identity, workstation: vm, runner: env.runner, fs: env.fs)
+        let minted = try await HauntedCLI.mintNodeToken(
+            identity: identity, node: vm, runner: env.runner, fs: env.fs)
         let command = try enrollCommand(limactl: limactl, spec: EnrollSpec(
             vm: vm, daemon: minted.daemon, installBase: base,
             control: control, token: minted.token, fingerprint: fingerprint))

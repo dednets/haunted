@@ -52,7 +52,7 @@ struct HauntedCLIArgumentTests {
     // MARK: ARG-05/06 — the filters actually run at the decode boundary
 
     /// ARG-05: a crafted `target` is dropped; its siblings survive.
-    @Test("ARG-05: decodeWorkstations drops flag-like targets")
+    @Test("ARG-05: decodeNodes drops flag-like targets")
     func decodeDropsUnsafeTarget() throws {
         let json = Data("""
         [
@@ -61,7 +61,7 @@ struct HauntedCLIArgumentTests {
           {"target":"","daemon":"empty","app":"haunted","online":false}
         ]
         """.utf8)
-        let result = try HauntedCLI.decodeWorkstations(json)
+        let result = try HauntedCLI.decodeNodes(json)
         #expect(result.map(\.target) == ["alice/box/haunted"])
     }
 

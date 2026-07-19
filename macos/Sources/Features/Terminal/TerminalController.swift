@@ -1331,7 +1331,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
     /// Fork: ⌘W confirmation for one or more controllers attached to Haunted
     /// sessions. Closing a Haunted tab tears down only the *local* attach
-    /// client, which DETACHES — the session keeps running on the workstation,
+    /// client, which DETACHES — the session keeps running on the Haunted host,
     /// so the upstream "the process will be killed" dialog was false. This
     /// offers the real choice (Cancel / Run in Background / Close, Close
     /// default), and only Close exits the remote session (like typing `exit`).
@@ -1356,7 +1356,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         Task { @MainActor in
             let response = await confirmCloseChoiceAsync(
                 messageText: messageText,
-                informativeText: "Attached to \(noun) running on the workstation. Close \(pronoun) (like typing “exit” — the process ends), or leave \(pronoun) running in the background.",
+                informativeText: "Attached to \(noun) running on the Haunted host. Close \(pronoun) (like typing “exit” — the process ends), or leave \(pronoun) running in the background.",
                 buttonTitles: HauntedManager.closeTabButtonTitles)
             let choice = HauntedManager.closeTabChoice(for: response)
             // Tear the tab(s) down through the last-tab empty-state rule — a

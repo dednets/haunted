@@ -26,9 +26,9 @@ import Foundation
 ///  2. **A quiet login shell.** `run` executes `/bin/zsh -lc`, which sources
 ///     `/etc/zshenv`, `~/.zshenv`, `/etc/zprofile` and `~/.zprofile`. Anything
 ///     those print on stdout is indistinguishable from the child's own output —
-///     to `run`, and to `HauntedCLI.decodeWorkstations` in production. The exact
+///     to `run`, and to `HauntedCLI.decodeNodes` in production. The exact
 ///     byte assertions below are the contract, not a flake: a `~/.zprofile` that
-///     echoes also breaks `dedmeshctl workstations -json`.
+///     echoes also breaks `dedmeshctl haunted -json`.
 struct HauntedCLIRunTests {
     // MARK: - RUN-01…03: exit status and stderr mapping
 
@@ -251,7 +251,7 @@ struct HauntedCLIRunTests {
     }
 
     /// Same hazard, synchronous flavor: `runToCompletion` also used
-    /// `waitUntilExit`, and it runs on paths (workstation supervision) that
+    /// `waitUntilExit`, and it runs on paths (node supervision) that
     /// must never wedge. A wedged child reports -1 at the deadline.
     @Test("RUN-09b: runToCompletion fails a wedged child at the deadline")
     func runToCompletionFailsWedgedChildAtDeadline() async throws {

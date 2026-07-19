@@ -93,10 +93,10 @@ struct HauntedManagerLogicTests {
     /// and these cases are about the *sequence* of polls.
     private final class ScriptedListing: HauntedSessionListing, @unchecked Sendable {
         private let lock = NSLock()
-        private var answers: [Result<[HauntedWorkstationSession], any Error>]
+        private var answers: [Result<[HauntedNodeSession], any Error>]
         private var _calls = 0
 
-        init(_ answers: [Result<[HauntedWorkstationSession], any Error>]) {
+        init(_ answers: [Result<[HauntedNodeSession], any Error>]) {
             self.answers = answers
         }
 
@@ -106,7 +106,7 @@ struct HauntedManagerLogicTests {
 
         func list(
             identity: HauntedClientIdentity, live: [String]
-        ) async throws -> [HauntedWorkstationListing] {
+        ) async throws -> [HauntedNodeListing] {
             lock.lock()
             let index = min(_calls, answers.count - 1)
             _calls += 1
@@ -116,8 +116,8 @@ struct HauntedManagerLogicTests {
             // are that target's live list.
             let sessions = try result.get()
             return live.map { target in
-                HauntedWorkstationListing(
-                    workstation: HauntedWorkstation(
+                HauntedNodeListing(
+                    node: HauntedNode(
                         target: target,
                         daemon: String(target.split(separator: "/").dropFirst().first ?? "d"),
                         app: "haunted", online: true, state: nil, error: nil),
@@ -125,19 +125,19 @@ struct HauntedManagerLogicTests {
             }
         }
 
-        func setWorkstationColor(
+        func setNodeColor(
             identity: HauntedClientIdentity, daemon: String, color: String?
         ) async throws {
             // These cases never set colors; a call reaching here is a bug.
-            throw HauntedCLIError(message: "unexpected setWorkstationColor")
+            throw HauntedCLIError(message: "unexpected setNodeColor")
         }
     }
 
     private static let identity = HauntedClientIdentity(
         stateDir: URL(fileURLWithPath: "/nonexistent"), console: nil)
 
-    private static func session(_ name: String, clients: Int) -> HauntedWorkstationSession {
-        HauntedWorkstationSession(
+    private static func session(_ name: String, clients: Int) -> HauntedNodeSession {
+        HauntedNodeSession(
             name: name, pid: 1, clients: clients, cols: 80, rows: 24,
             created: 0, title: nil)
     }
@@ -204,7 +204,7 @@ struct HauntedManagerLogicTests {
     // MARK: CLOSE-01…03 — ⌘W kills the remote session by default
 
     /// CLOSE-01. THE BUG: closing a Haunted tab only detached the persistent
-    /// remote session — it kept running on the workstation — while the dialog
+    /// remote session — it kept running on the node — while the dialog
     /// claimed "the process will be killed". The DEFAULT ⌘W action (Enter →
     /// the first NSAlert button) must map to `.close`, which exits the remote
     /// session like typing `exit`. "Run in Background" is the second button,

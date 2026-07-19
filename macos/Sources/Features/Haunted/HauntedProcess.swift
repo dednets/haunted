@@ -183,7 +183,7 @@ struct HauntedProcessRunner: HauntedProcessRunning, Sendable {
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
         // Same reasoning as run(): waitUntilExit can hang forever, and this
-        // method is called synchronously on paths (workstation supervision)
+        // method is called synchronously on paths (node supervision)
         // that must never wedge. terminationHandler + a bounded semaphore wait.
         let exited = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in exited.signal() }

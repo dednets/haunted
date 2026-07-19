@@ -215,7 +215,7 @@ struct HauntedImagePasteTests {
             "HauntedImagePaste.intercept(event: event, surfaceView: self)"), """
             SurfaceView.keyDown no longer routes Ctrl+V through \
             HauntedImagePaste. An image paste into a remote session will send \
-            a bare 0x16, the app on the workstation will read its own (empty) \
+            a bare 0x16, the app on the node will read its own (empty) \
             clipboard, and image paste silently regresses to broken.
             """)
     }

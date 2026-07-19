@@ -4,8 +4,8 @@ import SwiftUI
 import GhosttyKit
 
 /// Associates Ghostty windows and surfaces with the enrolled DedNets client
-/// identity so the workstation sidebar can open attached tabs and splits
-/// inherit the workstation of the surface they were created from.
+/// identity so the node sidebar can open attached tabs and splits
+/// inherit the node of the surface they were created from.
 ///
 /// There is no session/token state here: authentication is the client mTLS
 /// certificate in the identity's state dir, and every attach/list/kill is a
@@ -19,7 +19,7 @@ final class HauntedManager {
         init(_ identity: HauntedClientIdentity) { self.identity = identity }
     }
 
-    /// What a surface/tab is attached to: which workstation (target), and
+    /// What a surface/tab is attached to: which node (target), and
     /// which session name.
     private final class Attachment {
         let identity: HauntedClientIdentity
@@ -91,7 +91,7 @@ final class HauntedManager {
         return controller.window != nil
     }
 
-    /// The workstation behind a surface, for features that must cross the
+    /// The node behind a surface, for features that must cross the
     /// wire on the surface's behalf (Ctrl+V image paste uploads there). Nil
     /// for local "This computer" tabs and unattached surfaces — callers
     /// treat that as "behave like plain Ghostty".
@@ -133,7 +133,7 @@ final class HauntedManager {
     /// What the user chose in the ⌘W confirmation for a Haunted tab.
     ///
     /// Closing the tab only tears down the *local* attach client, which
-    /// **detaches** — the session keeps running on the workstation (that is
+    /// **detaches** — the session keeps running on the node (that is
     /// what persistence is for). So the old two-button dialog's "the process
     /// will be killed" was a lie: nothing was killed. The real choice:
     ///  - `close` (default): exit the remote session, like typing `exit`;
@@ -314,7 +314,7 @@ final class HauntedManager {
         }
     }
 
-    /// Closes every open tab attached to `target`, used when that workstation is
+    /// Closes every open tab attached to `target`, used when that node is
     /// removed from the console. The daemon is no longer reachable, so there is
     /// nothing to kill over the mesh — the tabs can only be closed locally;
     /// otherwise each one reconnect-loops for ~3 minutes and then strands a dead
@@ -367,7 +367,7 @@ final class HauntedManager {
         }
     }
 
-    /// The workstation target the controller's focused (or root) surface is
+    /// The node target the controller's focused (or root) surface is
     /// attached to.
     @MainActor
     func target(for controller: TerminalController) -> String? {
@@ -452,16 +452,16 @@ final class HauntedManager {
     }
 
     /// Opens a new tab with a fresh session on the focused window's
-    /// workstation (⌘T). Falls back to the first online workstation when the
+    /// node (⌘T). Falls back to the first online node when the
     /// focused window has none yet.
     @MainActor
     func newTabOnCurrentDaemon(from parent: TerminalController) async {
         guard let identity = self.identity(for: parent) else { return }
         var target = self.target(for: parent)
         if target == nil {
-            let workstations = (try? await HauntedCLI.workstations(
+            let nodes = (try? await HauntedCLI.nodes(
                 identity: identity)) ?? []
-            target = workstations.first { $0.online }?.target
+            target = nodes.first { $0.online }?.target
         }
         guard let target else { return }
         openTab(from: parent, target: target,
@@ -471,22 +471,22 @@ final class HauntedManager {
     // MARK: Session entry points
 
     /// Opens the Haunted window for the enrolled identity, resuming where the
-    /// user left off: the last-attached workstation/session when that
-    /// workstation is still online (sessions persist in its haunted-daemon
-    /// across Terminal quits), else the first online workstation's persistent
+    /// user left off: the last-attached node/session when that
+    /// node is still online (sessions persist in its haunted-daemon
+    /// across Terminal quits), else the first online node's persistent
     /// "default" session, else a plain shell so the sidebar is visible and
-    /// the user can click a workstation once one comes online.
+    /// the user can click a node once one comes online.
     @MainActor
     func openWindow(
         identity: HauntedClientIdentity,
-        workstations: [HauntedWorkstation],
-        lastSessions: [HauntedWorkstationSession] = []
+        nodes: [HauntedNode],
+        lastSessions: [HauntedNodeSession] = []
     ) {
         guard let appDelegate = NSApp.delegate as? AppDelegate else { return }
 
         switch HauntedSessionRouter.route(
             lastAttached: Self.lastAttached,
-            workstations: workstations,
+            nodes: nodes,
             sessionsOnLastTarget: lastSessions) {
         case .resume(let target, let sessionName):
             NSLog("[haunted] openWindow: resume target=%@ session=%@",
@@ -522,13 +522,13 @@ final class HauntedManager {
         controller.surfaceTree = .init()
     }
 
-    /// The workstation target of the last session the user attached to, for
+    /// The node target of the last session the user attached to, for
     /// deciding at startup whether to fetch its session list (to confirm the
     /// remembered session still exists before resuming it).
     @MainActor
     var lastAttachedTarget: String? { Self.lastAttached?.target }
 
-    /// Last (workstation, session) the user attached to, persisted so a
+    /// Last (node, session) the user attached to, persisted so a
     /// relaunch lands back in it. GUI-generated split/tab session names are
     /// as valid here as "default": the daemon keeps them alive across quits.
     private static var lastAttached: (target: String, session: String)? {
@@ -550,11 +550,11 @@ final class HauntedManager {
     @MainActor
     func focusOrOpen(
         from parent: TerminalController,
-        workstation: HauntedWorkstation,
+        node: HauntedNode,
         sessionName: String?
     ) {
         let name = sessionName ?? Self.generateSessionName()
-        if let existing = sessionTabs.object(forKey: Self.tabKey(workstation.target, name)),
+        if let existing = sessionTabs.object(forKey: Self.tabKey(node.target, name)),
            let window = existing.window {
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -565,11 +565,11 @@ final class HauntedManager {
         // Opening from an empty-state window fills that window in place rather
         // than leaving a lingering "Nothing here" tab behind a new one.
         if parent.hauntedEmptyState {
-            attachInPlace(controller: parent, target: workstation.target,
+            attachInPlace(controller: parent, target: node.target,
                           sessionName: name, create: create)
             return
         }
-        openTab(from: parent, target: workstation.target,
+        openTab(from: parent, target: node.target,
                 sessionName: name, create: create)
     }
 
@@ -630,7 +630,7 @@ final class HauntedManager {
         NotificationCenter.default.post(name: .hauntedSessionsDidChange, object: nil)
     }
 
-    /// Opens a new tab attached to a named session on a workstation.
+    /// Opens a new tab attached to a named session on a node.
     @MainActor
     func openTab(
         from parent: TerminalController,
@@ -656,8 +656,8 @@ final class HauntedManager {
     /// interesting decision, extracted from `splitConfiguration`, which cannot
     /// run without a live `Ghostty.SurfaceView`.
     enum SplitPlan: Equatable {
-        /// The parent is attached to a workstation; the child opens a fresh
-        /// session on that same workstation.
+        /// The parent is attached to a node; the child opens a fresh
+        /// session on that same node.
         case inherit(target: String, sessionName: String)
         /// The parent is a plain local shell (or not ours). Whatever config the
         /// caller had is used unchanged, and no session name is pending.
@@ -672,8 +672,8 @@ final class HauntedManager {
         return .inherit(target: parentTarget, sessionName: generateName())
     }
 
-    /// If a split's parent surface belongs to a workstation, the child
-    /// attaches to a fresh session on the same workstation. Synchronous: the
+    /// If a split's parent surface belongs to a node, the child
+    /// attaches to a fresh session on the same node. Synchronous: the
     /// attach command authenticates from the state dir, no token to mint.
     ///
     /// `@MainActor` because it writes `pendingSplitSessionName`, which the
@@ -758,7 +758,7 @@ final class HauntedManager {
         repeat {
             if let listings = try? await listing.list(
                 identity: identity, live: [target]),
-               let live = listings.first(where: { $0.workstation.target == target })?.live,
+               let live = listings.first(where: { $0.node.target == target })?.live,
                live.contains(where: { $0.name == sessionName && $0.clients > 0 }) {
                 return true
             }
@@ -881,11 +881,11 @@ final class HauntedManager {
 
         let sidebar = HauntedSidebarView(
             identity: identity,
-            onOpen: { [weak self, weak controller] workstation, sessionName in
+            onOpen: { [weak self, weak controller] node, sessionName in
                 guard let self, let controller else { return }
                 Task { @MainActor in
                     self.focusOrOpen(from: controller,
-                                     workstation: workstation,
+                                     node: node,
                                      sessionName: sessionName)
                 }
             },
@@ -1043,7 +1043,7 @@ final class HauntedSidebarDivider: NSView {
     }
 }
 
-/// Workstation sidebar on the left (user-resizable, collapsible to a thin
+/// Node sidebar on the left (user-resizable, collapsible to a thin
 /// strip), a drag divider, and the terminal filling the rest.
 final class HauntedContainerView: NSView {
     private let terminalArea: NSView

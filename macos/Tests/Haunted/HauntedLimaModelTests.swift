@@ -80,7 +80,7 @@ struct HauntedLimaModelTests {
             if command.contains(".config/dedmesh") {
                 throw HauntedCLIError(message: "not enrolled") // probe: exit 1
             }
-            if command.contains("workstation token") {
+            if command.contains("haunted token") {
                 return Data(#"{"token":"dn_00ff","daemon":"tester-ws9"}"#.utf8)
             }
             if command.contains(" list --json") { return Data("[]".utf8) }
@@ -93,7 +93,7 @@ struct HauntedLimaModelTests {
         try await waitUntil({ harness.model.ops["ws9"] == nil }, "the pipeline finishes")
 
         let markers = ["create --name='ws9'", "start 'ws9'", ".config/dedmesh",
-                       "workstation token 'ws9'", "install.sh"]
+                       "haunted token 'ws9'", "install.sh"]
         let indices = markers.map { indexOf($0, in: harness.runner) }
         for (marker, index) in zip(markers, indices) {
             #expect(index != nil, "\(marker) never ran")
@@ -107,7 +107,7 @@ struct HauntedLimaModelTests {
         #expect(enroll.contains("https://web.example.com/install.sh"))
         #expect(enroll.contains("--ca-fingerprint"))
         #expect(enroll.contains("dn_00ff"))
-        #expect(enroll.contains("--workstation"))
+        #expect(enroll.contains("--haunted"))
         // The VM keeps the bare name; --name is the console-derived
         // username-prefixed daemon name from the mint reply.
         #expect(enroll.contains("shell 'ws9'"))
@@ -135,7 +135,7 @@ struct HauntedLimaModelTests {
 
         let commands = harness.runner.invocations.compactMap(\.command)
         #expect(commands.contains { $0.contains(".config/dedmesh") })
-        #expect(!commands.contains { $0.contains("workstation token") },
+        #expect(!commands.contains { $0.contains("haunted token") },
                 "a token was minted for an enrolled VM — burned for nothing")
         #expect(!commands.contains { $0.contains("install.sh") })
     }
@@ -186,7 +186,7 @@ struct HauntedLimaModelTests {
 
         // The VM operations use the bare name; the console revoke uses the
         // FULL stored daemon name from the merged console ref.
-        let markers = ["stop 'ws9'", "delete --force 'ws9'", "workstation rm 'tester-ws9'"]
+        let markers = ["stop 'ws9'", "delete --force 'ws9'", "haunted rm 'tester-ws9'"]
         let indices = markers.compactMap { indexOf($0, in: harness.runner) }
         #expect(indices.count == 3, "delete steps missing: \(harness.runner.invocations.compactMap(\.command))")
         #expect(indices == indices.sorted(), "delete steps out of order")
@@ -196,7 +196,7 @@ struct HauntedLimaModelTests {
     @Test("LIMOD-04b: a failed console revoke is a warning, not a failed delete")
     func revokeFailureDowngraded() async throws {
         let harness = try makeHarness { command in
-            if command.contains("workstation rm") {
+            if command.contains("haunted rm") {
                 throw HauntedCLIError(message: "console unreachable")
             }
             if command.contains(" list --json") { return Data("[]".utf8) }
@@ -233,7 +233,7 @@ struct HauntedLimaModelTests {
 
         #expect(harness.model.ops["ws9"] == .failed("vm is wedged"))
         #expect(!harness.runner.invocations.compactMap(\.command)
-            .contains { $0.contains("workstation rm") },
+            .contains { $0.contains("haunted rm") },
             "the console row must survive while the VM still exists")
     }
 

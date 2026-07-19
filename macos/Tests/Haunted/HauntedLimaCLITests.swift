@@ -61,7 +61,7 @@ struct HauntedLimaCLITests {
 
     // MARK: LIMA-02 — the name grammar (mirror of names.ValidateName)
 
-    @Test("LIMA-02: workstation-name grammar (a-z, 0-9, - and _; leading alnum)", arguments: [
+    @Test("LIMA-02: node-name grammar (a-z, 0-9, - and _; leading alnum)", arguments: [
         ("ws1", true),
         ("a", true),
         ("my-box-2", true),
@@ -80,7 +80,7 @@ struct HauntedLimaCLITests {
         ("wß1", false),
     ])
     func nameGrammar(name: String, valid: Bool) {
-        #expect(isValidWorkstationName(name) == valid)
+        #expect(isValidNodeName(name) == valid)
     }
 
     @Test("LIMA-02c: daemon-name grammar takes the prefixed form; display strips it")
@@ -93,12 +93,12 @@ struct HauntedLimaCLITests {
         #expect(!isValidDaemonName("Luiz-ws"))
 
         // Own prefix strips; legacy and foreign names pass through.
-        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: "luiz") == "ws_9")
-        #expect(workstationDisplayName(daemon: "homelab", username: "luiz") == "homelab")
-        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: "bob") == "luiz-ws_9")
-        #expect(workstationDisplayName(daemon: "luiz-ws_9", username: nil) == "luiz-ws_9")
+        #expect(nodeDisplayName(daemon: "luiz-ws_9", username: "luiz") == "ws_9")
+        #expect(nodeDisplayName(daemon: "homelab", username: "luiz") == "homelab")
+        #expect(nodeDisplayName(daemon: "luiz-ws_9", username: "bob") == "luiz-ws_9")
+        #expect(nodeDisplayName(daemon: "luiz-ws_9", username: nil) == "luiz-ws_9")
         // A pathological bare "<username>-" never strips to empty.
-        #expect(workstationDisplayName(daemon: "luiz-", username: "luiz") == "luiz-")
+        #expect(nodeDisplayName(daemon: "luiz-", username: "luiz") == "luiz-")
     }
 
     @Test("LIMA-02b: join-token grammar", arguments: [
@@ -136,7 +136,7 @@ struct HauntedLimaCLITests {
             == "'/opt/homebrew/bin/limactl' shell 'ws9' -- sh -c 'ls \"$HOME/.config/dedmesh/\"*.toml >/dev/null 2>&1'")
     }
 
-    @Test("LIMA-04: the enroll command mirrors workstation-setup.sh exactly")
+    @Test("LIMA-04: the enroll command mirrors node-setup.sh exactly")
     func enrollCommand() throws {
         let fingerprint = String(repeating: "ab", count: 32)
         // The VM keeps the bare name; --name is the console-derived
@@ -151,7 +151,7 @@ struct HauntedLimaCLITests {
         #expect(command == "'/opt/homebrew/bin/limactl' shell 'ws9' -- sh -c "
             + "'curl -fsSL '\\''https://console.example.com/install.sh'\\'' | sh -s -- "
             + "--console '\\''console.example.com:9443'\\'' --token '\\''dn_0123abcd'\\'' "
-            + "--name '\\''luiz-ws9'\\'' --ca-fingerprint '\\''sha256:\(fingerprint)'\\'' --workstation'")
+            + "--name '\\''luiz-ws9'\\'' --ca-fingerprint '\\''sha256:\(fingerprint)'\\'' --haunted'")
     }
 
     /// One bad operand per case; everything else stays valid so the refusal
@@ -195,9 +195,9 @@ struct HauntedLimaCLITests {
         #expect(yaml.contains("memory: \"2GiB\""))
         #expect(yaml.contains("disk: \"20GiB\""))
         #expect(yaml.contains("mounts: []"), "no default mounts, ever")
-        #expect(yaml.contains("deploy/lima/workstation.yaml"), "the keep-in-sync pointer")
+        #expect(yaml.contains("deploy/lima/node.yaml"), "the keep-in-sync pointer")
         #expect(yaml.contains("enable-linger"), "daemons must survive the SSH session")
-        #expect(yaml.contains("get.docker.com"), "rootful Docker for the workstation shell")
+        #expect(yaml.contains("get.docker.com"), "rootful Docker for the node shell")
         #expect(yaml.contains("usermod -aG docker"), "the shell user reaches the Docker socket")
         #expect(yaml.contains("ubuntu-26.04-server-cloudimg-arm64.img"))
     }
@@ -286,7 +286,7 @@ struct HauntedLimaCLITests {
 
     // MARK: LIMA-09 — the dedmeshctl halves (mint + revoke)
 
-    @Test("LIMA-09: mintWorkstationToken shells the exact command and validates the reply")
+    @Test("LIMA-09: mintNodeToken shells the exact command and validates the reply")
     func mintToken() async throws {
         var fs = HauntedTempFileSystem()
         let ctl = fs.homeDirectory.path + "/.local/bin/dedmeshctl"
@@ -295,12 +295,12 @@ struct HauntedLimaCLITests {
         let good = FakeProcessRunner { _ in
             Data(#"{"token":"dn_00ff","daemon":"luiz-ws9"}"#.utf8)
         }
-        let minted = try await HauntedCLI.mintWorkstationToken(
-            identity: Self.identity, workstation: "ws9", runner: good, fs: fs)
+        let minted = try await HauntedCLI.mintNodeToken(
+            identity: Self.identity, node: "ws9", runner: good, fs: fs)
         #expect(minted.token == "dn_00ff")
         #expect(minted.daemon == "luiz-ws9")
         #expect(good.invocations.compactMap(\.command)
-            == ["'\(ctl)' workstation token 'ws9' -json -state-dir '/state'"])
+            == ["'\(ctl)' haunted token 'ws9' -json -state-dir '/state'"])
 
         // A malformed token or daemon name in the (remote-controlled) reply
         // never escapes into an argv.
@@ -311,27 +311,27 @@ struct HauntedLimaCLITests {
         ] {
             let evil = FakeProcessRunner { _ in Data(reply.utf8) }
             await #expect(throws: HauntedCLIError.self, "\(reply) must be refused") {
-                _ = try await HauntedCLI.mintWorkstationToken(
-                    identity: Self.identity, workstation: "ws9", runner: evil, fs: fs)
+                _ = try await HauntedCLI.mintNodeToken(
+                    identity: Self.identity, node: "ws9", runner: evil, fs: fs)
             }
         }
     }
 
-    @Test("LIMA-09b: revokeWorkstation shells the exact command; hostile names never spawn")
+    @Test("LIMA-09b: revokeNode shells the exact command; hostile names never spawn")
     func revoke() async throws {
         var fs = HauntedTempFileSystem()
         let ctl = fs.homeDirectory.path + "/.local/bin/dedmeshctl"
         fs.executables = [ctl]
 
         let runner = FakeProcessRunner()
-        try await HauntedCLI.revokeWorkstation(
+        try await HauntedCLI.revokeNode(
             identity: Self.identity, daemon: "ws9", runner: runner, fs: fs)
         #expect(runner.invocations.compactMap(\.command)
-            == ["'\(ctl)' workstation rm 'ws9' -state-dir '/state'"])
+            == ["'\(ctl)' haunted rm 'ws9' -state-dir '/state'"])
 
         let refused = FakeProcessRunner()
         await #expect(throws: HauntedCLIError.self) {
-            try await HauntedCLI.revokeWorkstation(
+            try await HauntedCLI.revokeNode(
                 identity: Self.identity, daemon: "-evil", runner: refused, fs: fs)
         }
         #expect(refused.invocations.isEmpty)

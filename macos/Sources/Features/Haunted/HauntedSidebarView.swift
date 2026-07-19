@@ -4,16 +4,16 @@ import SwiftUI
 /// What the sidebar model reads from — and writes to — the mesh. A seam, so
 /// the poll loop can be driven without spawning `dedmeshctl`/`haunted` (§5.4).
 protocol HauntedSessionListing: Sendable {
-    /// One poll: every reachable workstation (console session summaries
+    /// One poll: every reachable node (console session summaries
     /// included) plus fresh titled session lists for the `live` targets.
     /// Empty `live` fetches the list alone. ONE Console mTLS session however
     /// many targets are queried — the whole point (performance.md item 1).
     func list(
         identity: HauntedClientIdentity, live: [String]
-    ) async throws -> [HauntedWorkstationListing]
-    /// Persists a workstation daemon's display color on the console
+    ) async throws -> [HauntedNodeListing]
+    /// Persists a node daemon's display color on the console
     /// (nil = back to the default).
-    func setWorkstationColor(
+    func setNodeColor(
         identity: HauntedClientIdentity, daemon: String, color: String?
     ) async throws
 }
@@ -55,10 +55,10 @@ final class HauntedCLISessionListing: HauntedSessionListing, @unchecked Sendable
 
     func list(
         identity: HauntedClientIdentity, live: [String]
-    ) async throws -> [HauntedWorkstationListing] {
+    ) async throws -> [HauntedNodeListing] {
         if !legacyCLI {
             do {
-                return try await HauntedCLI.workstationSessions(
+                return try await HauntedCLI.nodeSessions(
                     identity: identity, live: live, runner: runner, fs: fs)
             } catch let error as HauntedCLIError
                 where Self.isLegacyFlagError(error.message) {
@@ -72,42 +72,42 @@ final class HauntedCLISessionListing: HauntedSessionListing, @unchecked Sendable
     /// live target for its sessions. No summaries (old CLIs don't emit them).
     private func legacyList(
         identity: HauntedClientIdentity, live: [String]
-    ) async throws -> [HauntedWorkstationListing] {
-        let workstations = try await HauntedCLI.workstations(
+    ) async throws -> [HauntedNodeListing] {
+        let nodes = try await HauntedCLI.nodes(
             identity: identity, runner: runner, fs: fs)
         let wanted = Set(live)
-        var out: [HauntedWorkstationListing] = []
-        for workstation in workstations {
-            var liveSessions: [HauntedWorkstationSession]?
+        var out: [HauntedNodeListing] = []
+        for node in nodes {
+            var liveSessions: [HauntedNodeSession]?
             var liveError: String?
-            if workstation.online, wanted.contains(workstation.target) {
+            if node.online, wanted.contains(node.target) {
                 do {
                     liveSessions = try await HauntedCLI.sessions(
-                        identity: identity, target: workstation.target,
+                        identity: identity, target: node.target,
                         runner: runner, fs: fs)
                 } catch {
                     liveError = error.localizedDescription
                 }
             }
-            out.append(HauntedWorkstationListing(
-                workstation: workstation, live: liveSessions, liveError: liveError))
+            out.append(HauntedNodeListing(
+                node: node, live: liveSessions, liveError: liveError))
         }
         return out
     }
 
-    func setWorkstationColor(
+    func setNodeColor(
         identity: HauntedClientIdentity, daemon: String, color: String?
     ) async throws {
-        try await HauntedCLI.setWorkstationColor(
+        try await HauntedCLI.setNodeColor(
             identity: identity, daemon: daemon, color: color,
             runner: runner, fs: fs)
     }
 }
 
-/// The color choices offered on a workstation row, plus "Default". A fixed
+/// The color choices offered on a node row, plus "Default". A fixed
 /// palette rather than a color picker: eight distinguishable hues that read at
 /// sidebar-text size, whose values are exactly what the console stores.
-enum HauntedWorkstationPalette {
+enum HauntedNodePalette {
     struct Preset: Identifiable, Equatable {
         let name: String
         let hex: String // "#rrggbb", lowercase — the stored form
@@ -130,7 +130,7 @@ enum HauntedWorkstationPalette {
     /// exactly that shape (the decode boundary should have caught it, but the
     /// renderer must not trust that).
     static func hexToRGB(_ hex: String) -> (red: Double, green: Double, blue: Double)? {
-        guard HauntedWorkstation.normalizedColor(hex) == hex else { return nil }
+        guard HauntedNode.normalizedColor(hex) == hex else { return nil }
         var value: UInt64 = 0
         guard Scanner(string: String(hex.dropFirst())).scanHexInt64(&value) else { return nil }
         return (
@@ -149,12 +149,12 @@ struct HauntedLocalTab: Identifiable, Equatable {
     let title: String
 }
 
-/// One sidebar row after joining the console's workstation list with the
-/// host's local Lima VMs: console-only (a remote workstation, or an orphan a
+/// One sidebar row after joining the console's node list with the
+/// host's local Lima VMs: console-only (a remote node, or an orphan a
 /// failed revoke left behind), Lima-only (a VM that has not enrolled/come
-/// online yet), or both (a GUI-managed workstation).
+/// online yet), or both (a GUI-managed node).
 struct HauntedSidebarRow: Identifiable, Equatable {
-    let workstation: HauntedWorkstation?
+    let node: HauntedNode?
     let lima: HauntedLimaInstance?
     let op: HauntedLimaModel.Op?
 
@@ -169,7 +169,7 @@ struct HauntedSidebarRow: Identifiable, Equatable {
     /// across accounts); Haunted displays the bare name.
     let displayName: String
 
-    var id: String { workstation?.id ?? "lima:\(lima?.name ?? "")" }
+    var id: String { node?.id ?? "lima:\(lima?.name ?? "")" }
 }
 
 /// The Lima operations a sidebar row can request; the view dispatches them to
@@ -184,39 +184,39 @@ enum HauntedLimaAction {
 }
 
 enum HauntedSidebarMerge {
-    /// Joins console workstations with local Lima VMs by daemon name — but
+    /// Joins console nodes with local Lima VMs by daemon name — but
     /// only for rows the caller's own username owns: a local VM named like
     /// ANOTHER user's daemon (targets can be shared in a picker some day)
     /// must never merge, or its menu would offer to delete someone else's
     /// machine. `username` comes from the client certificate CN; nil (an
     /// unreadable cert) merges nothing.
     static func mergeRows(
-        workstations: [HauntedWorkstation],
+        nodes: [HauntedNode],
         lima: [HauntedLimaInstance],
         ops: [String: HauntedLimaModel.Op],
         username: String?
     ) -> [HauntedSidebarRow] {
         var rows: [HauntedSidebarRow] = []
         var claimed = Set<String>()
-        for workstation in workstations {
-            let owned = username.map { workstation.target.hasPrefix($0 + "/") } ?? false
+        for node in nodes {
+            let owned = username.map { node.target.hasPrefix($0 + "/") } ?? false
             // Console daemon names carry the "<username>-" prefix; the local
             // VM (and the display) use the bare name — join on that.
             let display = owned
-                ? workstationDisplayName(daemon: workstation.daemon, username: username)
-                : workstation.daemon
+                ? nodeDisplayName(daemon: node.daemon, username: username)
+                : node.daemon
             let vm = owned ? lima.first { $0.name == display } : nil
             if let vm { claimed.insert(vm.name) }
             // Ops key by VM/display name; an unowned row must not pick up an
             // op that belongs to a same-named LOCAL VM (its own separate row).
             rows.append(HauntedSidebarRow(
-                workstation: workstation, lima: vm,
+                node: node, lima: vm,
                 op: owned ? ops[display] : nil, owned: owned,
                 displayName: display))
         }
         for vm in lima where !claimed.contains(vm.name) {
             rows.append(HauntedSidebarRow(
-                workstation: nil, lima: vm, op: ops[vm.name], owned: true,
+                node: nil, lima: vm, op: ops[vm.name], owned: true,
                 displayName: vm.name))
         }
         return rows.sorted { $0.displayName < $1.displayName }
@@ -233,7 +233,7 @@ enum HauntedSidebarMerge {
 @MainActor
 final class HauntedSidebarModel: ObservableObject {
     static let shared = HauntedSidebarModel(
-        // Lima VM state rides the same 4s cadence as the workstation list —
+        // Lima VM state rides the same 4s cadence as the node list —
         // one poll loop for the whole sidebar. Only the production singleton
         // hooks it up: the default (nil) keeps tests hermetic, since
         // HauntedLimaModel.shared would probe the real filesystem for limactl.
@@ -242,8 +242,8 @@ final class HauntedSidebarModel: ObservableObject {
         limaRefresh: { await HauntedLimaModel.shared.refresh() },
         localTabsProvider: { HauntedManager.shared.localTabs() })
 
-    @Published var workstations: [HauntedWorkstation] = []
-    @Published var sessionsByTarget: [String: [HauntedWorkstationSession]] = [:]
+    @Published var nodes: [HauntedNode] = []
+    @Published var sessionsByTarget: [String: [HauntedNodeSession]] = [:]
     @Published var expanded: Set<String> = []
     @Published var errorMessage: String?
     @Published var loaded = false
@@ -251,18 +251,18 @@ final class HauntedSidebarModel: ObservableObject {
     /// poll (and change notification) as everything else.
     @Published var localTabs: [HauntedLocalTab] = []
     /// Whether the "This computer" group shows its tabs. Separate from
-    /// `expanded` (workstation ids) so reconcile() never touches it.
+    /// `expanded` (node ids) so reconcile() never touches it.
     @Published var localExpanded = true
 
     private let client: HauntedSessionListing
     /// Killing a session closes its tab, which only `HauntedManager` can do.
     /// Injected so a test can observe the request without a window.
     private let killSession: @MainActor (HauntedClientIdentity, String, String) -> Void
-    /// Closing every tab of a removed workstation is likewise `HauntedManager`'s
+    /// Closing every tab of a removed node is likewise `HauntedManager`'s
     /// job; injected so the removal reconciliation is observable without windows.
-    private let closeWorkstation: @MainActor (String) -> Void
+    private let closeNode: @MainActor (String) -> Void
     /// The poll cadence while the app is active. Each cycle costs ONE Console
-    /// mTLS session — a single multiplexed `dedmeshctl workstations -sessions`
+    /// mTLS session — a single multiplexed `dedmeshctl haunted -sessions`
     /// carrying the host list plus live session lists for the expanded rows
     /// (see refreshSessions).
     private let pollInterval: TimeInterval
@@ -300,7 +300,7 @@ final class HauntedSidebarModel: ObservableObject {
             HauntedManager.shared.killSession(
                 identity: $0, target: $1, sessionName: $2)
         },
-        closeWorkstation: @escaping @MainActor (String) -> Void = {
+        closeNode: @escaping @MainActor (String) -> Void = {
             HauntedManager.shared.closeTabs(forTarget: $0)
         },
         pollInterval: TimeInterval = 4,
@@ -315,7 +315,7 @@ final class HauntedSidebarModel: ObservableObject {
     ) {
         self.client = client
         self.killSession = killSession
-        self.closeWorkstation = closeWorkstation
+        self.closeNode = closeNode
         self.pollInterval = pollInterval
         self.inactivePollInterval = inactivePollInterval
         self.isAppActive = isAppActive
@@ -378,41 +378,41 @@ final class HauntedSidebarModel: ObservableObject {
         pollTask = Task { [weak self] in await self?.poll() }
     }
 
-    func toggle(_ workstation: HauntedWorkstation) {
-        if expanded.contains(workstation.id) {
-            expanded.remove(workstation.id)
+    func toggle(_ node: HauntedNode) {
+        if expanded.contains(node.id) {
+            expanded.remove(node.id)
         } else {
-            expanded.insert(workstation.id)
-            // Expanding reveals a workstation whose sessions may be stale (it
+            expanded.insert(node.id)
+            // Expanding reveals a node whose sessions may be stale (it
             // was skipped while collapsed) — fetch them now rather than
             // leaving the empty list until the next poll.
             Task { [weak self] in await self?.refreshSessions() }
         }
     }
 
-    func kill(workstation: HauntedWorkstation, session sessionName: String) {
+    func kill(node: HauntedNode, session sessionName: String) {
         guard let identity else { return }
         // Optimistically drop it from the list; the change notification's
         // refresh reconciles.
-        sessionsByTarget[workstation.id]?.removeAll { $0.name == sessionName }
-        killSession(identity, workstation.target, sessionName)
+        sessionsByTarget[node.id]?.removeAll { $0.name == sessionName }
+        killSession(identity, node.target, sessionName)
     }
 
-    /// Sets (nil clears) a workstation's display color: an optimistic local
+    /// Sets (nil clears) a node's display color: an optimistic local
     /// recolor — of every row on that daemon, since the color is per-daemon
     /// console state — then the console write. On failure the error surfaces
     /// in the sidebar and the next poll reverts the tint to the stored truth;
     /// on success the next poll simply confirms what is already shown.
-    func setColor(workstation: HauntedWorkstation, color: String?) {
+    func setColor(node: HauntedNode, color: String?) {
         guard let identity else { return }
-        workstations = workstations.map {
-            $0.daemon == workstation.daemon ? $0.withColor(color) : $0
+        nodes = nodes.map {
+            $0.daemon == node.daemon ? $0.withColor(color) : $0
         }
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await self.client.setWorkstationColor(
-                    identity: identity, daemon: workstation.daemon, color: color)
+                try await self.client.setNodeColor(
+                    identity: identity, daemon: node.daemon, color: color)
             } catch {
                 self.errorMessage = error.localizedDescription
             }
@@ -421,7 +421,7 @@ final class HauntedSidebarModel: ObservableObject {
 
     /// Absorb a topology change between two successful polls: hosts the console
     /// added since `previous`, and hosts it removed. Runs only inside the poll's
-    /// success path, so a transient CLI failure (which leaves `workstations`
+    /// success path, so a transient CLI failure (which leaves `nodes`
     /// untouched) can never be mistaken for every host being removed.
     ///
     /// - Removed hosts: close their open tabs (the daemon is gone; a tab left
@@ -432,23 +432,23 @@ final class HauntedSidebarModel: ObservableObject {
     ///   would reopen whatever the user just collapsed (MOD-06). On the first
     ///   poll `previous` is empty, so this expands every online host, which is
     ///   the first-load behavior (MOD-05).
-    private func reconcile(previous: [HauntedWorkstation], fresh: [HauntedWorkstation]) {
+    private func reconcile(previous: [HauntedNode], fresh: [HauntedNode]) {
         let previousIDs = Set(previous.map { $0.id })
         let freshIDs = Set(fresh.map { $0.id })
 
         for removed in previousIDs.subtracting(freshIDs) {
             sessionsByTarget[removed] = nil
             expanded.remove(removed)
-            // `id` is the target ("user/daemon/app"); closeWorkstation takes the
+            // `id` is the target ("user/daemon/app"); closeNode takes the
             // target. They are the same string here, but resolve it explicitly.
             if let target = previous.first(where: { $0.id == removed })?.target {
-                closeWorkstation(target)
+                closeNode(target)
             }
         }
 
-        for workstation in fresh
-        where workstation.online && !previousIDs.contains(workstation.id) {
-            expanded.insert(workstation.id)
+        for node in fresh
+        where node.online && !previousIDs.contains(node.id) {
+            expanded.insert(node.id)
         }
     }
 
@@ -462,19 +462,19 @@ final class HauntedSidebarModel: ObservableObject {
               let index = sessions.firstIndex(where: { $0.name == sessionName }),
               sessions[index].title != title else { return }
         let old = sessions[index]
-        sessions[index] = HauntedWorkstationSession(
+        sessions[index] = HauntedNodeSession(
             name: old.name, pid: old.pid, clients: old.clients,
             cols: old.cols, rows: old.rows, created: old.created, title: title)
         sessionsByTarget[target] = sessions
     }
 
-    /// One refresh cycle: a SINGLE `client.list` call carries the workstation
+    /// One refresh cycle: a SINGLE `client.list` call carries the node
     /// list (summaries included) and the live titled session lists for every
-    /// EXPANDED online workstation — one Console mTLS session per cycle,
+    /// EXPANDED online node — one Console mTLS session per cycle,
     /// however many rows are open (performance.md item 1; the old shape was
     /// 1 + N sessions). Rules:
     ///
-    ///  - **Only EXPANDED online workstations are queried live.** A collapsed
+    ///  - **Only EXPANDED online nodes are queried live.** A collapsed
     ///    group renders no sessions, so fetching its titles is pure waste; it
     ///    seeds from the console's snapshot summaries instead, so expanding
     ///    shows an instant (title-less) list while the on-expand refresh
@@ -483,7 +483,7 @@ final class HauntedSidebarModel: ObservableObject {
     ///    notification both call this; a request arriving mid-run sets a
     ///    pending flag and the in-flight pass re-runs once, rather than firing
     ///    a second concurrent subprocess.
-    ///  - **One workstation's live failure must not blank the others**: its
+    ///  - **One node's live failure must not blank the others**: its
     ///    row keeps the sessions it last showed (`liveError` rows), and a
     ///    whole-call failure keeps everything (no flash-to-empty).
     func refreshSessions() async {
@@ -497,7 +497,7 @@ final class HauntedSidebarModel: ObservableObject {
         defer { refreshing = false }
         repeat {
             refreshPending = false
-            let requested = workstations
+            let requested = nodes
                 .filter { $0.online && expanded.contains($0.id) }
                 .map(\.target)
             do {
@@ -505,7 +505,7 @@ final class HauntedSidebarModel: ObservableObject {
                 errorMessage = nil
                 apply(listings: listings, requested: Set(requested))
             } catch {
-                // Keep the last-known workstations: a transient CLI failure
+                // Keep the last-known nodes: a transient CLI failure
                 // must not flash the sidebar to empty.
                 errorMessage = error.localizedDescription
             }
@@ -516,14 +516,14 @@ final class HauntedSidebarModel: ObservableObject {
     /// per-row sessions — fresh titled `live` when queried, untouched on a
     /// per-row `liveError` (a mesh blip must not blank a list the user is
     /// looking at), seeded from the snapshot summaries when never loaded.
-    private func apply(listings: [HauntedWorkstationListing], requested: Set<String>) {
-        let fresh = listings.map(\.workstation)
-        let previous = workstations
-        workstations = fresh.sorted { $0.target < $1.target }
+    private func apply(listings: [HauntedNodeListing], requested: Set<String>) {
+        let fresh = listings.map(\.node)
+        let previous = nodes
+        nodes = fresh.sorted { $0.target < $1.target }
         reconcile(previous: previous, fresh: fresh)
 
         for listing in listings {
-            let id = listing.workstation.id
+            let id = listing.node.id
             if let live = listing.live {
                 sessionsByTarget[id] = live.sorted { $0.name < $1.name }
             } else if listing.liveError == nil, sessionsByTarget[id] == nil {
@@ -536,7 +536,7 @@ final class HauntedSidebarModel: ObservableObject {
         // so their titles arrive now, not at the next interval. Terminates:
         // the re-run requests exactly the expanded set, after which nothing
         // is missing.
-        let missing = workstations.contains {
+        let missing = nodes.contains {
             $0.online && expanded.contains($0.id) && !requested.contains($0.target)
         }
         if missing { refreshPending = true }
@@ -556,17 +556,17 @@ final class HauntedSidebarModel: ObservableObject {
     }
 }
 
-/// Workstation sidebar shown in Haunted-connected terminal windows. Each
-/// workstation the enrolled client may reach is a group; under it are the
-/// sessions currently running on that workstation's Haunted daemon, plus a
-/// "new session" action. Clicking an online workstation's name attaches to
+/// Node sidebar shown in Haunted-connected terminal windows. Each
+/// node the enrolled client may reach is a group; under it are the
+/// sessions currently running on that node's Haunted daemon, plus a
+/// "new session" action. Clicking an online node's name attaches to
 /// its persistent "default" session (creating it on first use); the chevron
 /// expands the session list. Rows for sessions already open in this app are
 /// highlighted. Purely a renderer over HauntedSidebarModel.shared.
 struct HauntedSidebarView: View {
     let identity: HauntedClientIdentity
-    /// (workstation, sessionName?) — nil sessionName means "create a new session".
-    let onOpen: (HauntedWorkstation, String?) -> Void
+    /// (node, sessionName?) — nil sessionName means "create a new session".
+    let onOpen: (HauntedNode, String?) -> Void
     /// "This computer": open a plain local terminal on this Mac.
     let onOpenLocal: () -> Void
     /// Focus an already-open local tab (a "This computer" child row).
@@ -591,7 +591,7 @@ struct HauntedSidebarView: View {
 
     private var mergedRows: [HauntedSidebarRow] {
         HauntedSidebarMerge.mergeRows(
-            workstations: model.workstations,
+            nodes: model.nodes,
             lima: limaModel.available ? limaModel.instances : [],
             ops: limaModel.ops,
             username: username)
@@ -630,7 +630,7 @@ struct HauntedSidebarView: View {
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
-            .help("Show workstations")
+            .help("Show Haunted hosts")
             .padding(.top, 14)
             Spacer()
         }
@@ -666,15 +666,15 @@ struct HauntedSidebarView: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.plain)
-                .help("Hide workstations (drag the divider to resize)")
+                .help("Hide Haunted hosts (drag the divider to resize)")
             }
             .padding(.top, 12)
             .padding(.horizontal, 12)
 
             Divider()
 
-            if model.loaded && model.workstations.isEmpty && model.errorMessage == nil {
-                Text("No workstations")
+            if model.loaded && model.nodes.isEmpty && model.errorMessage == nil {
+                Text("No Haunted hosts")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .padding(.horizontal, 12)
@@ -684,7 +684,7 @@ struct HauntedSidebarView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     // Always first and always available: a regular terminal on
                     // this Mac, exactly upstream Ghostty's default surface —
-                    // rendered like the workstations: expandable, its open
+                    // rendered like the nodes: expandable, its open
                     // tabs listed, plus a "New session" action.
                     LocalComputerGroup(
                         tabs: model.localTabs,
@@ -695,14 +695,14 @@ struct HauntedSidebarView: View {
                         onFocusTab: onFocusLocalTab)
 
                     ForEach(mergedRows) { row in
-                        if let workstation = row.workstation {
-                            WorkstationGroup(
-                                workstation: workstation,
+                        if let node = row.node {
+                            NodeGroup(
+                                node: node,
                                 displayName: row.displayName,
-                                sessions: model.sessionsByTarget[workstation.id] ?? [],
-                                isExpanded: model.expanded.contains(workstation.id),
+                                sessions: model.sessionsByTarget[node.id] ?? [],
+                                isExpanded: model.expanded.contains(node.id),
                                 currentSessionName: currentSession().flatMap {
-                                    $0.target == workstation.target ? $0.name : nil
+                                    $0.target == node.target ? $0.name : nil
                                 },
                                 lima: row.lima,
                                 limaOp: row.op,
@@ -712,18 +712,18 @@ struct HauntedSidebarView: View {
                                 // delete-revoke leaves behind).
                                 offersConsoleRevoke: row.owned && row.lima == nil
                                     && limaModel.available,
-                                toggle: { model.toggle(workstation) },
+                                toggle: { model.toggle(node) },
                                 onOpenPrimary: {
-                                    model.expanded.insert(workstation.id)
-                                    onOpen(workstation, "default")
+                                    model.expanded.insert(node.id)
+                                    onOpen(node, "default")
                                 },
-                                onOpenSession: { onOpen(workstation, $0) },
-                                onNewSession: { onOpen(workstation, nil) },
+                                onOpenSession: { onOpen(node, $0) },
+                                onNewSession: { onOpen(node, nil) },
                                 onKillSession: {
-                                    model.kill(workstation: workstation, session: $0)
+                                    model.kill(node: node, session: $0)
                                 },
                                 onSetColor: {
-                                    model.setColor(workstation: workstation, color: $0)
+                                    model.setColor(node: node, color: $0)
                                 },
                                 onLimaAction: { handleLima($0, row: row) })
                         } else if let vm = row.lima {
@@ -740,7 +740,7 @@ struct HauntedSidebarView: View {
                             HStack(spacing: 6) {
                                 Image(systemName: "plus.circle")
                                     .font(.caption)
-                                Text("New workstation…")
+                                Text("New Haunted host…")
                                     .font(.callout)
                                 Spacer(minLength: 0)
                             }
@@ -750,7 +750,7 @@ struct HauntedSidebarView: View {
                             .padding(.horizontal, 8)
                         }
                         .buttonStyle(.plain)
-                        .help("Create a Lima VM and enroll it as a workstation")
+                        .help("Create a Lima VM and enroll it as a Haunted host")
                     }
                 }
                 .padding(.horizontal, 8)
@@ -780,8 +780,8 @@ struct HauntedSidebarView: View {
                 // deals in: local VM names plus console daemons with the
                 // user's prefix stripped.
                 existingNames: Set(limaModel.instances.map(\.name))
-                    .union(model.workstations.map {
-                        workstationDisplayName(daemon: $0.daemon, username: username)
+                    .union(model.nodes.map {
+                        nodeDisplayName(daemon: $0.daemon, username: username)
                     }),
                 onCreate: { spec in
                     limaModel.createAndEnroll(spec: spec, identity: identity)
@@ -802,18 +802,18 @@ struct HauntedSidebarView: View {
             limaModel.enroll(name: name, identity: identity)
         case .delete:
             confirm(
-                "Delete workstation “\(name)”?",
+                "Delete node “\(name)”?",
                 detail: "The Lima VM and its disk are destroyed and the "
-                    + "workstation is removed from the Console. This cannot "
+                    + "Haunted host is removed from the Console. This cannot "
                     + "be undone.",
                 button: "Delete"
             ) {
                 limaModel.delete(name: name,
-                                 consoleDaemon: row.workstation?.daemon,
+                                 consoleDaemon: row.node?.daemon,
                                  identity: identity)
             }
         case .revokeConsole:
-            guard let daemon = row.workstation?.daemon else { return }
+            guard let daemon = row.node?.daemon else { return }
             confirm(
                 "Remove “\(name)” from the Console?",
                 detail: "The daemon and everything it published are deleted; "
@@ -845,18 +845,18 @@ struct HauntedSidebarView: View {
     }
 }
 
-private struct WorkstationGroup: View {
-    let workstation: HauntedWorkstation
+private struct NodeGroup: View {
+    let node: HauntedNode
     /// The name the row shows: the console daemon name with the user's own
     /// "<username>-" prefix stripped (console names stay prefixed).
     let displayName: String
-    let sessions: [HauntedWorkstationSession]
+    let sessions: [HauntedNodeSession]
     let isExpanded: Bool
-    /// The session name the hosting tab is attached to on THIS workstation
+    /// The session name the hosting tab is attached to on THIS node
     /// (nil when the host tab looks elsewhere) — the row highlighted as
     /// current, beyond the open-in-this-app accent.
     let currentSessionName: String?
-    /// The local Lima VM backing this workstation (merged by name), if any.
+    /// The local Lima VM backing this node (merged by name), if any.
     let lima: HauntedLimaInstance?
     let limaOp: HauntedLimaModel.Op?
     /// Console-only owned row: offer "Remove from Console…" (the orphan a
@@ -885,7 +885,7 @@ private struct WorkstationGroup: View {
                 }
                 .buttonStyle(.plain)
                 .help(isExpanded ? "Collapse sessions" : "Show sessions")
-                .disabled(!workstation.online)
+                .disabled(!node.online)
 
                 Button(action: onOpenPrimary) {
                     HStack(spacing: 6) {
@@ -909,7 +909,7 @@ private struct WorkstationGroup: View {
                                 .font(.caption2)
                                 .foregroundStyle(.yellow)
                                 .help(message)
-                        } else if let lima, lima.isRunning, !workstation.online {
+                        } else if let lima, lima.isRunning, !node.online {
                             // The VM runs but its daemon has not come online
                             // (booting, or dedmeshd died inside): distinguish
                             // this from a plain offline host.
@@ -924,31 +924,31 @@ private struct WorkstationGroup: View {
                     .padding(.horizontal, 6)
                     .background(
                         RoundedRectangle(cornerRadius: 5)
-                            .fill(hovering && workstation.online
+                            .fill(hovering && node.online
                                   ? Color.secondary.opacity(0.15) : Color.clear))
                 }
                 .buttonStyle(.plain)
                 .onHover { hovering = $0 }
-                .help(workstation.online
+                .help(node.online
                       ? "Open a terminal on \(displayName) (its persistent default session)"
-                      : workstation.error ?? "\(workstation.target) (\(workstation.status))")
-                .disabled(!workstation.online)
+                      : node.error ?? "\(node.target) (\(node.status))")
+                .disabled(!node.online)
             }
-            .opacity(workstation.online ? 1 : 0.5)
+            .opacity(node.online ? 1 : 0.5)
             .padding(.leading, 2)
             // Attached to the row, NOT inside the .disabled buttons: the color
-            // is console state, so an offline workstation's row keeps its menu.
+            // is console state, so an offline node's row keeps its menu.
             .contextMenu {
                 colorMenu
                 limaMenu
             }
 
-            if isExpanded && workstation.online {
+            if isExpanded && node.online {
                 ForEach(sessions) { session in
                     SessionRow(
                         session: session,
                         isOpenHere: HauntedManager.shared.isSessionOpen(
-                            target: workstation.target, sessionName: session.name),
+                            target: node.target, sessionName: session.name),
                         isCurrent: session.name == currentSessionName,
                         action: { onOpenSession(session.name) },
                         onKill: { onKillSession(session.name) })
@@ -976,18 +976,18 @@ private struct WorkstationGroup: View {
     /// one recolors locally at once and persists via the model.
     @ViewBuilder private var colorMenu: some View {
         Menu("Color") {
-            ForEach(HauntedWorkstationPalette.presets) { preset in
+            ForEach(HauntedNodePalette.presets) { preset in
                 Button {
                     onSetColor(preset.hex)
                 } label: {
-                    Text(workstation.color == preset.hex ? "✓ \(preset.name)" : preset.name)
+                    Text(node.color == preset.hex ? "✓ \(preset.name)" : preset.name)
                 }
             }
             Divider()
             Button {
                 onSetColor(nil)
             } label: {
-                Text(workstation.color == nil ? "✓ Default" : "Default")
+                Text(node.color == nil ? "✓ Default" : "Default")
             }
         }
     }
@@ -1004,7 +1004,7 @@ private struct WorkstationGroup: View {
                 } else {
                     Button("Start VM") { onLimaAction(.start) }
                 }
-                Button("Delete Workstation…", role: .destructive) {
+                Button("Delete Haunted host…", role: .destructive) {
                     onLimaAction(.delete)
                 }
             }
@@ -1019,20 +1019,20 @@ private struct WorkstationGroup: View {
         }
     }
 
-    /// The workstation name's tint: the user-chosen color when set, else the
+    /// The node name's tint: the user-chosen color when set, else the
     /// default label color. The status dot keeps its online/error semantics —
     /// the color rides the NAME, never the dot.
     private var nameColor: Color {
-        guard let hex = workstation.color,
-              let rgb = HauntedWorkstationPalette.hexToRGB(hex) else { return .primary }
+        guard let hex = node.color,
+              let rgb = HauntedNodePalette.hexToRGB(hex) else { return .primary }
         return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 
     private var statusColor: Color {
-        if workstation.online {
+        if node.online {
             return .green
         }
-        if workstation.state == "error" {
+        if node.state == "error" {
             return .red
         }
         return Color.secondary.opacity(0.4)
@@ -1040,7 +1040,7 @@ private struct WorkstationGroup: View {
 }
 
 private struct SessionRow: View {
-    let session: HauntedWorkstationSession
+    let session: HauntedNodeSession
     let isOpenHere: Bool
     /// The hosting tab shows exactly this session: render selected, matching
     /// the tab bar's own highlight.
@@ -1095,7 +1095,7 @@ private struct SessionRow: View {
 
 /// "This computer": a regular terminal on this Mac — upstream Ghostty's
 /// default surface, no attach command, no mesh in the path. Rendered like a
-/// workstation group: chevron, the open local tabs as child rows (the
+/// node group: chevron, the open local tabs as child rows (the
 /// hosting tab highlighted), and a "New session" action. Clicking the name
 /// opens a new local terminal; clicking a child row focuses that tab.
 private struct LocalComputerGroup: View {
@@ -1210,7 +1210,7 @@ private struct LocalTabRow: View {
     }
 }
 
-/// A Lima VM the console does not (yet) list as a workstation: created but
+/// A Lima VM the console does not (yet) list as a node: created but
 /// not enrolled, still booting, or enrolled under a name the console has
 /// since revoked. Hollow dot — there is no daemon whose online/error state
 /// the filled dot could report.
@@ -1251,12 +1251,12 @@ private struct LimaVMRow: View {
         .padding(.leading, 24)
         .padding(.trailing, 6)
         .contentShape(Rectangle())
-        .help("Lima VM \(vm.name) (\(vm.status)) — not a workstation yet")
+        .help("Lima VM \(vm.name) (\(vm.status)) — not a Haunted host yet")
         .contextMenu {
             if op?.isInFlight != true {
                 if vm.isRunning {
                     Button("Stop VM") { onAction(.stop) }
-                    Button("Enroll as Workstation") { onAction(.enroll) }
+                    Button("Enroll as Haunted") { onAction(.enroll) }
                 } else {
                     Button("Start VM") { onAction(.start) }
                 }
@@ -1270,8 +1270,8 @@ private struct LimaVMRow: View {
     }
 }
 
-/// The "New workstation…" form: a name under the daemon grammar, explicitly
-/// chosen exposed directories (none by default — a workstation exports a
+/// The "New node…" form: a name under the daemon grammar, explicitly
+/// chosen exposed directories (none by default — a node exports a
 /// shell over the mesh, so every mount is an explicit decision), and sizing.
 private struct LimaCreateSheet: View {
     let existingNames: Set<String>
@@ -1291,11 +1291,11 @@ private struct LimaCreateSheet: View {
 
     private var nameError: String? {
         if name.isEmpty { return nil }
-        if !isValidWorkstationName(name) {
+        if !isValidNodeName(name) {
             return "a-z, 0-9, - and _, starting with a letter or digit, max 32"
         }
         if existingNames.contains(name) {
-            return "a VM or workstation with this name already exists"
+            return "a VM or node with this name already exists"
         }
         return nil
     }
@@ -1304,7 +1304,7 @@ private struct LimaCreateSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("New workstation")
+            Text("New Haunted host")
                 .font(.headline)
 
             TextField("Name (e.g. ws1)", text: $name)

@@ -29,70 +29,70 @@ final class HauntedLoginController: NSWindowController {
     }
 
     /// Auto-connect: only open a Haunted window after the enrolled identity
-    /// can authenticate and list workstations. Offline workstations still mean
+    /// can authenticate and list nodes. Offline nodes still mean
     /// the user is logged in; show the Haunted window/sidebar instead of
     /// returning to login. A revoked/broken identity falls back to login.
     @MainActor
     private static func connect(identity: HauntedClientIdentity) {
         Task { @MainActor in
-            let justStarted = await HauntedWorkstationSupervisor.ensureRunning()
+            let justStarted = await HauntedNodeSupervisor.ensureRunning()
             do {
-                let workstations = justStarted
+                let nodes = justStarted
                     ? try await waitForOnline(identity: identity)
-                    : try await HauntedCLI.workstations(identity: identity)
-                NSLog("[haunted] startup: %d workstation(s) via %@",
-                      workstations.count, identity.consoleHost)
+                    : try await HauntedCLI.nodes(identity: identity)
+                NSLog("[haunted] startup: %d node(s) via %@",
+                      nodes.count, identity.consoleHost)
                 // Only fetch the last target's sessions when it is actually
                 // online — the router needs the list to confirm the remembered
                 // session still exists before resuming it (else it must never
                 // create one, so it lands on the empty state instead).
                 let lastSessions = await lastSessions(
-                    identity: identity, workstations: workstations)
+                    identity: identity, nodes: nodes)
                 HauntedManager.shared.openWindow(
-                    identity: identity, workstations: workstations,
+                    identity: identity, nodes: nodes,
                     lastSessions: lastSessions)
             } catch {
-                NSLog("[haunted] startup: workstation list failed (%@)",
+                NSLog("[haunted] startup: node list failed (%@)",
                       "\(error)")
                 shared.showLoginMessage(error.localizedDescription)
             }
         }
     }
 
-    /// The sessions on the last-attached workstation, or `[]` when there is no
+    /// The sessions on the last-attached node, or `[]` when there is no
     /// remembered target or it is not currently online. The router uses this to
     /// decide whether the remembered session still exists (resume) or is gone
     /// (empty state); a failed list is treated as "no sessions", i.e. empty.
     @MainActor
     private static func lastSessions(
         identity: HauntedClientIdentity,
-        workstations: [HauntedWorkstation]
-    ) async -> [HauntedWorkstationSession] {
+        nodes: [HauntedNode]
+    ) async -> [HauntedNodeSession] {
         guard let target = HauntedManager.shared.lastAttachedTarget,
-              workstations.contains(where: { $0.target == target && $0.online })
+              nodes.contains(where: { $0.target == target && $0.online })
         else { return [] }
         return (try? await HauntedCLI.sessions(
             identity: identity, target: target)) ?? []
     }
 
-    /// Right after a cold-launch spawn of the local workstation daemons,
+    /// Right after a cold-launch spawn of the local node daemons,
     /// dedmeshd still needs a moment to connect to the console and register —
     /// give it a few quick retries before falling back to a plain shell, so
-    /// launching Haunted lands directly on the local workstation instead of
+    /// launching Haunted lands directly on the local node instead of
     /// requiring the user to reopen it once it comes online.
     @MainActor
     private static func waitForOnline(
         identity: HauntedClientIdentity
-    ) async throws -> [HauntedWorkstation] {
-        var workstations: [HauntedWorkstation] = []
+    ) async throws -> [HauntedNode] {
+        var nodes: [HauntedNode] = []
         for attempt in 0..<6 {
-            workstations = try await HauntedCLI.workstations(identity: identity)
-            if workstations.contains(where: { $0.online }) { break }
+            nodes = try await HauntedCLI.nodes(identity: identity)
+            if nodes.contains(where: { $0.online }) { break }
             if attempt < 5 {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
         }
-        return workstations
+        return nodes
     }
 
     private static func installMenuItem() {

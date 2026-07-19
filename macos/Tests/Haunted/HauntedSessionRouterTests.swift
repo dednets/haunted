@@ -9,30 +9,30 @@ import Foundation
 /// `Ghostty.SurfaceView`, none of which a unit test can supply. §5.4 extracts
 /// the decision so it can be checked without any of that.
 struct HauntedSessionRouterTests {
-    private func workstation(
+    private func node(
         _ target: String, online: Bool
-    ) -> HauntedWorkstation {
-        HauntedWorkstation(
+    ) -> HauntedNode {
+        HauntedNode(
             target: target, daemon: String(target.split(separator: "/")[1]),
             app: "haunted", online: online, state: nil, error: nil)
     }
 
-    private func session(_ name: String) -> HauntedWorkstationSession {
-        HauntedWorkstationSession(
+    private func session(_ name: String) -> HauntedNodeSession {
+        HauntedNodeSession(
             name: name, pid: 1, clients: 0, cols: 80, rows: 24,
             created: 0, title: nil)
     }
 
     // MARK: OPEN-01…06
 
-    /// OPEN-01. Sessions persist in the workstation's haunted-daemon across
+    /// OPEN-01. Sessions persist in the node's haunted-daemon across
     /// Terminal quits, so resuming is the whole point of remembering — but only
     /// when that session is still there to resume.
-    @Test("OPEN-01: last-attached workstation online and session still exists → resume")
+    @Test("OPEN-01: last-attached node online and session still exists → resume")
     func resumesLastAttached() {
         let route = HauntedSessionRouter.route(
             lastAttached: ("alice/box/haunted", "work"),
-            workstations: [workstation("alice/box/haunted", online: true)],
+            nodes: [node("alice/box/haunted", online: true)],
             sessionsOnLastTarget: [session("work")])
         #expect(route == .resume(target: "alice/box/haunted", session: "work"))
     }
@@ -45,21 +45,21 @@ struct HauntedSessionRouterTests {
     func emptyWhenRememberedSessionIsGone() {
         let route = HauntedSessionRouter.route(
             lastAttached: ("alice/box/haunted", "gui-deadbeefdeadbeef"),
-            workstations: [workstation("alice/box/haunted", online: true)],
+            nodes: [node("alice/box/haunted", online: true)],
             sessionsOnLastTarget: [session("default"), session("other")])
         #expect(route == .empty)
     }
 
     /// OPEN-03. Attaching to an offline daemon would hang on the reconnect loop
     /// rather than show anything useful, and we do not auto-attach to some other
-    /// online workstation — that is a click the user has not made yet.
-    @Test("OPEN-03: last-attached workstation offline → empty, not another workstation")
+    /// online node — that is a click the user has not made yet.
+    @Test("OPEN-03: last-attached node offline → empty, not another node")
     func emptyWhenLastIsOffline() {
         let route = HauntedSessionRouter.route(
             lastAttached: ("alice/box/haunted", "work"),
-            workstations: [
-                workstation("alice/box/haunted", online: false),
-                workstation("alice/other/haunted", online: true),
+            nodes: [
+                node("alice/box/haunted", online: false),
+                node("alice/other/haunted", online: true),
             ],
             sessionsOnLastTarget: [])
         #expect(route == .empty)
@@ -67,15 +67,15 @@ struct HauntedSessionRouterTests {
 
     /// OPEN-04. No last-attached at all: a first-ever launch, or a cleared
     /// default. The sidebar appears with the "Nothing here" placeholder; the
-    /// user picks a workstation. Startup never opens a session unprompted, even
-    /// when one workstation is online and ready.
-    @Test("OPEN-04: no last-attached, workstations online → empty (no auto-open)")
+    /// user picks a node. Startup never opens a session unprompted, even
+    /// when one node is online and ready.
+    @Test("OPEN-04: no last-attached, nodes online → empty (no auto-open)")
     func emptyWhenNothingRemembered() {
         let route = HauntedSessionRouter.route(
             lastAttached: nil,
-            workstations: [
-                workstation("alice/a/haunted", online: false),
-                workstation("alice/b/haunted", online: true),
+            nodes: [
+                node("alice/a/haunted", online: false),
+                node("alice/b/haunted", online: true),
             ],
             sessionsOnLastTarget: [])
         #expect(route == .empty)
@@ -84,22 +84,22 @@ struct HauntedSessionRouterTests {
     /// OPEN-05. Nothing online, nothing remembered → empty. (This is the case
     /// that used to be `.plainShell`; the shell is gone, replaced by the
     /// "Nothing here" placeholder.)
-    @Test("OPEN-05: no workstation online → empty")
+    @Test("OPEN-05: no node online → empty")
     func emptyWhenNothingOnline() {
         #expect(HauntedSessionRouter.route(
             lastAttached: nil,
-            workstations: [workstation("alice/a/haunted", online: false)],
+            nodes: [node("alice/a/haunted", online: false)],
             sessionsOnLastTarget: []) == .empty)
     }
 
-    /// OPEN-06. Remembered workstation is present but only listed offline while
+    /// OPEN-06. Remembered node is present but only listed offline while
     /// its session technically still shows in a stale list — offline wins, we
     /// do not attach into a reconnect hang.
-    @Test("OPEN-06: session listed but workstation offline → empty")
+    @Test("OPEN-06: session listed but node offline → empty")
     func offlineBeatsAStaleSessionList() {
         let route = HauntedSessionRouter.route(
             lastAttached: ("alice/box/haunted", "work"),
-            workstations: [workstation("alice/box/haunted", online: false)],
+            nodes: [node("alice/box/haunted", online: false)],
             sessionsOnLastTarget: [session("work")])
         #expect(route == .empty)
     }
@@ -111,7 +111,7 @@ struct HauntedSessionRouterTests {
     func resumedSessionNameIsValid() {
         guard case .resume(_, let session) = HauntedSessionRouter.route(
             lastAttached: ("alice/box/haunted", "gui-0123456789abcdef"),
-            workstations: [workstation("alice/box/haunted", online: true)],
+            nodes: [node("alice/box/haunted", online: true)],
             sessionsOnLastTarget: [self.session("gui-0123456789abcdef")])
         else { return #expect(Bool(false), "expected .resume") }
         #expect(isValidSessionName(session))
@@ -120,7 +120,7 @@ struct HauntedSessionRouterTests {
     // MARK: SPL-01/02 — the split-inheritance decision
 
     /// SPL-01. A split of a Haunted surface opens a *fresh* session on the same
-    /// workstation, never a second attach to the parent's session.
+    /// node, never a second attach to the parent's session.
     @Test("SPL-01: split from a Haunted surface inherits the target, fresh session")
     func splitInheritsTarget() {
         let plan = HauntedManager.splitPlan(

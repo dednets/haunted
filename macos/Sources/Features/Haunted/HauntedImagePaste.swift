@@ -4,10 +4,10 @@ import AppKit
 ///
 /// In a native terminal an app like Claude Code answers Ctrl+V by reading the
 /// LOCAL clipboard itself — the terminal never sees the image. In a Haunted
-/// tab that app runs on the workstation, where the Mac's clipboard does not
+/// tab that app runs on the node, where the Mac's clipboard does not
 /// exist, so the keystroke alone can never work: the image bytes have to
 /// cross the wire. This shim restores native behavior for exactly that case —
-/// a plain Ctrl+V, on a surface attached through a workstation target, with
+/// a plain Ctrl+V, on a surface attached through a node target, with
 /// an image on the pasteboard — by uploading the image (`haunted upload`,
 /// MSG_UPLOAD_* underneath) and typing the returned remote path into the
 /// session, which is the same text an image file dropped onto a terminal

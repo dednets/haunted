@@ -1097,7 +1097,7 @@ extension Ghostty {
 
             // Haunted: Ctrl+V with an image on the pasteboard, on a surface
             // attached to a remote session, must cross the wire instead of
-            // sending 0x16 — the pasting app runs on the workstation and
+            // sending 0x16 — the pasting app runs on the Haunted host and
             // cannot read this Mac's clipboard. Everything else passes
             // through. (PASTE-01 guards this hook against upstream rebases.)
             if HauntedImagePaste.intercept(event: event, surfaceView: self) {

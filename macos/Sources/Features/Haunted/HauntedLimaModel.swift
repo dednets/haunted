@@ -1,6 +1,6 @@
 import Foundation
 
-/// Sidebar-side state for the Lima workstations manager: which VMs exist,
+/// Sidebar-side state for the Lima nodes manager: which VMs exist,
 /// which long operation (if any) is in flight per VM, and the create/enroll/
 /// delete pipelines. Shared like HauntedSidebarModel, for the same reason —
 /// every window renders the same manager state, and an op started in one tab
@@ -65,7 +65,7 @@ final class HauntedLimaModel: ObservableObject {
 
     /// Called from the sidebar's poll loop (one cadence for everything). A
     /// missing limactl or a failed list keeps the last-known instances — the
-    /// same no-flash rule the workstation poll follows.
+    /// same no-flash rule the node poll follows.
     func refresh() async {
         guard let limactl else {
             available = false
@@ -83,7 +83,7 @@ final class HauntedLimaModel: ObservableObject {
         ops[name]?.isInFlight == true
     }
 
-    /// The full "New workstation…" pipeline: write yaml → create → start →
+    /// The full "New node…" pipeline: write yaml → create → start →
     /// enrolled-probe → mint token → install inside the VM. Each stage updates
     /// `ops[name]`; any throw parks the VM at `.failed` (retry by re-running
     /// the stage from the row's menu, or Delete to recover).
@@ -142,7 +142,7 @@ final class HauntedLimaModel: ObservableObject {
                 try await HauntedLimaCLI.delete(env: self.env, limactl: limactl, name: name)
                 if let consoleDaemon {
                     do {
-                        try await HauntedCLI.revokeWorkstation(
+                        try await HauntedCLI.revokeNode(
                             identity: identity, daemon: consoleDaemon,
                             runner: self.env.runner, fs: self.env.fs)
                     } catch {
@@ -169,7 +169,7 @@ final class HauntedLimaModel: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                try await HauntedCLI.revokeWorkstation(
+                try await HauntedCLI.revokeNode(
                     identity: identity, daemon: daemon,
                     runner: self.env.runner, fs: self.env.fs)
                 self.ops[name] = nil

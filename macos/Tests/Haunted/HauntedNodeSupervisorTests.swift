@@ -4,7 +4,7 @@ import Foundation
 
 /// TEST_PLAN §4.2 — SUP-01..09.
 ///
-/// Everything here drives `HauntedWorkstationSupervisor.ensureRunning(env:)` end
+/// Everything here drives `HauntedNodeSupervisor.ensureRunning(env:)` end
 /// to end, never the private helpers: the property SUP-04 protects is the *order*
 /// of the child launches, and that only exists at the entry point.
 ///
@@ -15,7 +15,7 @@ import Foundation
 /// passes an empty one, so `HauntedCLI.resolve` deterministically falls through
 /// to the bare tool name — the command strings below are exact, not
 /// machine-dependent.
-struct HauntedWorkstationSupervisorTests {
+struct HauntedNodeSupervisorTests {
     // MARK: - Fixtures
 
     /// Builds a disposable HOME, optionally with `~/.config/dedmesh` and the
@@ -90,7 +90,7 @@ struct HauntedWorkstationSupervisorTests {
         defer { fs.remove() }
         let runner = FakeProcessRunner()
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == false)
@@ -98,14 +98,14 @@ struct HauntedWorkstationSupervisorTests {
     }
 
     /// SUP-02. The directory exists (some other dedmesh tool made it) but holds
-    /// no config: this Mac is not enrolled as a workstation.
+    /// no config: this Mac is not enrolled as a node.
     @Test("SUP-02: config dir exists but is empty — returns false, launches nothing")
     func emptyConfigDirectory() async throws {
         let fs = try makeFileSystem()
         defer { fs.remove() }
         let runner = FakeProcessRunner()
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == false)
@@ -121,7 +121,7 @@ struct HauntedWorkstationSupervisorTests {
         defer { fs.remove() }
         let runner = FakeProcessRunner()
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == false)
@@ -131,9 +131,9 @@ struct HauntedWorkstationSupervisorTests {
     // MARK: - SUP-04: spawn order
 
     /// SUP-04. `haunted-daemon --daemonize` must be launched *and waited on*
-    /// before any `dedmeshd` is spawned. dedmeshd probes its workstation socket
+    /// before any `dedmeshd` is spawned. dedmeshd probes its node socket
     /// once at startup and only every 30s thereafter, so a dedmeshd that starts
-    /// first reports the workstation offline for up to half a minute.
+    /// first reports the node offline for up to half a minute.
     ///
     /// This asserts the whole ordered launch log, which is only meaningful
     /// through `ensureRunning` — the private helpers know nothing about order.
@@ -144,7 +144,7 @@ struct HauntedWorkstationSupervisorTests {
         // Empty process table: no dedmeshd is running, so one gets spawned.
         let runner = FakeProcessRunner(exitStatus: 0, processTable: [])
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == true)
@@ -182,7 +182,7 @@ struct HauntedWorkstationSupervisorTests {
         defer { fs.remove() }
         let runner = FakeProcessRunner()
 
-        _ = await HauntedWorkstationSupervisor.ensureRunning(
+        _ = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         let probes = pgreps(runner)
@@ -208,7 +208,7 @@ struct HauntedWorkstationSupervisorTests {
         let running = try listedConfig(fs, "a.toml")
         let runner = FakeProcessRunner(processTable: runningDedmeshd(running))
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == true)
@@ -237,7 +237,7 @@ struct HauntedWorkstationSupervisorTests {
         // reports 1, the pidfile guard having refused a second instance.
         let runner = FakeProcessRunner(exitStatus: 1, processTable: [])
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == true, "a dedmeshd was spawned, so the caller must wait for it")
@@ -253,7 +253,7 @@ struct HauntedWorkstationSupervisorTests {
         let running = try listedConfig(fs, "one.toml")
         let runner = FakeProcessRunner(exitStatus: 1, processTable: runningDedmeshd(running))
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == false)
@@ -270,7 +270,7 @@ struct HauntedWorkstationSupervisorTests {
         let runner = FakeProcessRunner(
             exitStatus: 1, processTable: ["dedmeshd -config /somewhere/else.toml"])
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == true)
@@ -300,7 +300,7 @@ struct HauntedWorkstationSupervisorTests {
         // The daemon for this exact config IS running.
         let runner = FakeProcessRunner(exitStatus: 1, processTable: runningDedmeshd(config))
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         // Evidence: the path reached pgrep with its metacharacters escaped, and
@@ -335,7 +335,7 @@ struct HauntedWorkstationSupervisorTests {
         ("no-metachars_here", "no-metachars_here"),
     ])
     func eresEscaping(input: String, expected: String) {
-        #expect(HauntedWorkstationSupervisor.eresEscaped(input) == expected)
+        #expect(HauntedNodeSupervisor.eresEscaped(input) == expected)
     }
 
     /// The escaped pattern must match its own literal text under a real regex
@@ -345,7 +345,7 @@ struct HauntedWorkstationSupervisorTests {
     func eresEscapedRoundTrips() throws {
         let path = "/home/u/.config/dedmesh/a+b.toml"
         let regex = try NSRegularExpression(
-            pattern: HauntedWorkstationSupervisor.eresEscaped(path))
+            pattern: HauntedNodeSupervisor.eresEscaped(path))
         func matches(_ s: String) -> Bool {
             regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) != nil
         }
@@ -370,7 +370,7 @@ struct HauntedWorkstationSupervisorTests {
         let other = config.deletingLastPathComponent().appendingPathComponent("ab.toml")
         let runner = FakeProcessRunner(exitStatus: 1, processTable: runningDedmeshd(other))
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(spawns(runner).count == 1,
@@ -388,7 +388,7 @@ struct HauntedWorkstationSupervisorTests {
         let running = try listedConfig(fs, "ab.toml")
         let runner = FakeProcessRunner(exitStatus: 1, processTable: runningDedmeshd(running))
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(spawns(runner).isEmpty)
@@ -400,7 +400,7 @@ struct HauntedWorkstationSupervisorTests {
     /// SUP-09. `/usr/bin/pgrep` missing (or not executable) makes `Process.run()`
     /// throw; the runner reports -1. The supervisor must not crash, and must
     /// treat "could not ask" as "not running" — the fail-safe direction here is
-    /// to start the daemon, since a workstation with no dedmeshd is useless
+    /// to start the daemon, since a node with no dedmeshd is useless
     /// while a duplicate is merely noisy.
     ///
     /// TEST_PLAN's "returns false" for this row is the private
@@ -412,7 +412,7 @@ struct HauntedWorkstationSupervisorTests {
         defer { fs.remove() }
         let runner = MissingPgrepRunner()
 
-        let started = await HauntedWorkstationSupervisor.ensureRunning(
+        let started = await HauntedNodeSupervisor.ensureRunning(
             env: .init(runner: runner, fs: fs))
 
         #expect(started == true)
