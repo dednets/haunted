@@ -15,7 +15,7 @@ zig-pkg/
 build-cmake/
 CMakeCache.txt
 CMakeFiles/
-/build.zig.zon.bak
+build.zig.zon.bak
 /result*
 /.nixos-test-history
 example/*.wasm
@@ -31,6 +31,7 @@ glad.zip
 
 vgcore.*
 
-
 # LLVM coverage artifacts from test runs
 *.profraw
+
+/sprite_face_test*
